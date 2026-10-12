@@ -1,0 +1,55 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "Asm Lens project configuration",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "compilers": {
+      "type": "array",
+      "description": "Compilers to use, in order of preference. The first one is the default; the others can be chosen with 'Asm Lens: Select Compiler' or the status bar.",
+      "items": {
+        "oneOf": [
+          { "type": "string", "description": "Compiler Explorer compiler id, e.g. g152." },
+          {
+            "type": "object",
+            "required": ["id"],
+            "additionalProperties": false,
+            "properties": {
+              "id": { "type": "string", "description": "Compiler Explorer compiler id, e.g. g152. Use 'Asm Lens: Select Compiler' > Browse to look ids up." },
+              "name": { "type": "string", "description": "Label shown in the status bar and CodeLens." },
+              "flags": { "type": "string", "description": "Flags for this compiler (overrides the top-level flags)." },
+              "language": { "enum": ["c", "c++"], "description": "Only offer this compiler for C or C++ files. Omit for both." }
+            }
+          }
+        ]
+      }
+    },
+    "flags": { "type": "string", "description": "Default compiler flags, used by compilers without their own flags." },
+    "language": { "enum": ["c", "c++"], "description": "Force the language sent to Compiler Explorer. By default C files use C and everything else C++." },
+    "includePaths": {
+      "type": "array",
+      "description": "Folders searched for #include files, in order of priority: the first entry is searched first, then the second, and so on. Relative paths are relative to the folder holding this file.",
+      "items": {
+        "oneOf": [
+          { "type": "string" },
+          {
+            "type": "object",
+            "required": ["path"],
+            "additionalProperties": false,
+            "properties": {
+              "path": { "type": "string" },
+              "recursive": { "type": "boolean", "description": "Also search every subfolder of this folder (at this priority)." }
+            }
+          }
+        ]
+      }
+    },
+    "buildFolders": {
+      "type": "array",
+      "items": { "type": "string" },
+      "description": "Folder names searched last for headers that are found nowhere else (for generated headers). Wildcards such as cmake-build-* work."
+    },
+    "baseUrl": { "type": "string", "description": "Compiler Explorer instance URL (default https://godbolt.org)." },
+    "maxIncludeFiles": { "type": "number", "minimum": 1, "description": "Maximum number of header files uploaded per analysis." }
+  }
+}
