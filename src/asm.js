@@ -81,8 +81,8 @@ function sectionKind(t) {
   if (!m) return undefined;
   const spec = m[1].trim();
   if (/^__[A-Z]+\s*,/.test(spec)) {                                   // Mach-O: segment,section
-    const [segment, section] = spec.split(',').map(x => x.trim());
-    return segment === '__TEXT' && /^__(?:text|textcoal_nt|StaticInit)$/.test(section);
+    const [segment, section = ''] = spec.split(',').map(x => x.trim());
+    return segment === '__TEXT' && (/^__(?:text|StaticInit)/.test(section) || /\b(?:pure|some)_instructions\b/.test(spec));
   }
   const name = (/^"([^"]*)"|^([^,\s]+)/.exec(spec) || []).slice(1).find(Boolean) || '';
   const flags = (/,\s*"([^"]*)"/.exec(spec) || [])[1] || '';
@@ -194,7 +194,7 @@ function parseFunctions(rows, resolveRef) {
     let ref = resolveRef ? resolveRef(row) : undefined;
     if (!ref && !hasMeta && loc && isInstructionLine(trimmed)) ref = loc;
     const labelMatch = trimmed.match(/^([^\s].*):(?:\s*(?:[#;].*)?)?$/);
-    if (labelMatch && !trimmed.startsWith('.L') && !trimmed.startsWith('$')) {
+    if (labelMatch && !trimmed.startsWith('.L') && !isLocalDollarLabel(trimmed)) {
       const label = labelMatch[1].trim();
       if (looksLikeFunctionLabel(label)) {
         if (current) functions.push(finalizeFunction(current));
@@ -215,8 +215,11 @@ function parseFunctions(rows, resolveRef) {
   if (current) functions.push(finalizeFunction(current));
   return functions;
 }
+// "$LN5@f" and "$L2" are local labels; "$s4geom6squareyS2iF" is a (mangled) Swift function.
+function isLocalDollarLabel(label) { return label.startsWith('$') && !/^\$[sSe]\w/.test(label); }
+
 function looksLikeFunctionLabel(label) {
-  if (!label || label.startsWith('.') || label.startsWith('$')) return false;
+  if (!label || label.startsWith('.') || isLocalDollarLabel(label)) return false;
   if (/^(?:[#;]|\/\/)/.test(label)) return false;   // comment lines such as LLVM's "# %bb.0:"
   if (/^(?:LBB|LBE|Ltmp|LCFI|Lfunc_begin|Lfunc_end|\.L)/.test(label)) return false;
   return /[A-Za-z_?@]/.test(label) && label.length < 500;
@@ -284,7 +287,41 @@ const OPERATOR_TOKEN = /^\s*(\(\s*\)|\[\s*\]|(?:new|delete)\s*(?:\[\s*\])?|co_aw
 // "int square<int>(int)" -> "square", "foo[abi:cxx11]()" -> "foo",
 // "example::generic::<i64>" -> "generic", "main.(*P).Sum" -> "Sum",
 // "output.square(Swift.Int) -> Swift.Int" -> "square", "S::operator==(S) const" -> "operator==".
+// Swift-mangled names (when no demangler is installed): the last of the
+// length-prefixed identifiers: "$s4geom6squareyS2iF" -> "square", "$s4geom3AccV4pushyySiF" -> "push".
+function swiftMangledName(s) {
+  const m = /^_?\$[sSe]/.exec(s);
+  if (!m) return undefined;
+  let i = m[0].length, last;
+  for (;;) {
+    if (/[A-Z]/.test(s[i] || '') && /\d/.test(s[i + 1] || '') && last) i++;   // a kind letter between names (V struct, C class, ...)
+    const n = /^(\d+)/.exec(s.slice(i));
+    if (!n) break;
+    const len = Number(n[1]);
+    const id = s.slice(i + n[1].length, i + n[1].length + len);
+    if (id.length !== len) break;
+    last = id;
+    i += n[1].length + len;
+  }
+  return last;
+}
+
+// MSVC-mangled names (Clang targeting Windows/MSVC, when no demangler handles
+// them): "?push@Acc@mx@@QEAAXH@Z" -> "push", "??$square@H@@YAHH@Z" -> "square",
+// "??0Acc@mx@@QEAA@XZ" -> "Acc", "??1Acc@@..." -> "~Acc", "??8S@@..." -> "operator==".
+const MSVC_OPERATORS = { 2: 'new', 3: 'delete', 4: '=', 5: '>>', 6: '<<', 7: '!', 8: '==', 9: '!=', A: '[]', C: '->', D: '*', E: '++', F: '--', G: '-', H: '+', I: '&', K: '/', L: '%', M: '<', N: '<=', O: '>', P: '>=', R: '()', S: '~', T: '^', U: '|', V: '&&', W: '||', Y: '+=', Z: '-=' };
+function msvcName(s) {
+  let m;
+  if ((m = /^\?\?\$([A-Za-z_$][\w$]*)@/.exec(s))) return m[1];
+  if ((m = /^\?\?([01])([A-Za-z_$][\w$]*)@/.exec(s))) return m[1] === '1' ? `~${m[2]}` : m[2];
+  if ((m = /^\?\?([2-9A-Z])/.exec(s)) && MSVC_OPERATORS[m[1]]) return `operator${MSVC_OPERATORS[m[1]]}`;
+  if ((m = /^\?([A-Za-z_$][\w$]*)@/.exec(s))) return m[1];
+  return undefined;
+}
+
 function normalizeName(name) {
+  const msvc = /^\?[?A-Za-z_$]/.test(String(name || '').trim()) ? msvcName(String(name).trim()) : undefined;
+  if (msvc !== undefined) return msvc;
   let s = String(name || '').trim()
     .replace(/^"([\s\S]*)"$/, '$1')
     .replace(/\s*\[clone[^\]]*\]/g, '')
@@ -293,6 +330,8 @@ function normalizeName(name) {
     .replace(/\(anonymous namespace\)::/g, '')
     .replace(/::h[0-9a-f]{16}$/, '');
   if (/^<[\w.-]+>$/.test(s)) return s;                       // Python: <module>, <lambda>
+  const swift = swiftMangledName(s);
+  if (swift) return swift;
   const py = /\.(<[\w-]+>)$/.exec(s);
   if (py) return py[1];
   s = replaceBraced(s, 'lambda');
@@ -471,7 +510,7 @@ module.exports = {
   IS_WIN, normPath, isSystemPath,
   makeRefResolver, makeLocalRefResolver, localAsmToRows, sectionKind, unescapeAsmString, isMachO, prepareMachO, finishMachO,
   parseFunctions, looksLikeFunctionLabel, isInstructionLine, cleanInstruction, buildLineIndex,
-  stripTemplateArgs, normalizeName, matchSourceSymbol, findFunctionResult, findAllFunctionResults,
+  stripTemplateArgs, normalizeName, msvcName, matchSourceSymbol, findFunctionResult, findAllFunctionResults,
   ANSI_RE, missingIncludesFrom, preprocessorErrorFilesFrom, errorLocationsFrom, stubFilename,
   cleanAssemblyRowsForDisplay, cleanAssemblyForDisplay
 };

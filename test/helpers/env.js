@@ -44,7 +44,8 @@ function fixture(...parts) { return fs.readFileSync(path.join(FIXTURES, ...parts
 
 // The extension activated in a mock VS Code whose workspace is `dir`.
 function start(dir, options = {}) {
-  const ctx = loadExtension({ workspaceFolders: [dir], ...options });
+  // A generous timeout: the first run of a compiler on a fresh CI machine can be slow.
+  const ctx = loadExtension({ workspaceFolders: [dir], ...options, settings: { 'asmLens.requestTimeoutMs': 120000, ...(options.settings || {}) } });
   const at = rel => path.join(dir, rel);
   return {
     ...ctx,

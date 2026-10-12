@@ -5,7 +5,9 @@
 // (recorded responses; live with `node test/run.js --remote`).
 const test = require('node:test');
 const assert = require('node:assert/strict');
+const path = require('path');
 const { spawnSync } = require('child_process');
+const { normPath } = require('../../src/asm');
 const { makeProject, start, fixture, hasCommand, IS_WIN } = require('../helpers/env');
 const { installFetch } = require('../helpers/ce-replay');
 
@@ -57,15 +59,26 @@ async function headerScenario(t, config) {
   assert.deepEqual(cpp.error, []);
   for (const line of [3, 5, 7, 9, 11]) assert.match(await x.lensAt('user.cpp', line), COUNT, `user.cpp line ${line}`);
 
-  // 4. Back in the header: it shows what user.cpp used (inlined at -O2).
-  for (const line of [L.square, L.clamp, L.cube, L.twice]) {
-    assert.match(await x.lensAt('mathx.hxx', line), /^\$\(symbol-numeric\) \d+ (inlined )?instructions.* · via user\.cpp$/, `line ${line}\n${x.describe('mathx.hxx')}`);
+  // 4. Back in the header: it shows what user.cpp used (inlined at -O2). Which
+  // header lines inlined code is attributed to is the compiler's choice (GCC on
+  // arm64 macOS attributes square()'s single instruction to the caller), so
+  // each template must show code exactly when some instruction maps into it.
+  const analysis = x.analysis('mathx.hxx');
+  assert.equal(path.basename(analysis.rootPath), 'user.cpp');
+  const headerKey = normPath(x.at('mathx.hxx'));
+  let withCode = 0;
+  for (const [line, last] of [[L.square, L.square + 1], [L.clamp, L.clamp + 5], [L.cube, L.cube], [L.twice, L.twice]]) {
+    const mapped = analysis.functions.some(f => f.instructionRows.some(r => r.ref && r.ref.key === headerKey && r.ref.line >= line - 1 && r.ref.line <= last - 1));
+    const lens = await x.lensAt('mathx.hxx', line);
+    if (mapped) withCode++;
+    assert.match(lens, mapped ? /^\$\(symbol-numeric\) \d+ (inlined )?instructions.* · via user\.cpp$/ : /No code emitted.* · via user\.cpp$/, `line ${line}\n${x.describe('mathx.hxx')}`);
   }
+  assert.ok(withCode >= 2, `inlined template code should show in the header\n${x.describe('mathx.hxx')}`);
   for (const line of [L.addInts, L.mulInts, L.push, L.get]) assert.match(await x.lensAt('mathx.hxx', line), /No code emitted/, `line ${line}`);
   // The panel opens on a header template's code.
-  const lens = (await x.lenses('mathx.hxx')).find(l => l.line === L.square && l.command === 'asmLens.showAssembly');
+  const lens = (await x.lenses('mathx.hxx')).find(l => l.line === L.clamp && l.command === 'asmLens.showAssembly');
   await x.state.commands.get('asmLens.showAssembly')(...lens.args);
-  assert.match(x.state.webviewHtml, /square/);
+  assert.match(x.state.webviewHtml, /clamp_to/);
   return x;
 }
 

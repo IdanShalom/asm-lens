@@ -131,7 +131,7 @@ function localCommand(langKey, { file, out, flags, text }) {
     case 'swift':
       return {
         args: ['-emit-assembly', '-g', ...flags, '-module-name', crateName(file), file, '-o', out],
-        output: 'file', format: 'gas', demanglers: [['swift-demangle', ['--simplified']], ['xcrun', ['swift-demangle', '--simplified']]]
+        output: 'file', format: 'gas', demanglers: [['swift-demangle', ['--simplified']], ['swift', ['demangle', '--simplified']], ['xcrun', ['swift-demangle', '--simplified']]]
       };
     case 'zig':
       return { args: ['build-obj', ...flags, `-femit-asm=${out}`, '-fno-emit-bin', file], output: 'file', format: 'gas', cwdTemp: true };

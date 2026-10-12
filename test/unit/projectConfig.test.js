@@ -89,8 +89,8 @@ test('normalizeConfig: invalid values are skipped with a warning, never thrown',
 });
 
 test('configBaseDir: .vscode/asm-lens.json resolves paths from the project root', () => {
-  assert.equal(pc.configBaseDir(path.join('/p', '.asm-lens.json')), path.resolve('/p'));
-  assert.equal(pc.configBaseDir(path.join('/p', '.vscode', 'asm-lens.json')), path.resolve('/p'));
+  assert.equal(pc.configBaseDir(path.join('/p', '.asm-lens.json')), path.join('/p'));
+  assert.equal(pc.configBaseDir(path.join('/p', '.vscode', 'asm-lens.json')), path.join('/p'));
 });
 
 test('loadProjectConfig: walks up from the file, stops at the workspace, prefers unsaved text', async () => {

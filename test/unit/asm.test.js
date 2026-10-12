@@ -32,6 +32,20 @@ test('normalizeName: C++ demangled names', () => {
   for (const [input, expected] of Object.entries(cases)) assert.equal(asm.normalizeName(input), expected, input);
 });
 
+test('normalizeName: MSVC-mangled names (Clang for Windows/MSVC)', () => {
+  const cases = {
+    '?push@Acc@mx@@QEAAXH@Z': 'push',
+    '??$square@H@@YAHH@Z': 'square',
+    '?twice@?$Box@N@mx@@QEBANXZ': 'twice',
+    '??0Acc@mx@@QEAA@XZ': 'Acc',
+    '??1Acc@mx@@QEAA@XZ': '~Acc',
+    '??8S@@QEBA_NU0@@Z': 'operator==',
+    '??R<lambda_1>@@QEBAHH@Z': 'operator()',
+    '?main@@YAHXZ': 'main'
+  };
+  for (const [input, expected] of Object.entries(cases)) assert.equal(asm.normalizeName(input), expected, input);
+});
+
 test('normalizeName: other languages', () => {
   const cases = {
     'example::generic::<i64>': 'generic',
@@ -41,6 +55,9 @@ test('normalizeName: other languages', () => {
     'main.(*P).Sum': 'Sum',
     'command-line-arguments.Square': 'Square',
     'output.square(Swift.Int) -> Swift.Int': 'square',
+    '$s4geom6squareyS2iF': 'square',
+    '$s4geom3AccV4pushyySiF': 'push',
+    '_$s4geom6squareyS2iF': 'square',
     'square(_:)': 'square',
     'int example.square(int)': 'square',
     '"square_"': 'square_',
@@ -64,7 +81,7 @@ test('parseFunctions: Compiler Explorer rows with source metadata', () => {
     { text: '        xor     eax, eax', source: { file: null, line: 7 } },
     { text: '        ret', source: { file: null, line: 7 } }
   ];
-  const resolve = asm.makeRefResolver('/w/a.cpp', [{ virtual: 'asm_lens/h.hpp', real: '/w/h.hpp' }]);
+  const resolve = asm.makeRefResolver(asm.normPath('/w/a.cpp'), [{ virtual: 'asm_lens/h.hpp', real: '/w/h.hpp' }]);
   const fns = asm.parseFunctions(rows, resolve);
   assert.deepEqual(fns.map(f => [f.name, f.count]), [['sq(int)', 3], ['other()', 2]]);
   assert.deepEqual(fns[0].instructionRows.map(r => r.ref && [r.ref.key, r.ref.line, r.ref.column]), [
@@ -82,6 +99,8 @@ test('parseFunctions: falls back to .file/.loc directives when rows carry no met
 test('looksLikeFunctionLabel / isInstructionLine', () => {
   for (const l of ['main', '_Z3fooi', 'ns::f(int)', '"square_"', '<module>', '?f@@YAXXZ']) assert.equal(asm.looksLikeFunctionLabel(l), true, l);
   for (const l of ['.L2', '.LBB0_1', 'LBB0_1', 'Ltmp3', '$LN5', '# %bb.0', '; %bb.0', '// x']) assert.equal(asm.looksLikeFunctionLabel(l), false, l);
+  assert.equal(asm.looksLikeFunctionLabel('$s4geom6squareyS2iF'), true);
+  assert.equal(asm.looksLikeFunctionLabel('$L12'), false);
   for (const l of ['mov eax, 1', 'ret', 'b.le .L2', 'LOAD_FAST x', 'IMULQ AX, AX', 'vpaddd ymm0, ymm1, ymm2']) assert.equal(asm.isInstructionLine(l), true, l);
   for (const l of ['.loc 1 2', '# comment', 'label:', '.L2:', 'section .text', '']) assert.equal(asm.isInstructionLine(l), false, l);
 });
@@ -157,7 +176,7 @@ test('localAsmToRows: Mach-O output from Apple Clang (underscores, L labels, ; c
   assert.equal(asm.finishMachO('__Z6sq_inti:\n'), '_Z6sq_inti:\n');
   const rows = asm.localAsmToRows(asm.finishMachO(prepared), '/Users/u/p');
   assert.deepEqual(rows.map(r => r.text.trim()), ['_Z6sq_inti:', '.Lfunc_begin0:', 'mul\tw0, w0, w0', 'ret', 'c_function:', 'ret']);
-  const fns = asm.parseFunctions(rows, asm.makeLocalRefResolver('/Users/u/p/a.cpp', '/Users/u/p'));
+  const fns = asm.parseFunctions(rows, asm.makeLocalRefResolver(asm.normPath('/Users/u/p/a.cpp'), '/Users/u/p'));
   assert.deepEqual(fns.map(f => [f.name, f.count]), [['_Z6sq_inti', 2], ['c_function', 1]]);
   assert.equal(fns[0].instructionRows[0].ref.key, asm.normPath('/Users/u/p/a.cpp'), '"<dir>/<stdin>" is the analyzed file');
   assert.equal(asm.isMachO('\t.text\nmain:\n'), false);
@@ -203,7 +222,7 @@ test('sectionKind and unescapeAsmString', () => {
   const kinds = {
     '.text': true, '.data': false, '.bss': false, '.section .text.unlikely,"ax",@progbits': true, '.section .rodata.str1.1,"aMS",@progbits,1': false,
     '.section .debug_line,"",@progbits': false, '.section .text$mn,"xr"': true, '.section .rdata,"dr"': false, '.section __TEXT,__text,regular,pure_instructions': true,
-    '.section __TEXT,__cstring,cstring_literals': false, '.section __DWARF,__debug_info,regular,debug': false, '.section .mytext,"ax"': true,
+    '.section __TEXT,__cstring,cstring_literals': false, '.section __TEXT,__text_startup,regular,pure_instructions': true, '.section __TEXT,__text_cold,regular,pure_instructions': true, '.section __TEXT,__const': false, '.section __DWARF,__debug_info,regular,debug': false, '.section .mytext,"ax"': true,
     '.data_region jt32': undefined, '.p2align 4': undefined, '.cstring': false
   };
   for (const [t, k] of Object.entries(kinds)) assert.equal(asm.sectionKind(t), k, t);
@@ -315,4 +334,16 @@ test('cleanAssemblyRowsForDisplay: instructions plus only the local labels that 
 test('normPath is case-insensitive only on Windows', () => {
   const p = path.resolve('/Some/Path.H');
   assert.equal(asm.normPath(p), process.platform === 'win32' ? p.toLowerCase() : p);
+});
+
+test('parseFunctions: Swift on Linux without a demangler (mangled $s labels are functions, $L labels are not)', () => {
+  const rows = [
+    'main:', '.Lfunc_begin0:', '\txorl\t%eax, %eax', '\tretq',
+    '$s4geom6squareyS2iF:', '.Lfunc_begin1:', '\timulq\t%rdi, %rdi', '\tjo\t.LBB1_2', '\tretq', '.LBB1_2:', '\tud2',
+    '$s4geom3AccV4pushyySiF:', '\taddq\t(%r13), %rdi', '\tretq', '$L5:', '\tnop'
+  ].map(text => ({ text }));
+  const fns = asm.parseFunctions(rows, () => undefined);
+  assert.deepEqual(fns.map(f => [f.name, f.count, asm.normalizeName(f.name)]), [
+    ['main', 2, 'main'], ['$s4geom6squareyS2iF', 4, 'square'], ['$s4geom3AccV4pushyySiF', 3, 'push']
+  ]);
 });
