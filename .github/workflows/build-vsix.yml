@@ -1,0 +1,35 @@
+name: Build VSIX
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - 'asm-lens-0.4.0 - Copy/extension/**'
+      - '.github/workflows/build-vsix.yml'
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: 'asm-lens-0.4.0 - Copy/extension'
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Check JavaScript syntax
+        run: |
+          node --check extension.js
+          node --check projectConfig.js
+          node -e "JSON.parse(require('fs').readFileSync('package.json','utf8'))"
+
+      - name: Package VSIX
+        run: npx --yes @vscode/vsce package --allow-missing-repository --out asm-lens.vsix
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: asm-lens-vsix
+          path: 'asm-lens-0.4.0 - Copy/extension/asm-lens.vsix'
