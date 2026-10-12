@@ -465,7 +465,7 @@ async function analyzeDocument(document) {
     const symbols = await vscode.commands.executeCommand('vscode.executeDocumentSymbolProvider', document.uri) || [];
     const allSourceFunctions = sourceFunctionsOf(document, symbols);
     const matched = functions.map(fn => {
-      const symbol = matchSourceSymbol(fn.name, allSourceFunctions);
+      const symbol = matchSourceSymbol(fn.name, allSourceFunctions, fn, rootPathKey);
       return { ...fn, sourceName: symbol?.name || fn.name, sourceRange: symbol?.range, sourceSelection: symbol?.selectionRange };
     });
     const paths = new Map([[rootPathKey, document.uri.fsPath]]);
@@ -664,7 +664,7 @@ async function analyzeLocal(document, resolved, settings) {
   const symbols = await vscode.commands.executeCommand('vscode.executeDocumentSymbolProvider', document.uri) || [];
   const allSourceFunctions = sourceFunctionsOf(document, symbols);
   const matched = functions.map(fn => {
-    const symbol = matchSourceSymbol(fn.name, allSourceFunctions);
+    const symbol = matchSourceSymbol(fn.name, allSourceFunctions, fn, rootPathKey);
     return { ...fn, sourceName: symbol?.name || fn.name, sourceRange: symbol?.range, sourceSelection: symbol?.selectionRange };
   });
   const fileKeys = new Set([rootPathKey]);
@@ -1046,7 +1046,26 @@ function buildLineIndex(functions) {
 function normalizeName(name) {
   return String(name || '').replace(/^.*::/, '').replace(/\s+/g, '').replace(/[&*]/g, '').replace(/\(.*$/, '').replace(/\[clone.*\]$/, '');
 }
-function matchSourceSymbol(asmName, symbols) {
+// Picks the source function for an emitted assembly function.
+// 1) By location: the source function whose range contains most of the function's mapped lines
+//    (this tells overloads apart). 2) Fallback: by name, as before.
+function matchSourceSymbol(asmName, symbols, fn, docKey) {
+  if (fn && docKey) {
+    const lines = fn.instructionRows.filter(r => r.ref && r.ref.key === docKey).map(r => r.ref.line);
+    if (lines.length) {
+      let best, bestHits = 0;
+      for (const s of symbols) {
+        if (!s.range) continue;
+        const hits = lines.filter(l => l >= s.range.start.line && l <= s.range.end.line).length;
+        // Prefer more hits; on a tie prefer the smaller (inner) range.
+        if (hits > bestHits || (hits && hits === bestHits && best &&
+            (s.range.end.line - s.range.start.line) < (best.range.end.line - best.range.start.line))) {
+          best = s; bestHits = hits;
+        }
+      }
+      if (best) return best;
+    }
+  }
   const norm = normalizeName(asmName);
   return symbols.find(s => normalizeName(s.name) === norm)
     || symbols.find(s => asmName.includes(s.name) || s.name.includes(asmName))
