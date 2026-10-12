@@ -124,7 +124,6 @@ function normalizeConfig(raw, baseDir) {
   }
   if (typeof raw.compiler === 'string' && raw.compiler.trim()) out.compiler = raw.compiler.trim();
   return out;
-  return out;
 }
 
 // Directory that relative paths in the file are resolved against: the folder
