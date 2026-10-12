@@ -6,15 +6,23 @@ const path = require('path');
 const CONFIG_NAMES = ['.asm-lens.json', path.join('.vscode', 'asm-lens.json')];
 
 const TEMPLATE = `{
+  // First compiler is the default; switch with the status-bar item.
   "compilers": [
     { "id": "g152", "name": "GCC 15.2", "flags": "-O2 -masm=intel" }
   ],
+  // Searched in this order.
   "includePaths": [
     "include",
     "src",
     { "path": "third_party", "recursive": true }
   ],
-  "buildFolders": ["build", "out"]
+  // Searched last, for generated headers.
+  "buildFolders": ["build", "out"],
+  // Never take headers from these folders (added to the built-in list).
+  "excludePaths": [],
+  // Passed as -D<name>.
+  "defines": [],
+  "extraFlags": ""
 }
 `;
 
@@ -44,6 +52,23 @@ function normalizeLanguage(value) {
   return undefined;
 }
 
+function stringList(value, label, warnings) {
+  if (value === undefined) return undefined;
+  if (!Array.isArray(value)) { warnings.push(`"${label}" must be an array of strings.`); return undefined; }
+  return value.filter(x => typeof x === 'string' && x.trim()).map(x => x.trim());
+}
+function normalizeDefines(value, label, warnings) {
+  const list = stringList(value, label, warnings);
+  return list ? list.map(d => d.replace(/^-D/, '')).filter(Boolean) : undefined;
+}
+function normalizeFlags(value, label, warnings) {
+  if (value === undefined) return undefined;
+  if (typeof value === 'string') return value.trim();
+  if (Array.isArray(value)) return value.filter(x => typeof x === 'string').join(' ').trim();
+  warnings.push(`"${label}" must be a string or an array of strings.`);
+  return undefined;
+}
+
 // Validates a parsed config. Invalid entries are skipped and reported in `warnings`.
 function normalizeConfig(raw, baseDir) {
   const warnings = [];
@@ -67,6 +92,10 @@ function normalizeConfig(raw, baseDir) {
     const l = normalizeLanguage(item.language);
     if (item.language !== undefined && !l) warnings.push(`compilers[${i}]: unknown "language" ${JSON.stringify(item.language)}.`);
     if (l) entry.language = l;
+    const defs = normalizeDefines(item.defines, `compilers[${i}].defines`, warnings);
+    if (defs) entry.defines = defs;
+    const extra = normalizeFlags(item.extraFlags, `compilers[${i}].extraFlags`, warnings);
+    if (extra) entry.extraFlags = extra;
     out.compilers.push(entry);
   });
 
@@ -79,6 +108,14 @@ function normalizeConfig(raw, baseDir) {
 
   if (Array.isArray(raw.buildFolders)) out.buildFolders = raw.buildFolders.filter(x => typeof x === 'string' && x.trim()).map(x => x.trim());
   else if (raw.buildFolders !== undefined) warnings.push('"buildFolders" must be an array of folder names.');
+
+  const excludes = stringList(raw.excludePaths, 'excludePaths', warnings);
+  if (excludes) out.excludePaths = excludes;
+  const defines = normalizeDefines(raw.defines, 'defines', warnings);
+  if (defines) out.defines = defines;
+  const extraFlags = normalizeFlags(raw.extraFlags, 'extraFlags', warnings);
+  if (extraFlags) out.extraFlags = extraFlags;
+  if (raw.uploadSystemHeaders !== undefined) out.uploadSystemHeaders = raw.uploadSystemHeaders === true;
   return out;
 }
 
