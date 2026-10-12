@@ -563,6 +563,35 @@ function makeLocalRefResolver(mainKey, cwd) {
   };
 }
 
+// Converts raw `-S -g` output into Compiler Explorer-style rows: { text, source }.
+// Reads .file/.loc for line info and drops assembler directives and comments.
+function localAsmToRows(asm, cwd) {
+  const files = new Map();
+  let cur = null;
+  const rows = [];
+  for (const raw of asm.split(/\r?\n/)) {
+    const line = raw.replace(/\s+$/, '');
+    const t = line.trim();
+    let m;
+    if ((m = t.match(/^\.file\s+(\d+)\s+"([^"]*)"(?:\s+"([^"]*)")?/))) {
+      const name = m[3] !== undefined ? (path.isAbsolute(m[3]) ? m[3] : path.join(m[2] || cwd, m[3])) : m[2];
+      files.set(Number(m[1]), name);
+      continue;
+    }
+    if ((m = t.match(/^\.loc\s+(\d+)\s+(\d+)(?:\s+(\d+))?/))) {
+      const line0 = Number(m[2]);
+      cur = line0 > 0 ? { file: files.get(Number(m[1])) || '<stdin>', line: line0, column: m[3] ? Number(m[3]) : undefined } : null;
+      continue;
+    }
+    if (!t || t.startsWith('#') || t.startsWith('//')) continue;
+    if (/^\.[A-Za-z_]/.test(t) && !/^\.[\w.$]+:/.test(t)) continue;   // directive, not a label
+    if (/^\.L(?:tmp|func_end|fe|ASF|FB|FE|VL|ehtable|Lexception|Ldebug|Linfo|Lsection)/.test(t)) continue; // debug/EH labels
+    const isLabel = /^[^\s].*:\s*(#.*)?$/.test(line);
+    rows.push({ text: line, source: isLabel || !cur ? undefined : { ...cur } });
+  }
+  return rows;
+}
+
 async function analyzeLocal(document, resolved, settings) {
   if (document.uri.scheme !== 'file') throw new Error('Local mode needs a file that is saved on disk.');
   const key = fileKey(document);
@@ -590,7 +619,7 @@ async function analyzeLocal(document, resolved, settings) {
     const args = [
       ...splitArgs(flags), ...incDirs.map(d => `-I${d}`), '-iquote', cwd,
       ...(stubbed.length ? [`-I${stubDir}`] : []),
-      '-S', '-g1', '-fdiagnostics-color=never', '-x', lang, '-o', '-', '-'
+      '-S', '-g', '-fdiagnostics-color=never', '-x', lang, '-o', '-', '-'
     ];
     const r = await runProcess(compiler, args, { cwd, input: source, timeoutMs });
     if (r.code === 0) { asm = r.stdout; break; }
@@ -629,7 +658,8 @@ async function analyzeLocal(document, resolved, settings) {
     if (d.code === 0 && d.stdout) asm = d.stdout;
   } catch (_) { /* c++filt not installed: keep mangled names */ }
 
-  const rows = asm.split(/\r?\n/);
+  const rows = localAsmToRows(asm, cwd);
+  asm = rows.map(r => r.text).join('\n');
   const functions = parseFunctions(rows, makeLocalRefResolver(rootPathKey, cwd));
   const symbols = await vscode.commands.executeCommand('vscode.executeDocumentSymbolProvider', document.uri) || [];
   const allSourceFunctions = sourceFunctionsOf(document, symbols);
