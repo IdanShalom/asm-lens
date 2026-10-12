@@ -320,7 +320,8 @@ function msvcName(s) {
 }
 
 function normalizeName(name) {
-  const msvc = /^\?[?A-Za-z_$]/.test(String(name || '').trim()) ? msvcName(String(name).trim()) : undefined;
+  const unquoted = String(name || '').trim().replace(/^"([\s\S]*)"$/, '$1');   // LLVM quotes names with ?, @, $
+  const msvc = /^\?[?A-Za-z_$]/.test(unquoted) ? msvcName(unquoted) : undefined;
   if (msvc !== undefined) return msvc;
   let s = String(name || '').trim()
     .replace(/^"([\s\S]*)"$/, '$1')

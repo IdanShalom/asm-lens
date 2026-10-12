@@ -363,3 +363,95 @@ test('header with an MSVC compiler on Compiler Explorer: no __attribute__((used)
     assert.equal(ce.requests[0].body.source, 'inline int a() { return 1; }\n');
   } finally { ce.restore(); }
 });
+
+test('progress: a notification with steps for a requested analysis, a status-bar spinner for automatic ones', async () => {
+  const dir = makeProject({ 'a.cpp': 'int f() { return 1; }\n' });
+  const ce = fakeCompilerExplorer(() => ({ code: 0, asm: asmFor(['f()', 1]) }));
+  try {
+    const x = start(dir);
+    await x.analyze('a.cpp');
+    const p = x.state.progress[0];
+    assert.equal(p.opts.location, x.vscode.ProgressLocation.Notification);
+    assert.equal(p.opts.cancellable, true);
+    assert.deepEqual(p.messages, ['reading settings…', 'finding local headers…', 'compiling with g152 on godbolt.org…', 'matching functions with the source…']);
+    // Saving the analyzed file analyzes it again, quietly.
+    await x.state.saveListener(x.open('a.cpp'));
+    const auto = x.state.progress[1];
+    assert.equal(auto.opts.location, x.vscode.ProgressLocation.Window);
+    assert.equal(auto.opts.cancellable, false);
+  } finally { ce.restore(); }
+});
+
+test('cancel: stops the request, reports nothing as an error, keeps no result', async () => {
+  const dir = makeProject({ 'a.cpp': 'int f() { return 1; }\n' });
+  const real = global.fetch;
+  let started;
+  global.fetch = (url, init) => new Promise((resolve, reject) => {
+    started();
+    init.signal.addEventListener('abort', () => { const e = new Error('aborted'); e.name = 'AbortError'; reject(e); });
+  });
+  try {
+    const x = start(dir);
+    const running = x.analyze('a.cpp');
+    await new Promise(r => { started = r; });
+    assert.deepEqual((await x.lenses('a.cpp')).map(l => l.title), ['$(sync~spin) Analyzing…']);
+    x.state.cancelProgress();
+    const msg = await running;
+    assert.deepEqual(msg.error, []);
+    assert.equal(x.analysis('a.cpp'), undefined);
+    assert.ok(x.state.outputLines.some(l => l.startsWith('Cancelled:')));
+    assert.deepEqual((await x.lenses('a.cpp')).map(l => l.title), ['$(play) Analyze with Asm Lens']);
+  } finally { global.fetch = real; }
+});
+
+test('cancel in local mode kills the compiler process', { skip: process.platform === 'win32' && 'uses a POSIX shell script as the compiler' }, async () => {
+  const fs = require('fs');
+  const dir = makeProject({ 'a.cpp': 'int f() { return 1; }\n', 'slow-cc': '#!/bin/sh\nsleep 30\n' });
+  fs.chmodSync(path.join(dir, 'slow-cc'), 0o755);
+  fs.writeFileSync(path.join(dir, '.asm-lens.json'), JSON.stringify({ mode: 'local', compiler: './slow-cc' }));
+  const x = start(dir);
+  const t0 = Date.now();
+  const running = x.analyze('a.cpp');
+  setTimeout(() => x.state.cancelProgress(), 300);
+  const msg = await running;
+  assert.ok(Date.now() - t0 < 10000, 'returned soon after cancel');
+  assert.deepEqual(msg.error, []);
+});
+
+test('unchanged code is not compiled twice (reply cache)', async () => {
+  const dir = makeProject({ 'a.cpp': 'int f() { return 1; }\n' });
+  const ce = fakeCompilerExplorer(() => ({ code: 0, asm: asmFor(['f()', 1]) }));
+  try {
+    const x = start(dir);
+    await x.analyze('a.cpp');
+    await x.analyze('a.cpp');
+    assert.equal(ce.requests.length, 1);
+    const doc = x.open('a.cpp');
+    doc.setText('int f() { return 2; }\n');
+    x.state.changeListener({ document: doc, contentChanges: [{}] });
+    await x.analyze('a.cpp');
+    assert.equal(ce.requests.length, 2);
+  } finally { ce.restore(); }
+});
+
+test('saving a header analyzes again the .cpp whose results it shows (unless turned off)', async () => {
+  const dir = makeProject({ 'm.hxx': '#pragma once\ninline int h() { return 1; }\n', 'u.cpp': '#include "m.hxx"\nint u() { return h(); }\n', 'other.hxx': '#pragma once\n' });
+  const ce = fakeCompilerExplorer(() => ({ code: 0, asm: [{ text: 'u():' }, { text: '        mov eax, 1', source: { file: 'asm_lens/m.hxx', line: 2 } }, { text: '        ret', source: { file: null, line: 2 } }] }));
+  try {
+    const x = start(dir);
+    await x.analyze('u.cpp');
+    const header = x.open('m.hxx');
+    header.setText('#pragma once\ninline int h() { return 7; }\n');
+    x.state.changeListener({ document: header, contentChanges: [{}] });
+    assert.equal(x.analysis('m.hxx'), undefined, 'the edit invalidated the results');
+    await x.state.saveListener(header);
+    await new Promise(r => setTimeout(r, 50));
+    assert.equal(ce.requests.length, 2);
+    assert.equal(x.analysis('m.hxx').rootPath, x.at('u.cpp'));
+    await x.state.saveListener(x.open('other.hxx'));
+    assert.equal(ce.requests.length, 2, 'an unrelated file does not trigger anything');
+    x.state.settings['asmLens.reanalyzeOnSave'] = false;
+    await x.state.saveListener(x.open('u.cpp'));
+    assert.equal(ce.requests.length, 2);
+  } finally { ce.restore(); }
+});

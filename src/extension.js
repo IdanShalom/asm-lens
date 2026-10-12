@@ -4,11 +4,12 @@ const path = require('path');
 const crypto = require('crypto');
 const os = require('os');
 const { spawn } = require('child_process');
+const { AsyncLocalStorage } = require('async_hooks');
 const projectConfig = require('./projectConfig');
 const scan = require('./cppScan');
 const languages = require('./languages');
 const {
-  normPath, makeRefResolver, makeLocalRefResolver, localAsmToRows, isMachO, prepareMachO, finishMachO,
+  IS_WIN, normPath, makeRefResolver, makeLocalRefResolver, localAsmToRows, isMachO, prepareMachO, finishMachO,
   parseFunctions, buildLineIndex, normalizeName,
   matchSourceSymbol, findFunctionResult, findAllFunctionResults,
   ANSI_RE, missingIncludesFrom, preprocessorErrorFilesFrom, errorLocationsFrom, stubFilename,
@@ -30,6 +31,11 @@ let outputPanel;
 let panelState;
 let outputChannel;
 let analysisBusy = new Set();
+// Files to analyze again once their running analysis ends (saved meanwhile).
+const rerunAfter = new Set();
+// Files analyzed in this session, for re-analysis on save:
+// file key -> { uri, deps (file path keys it used), stamp (when) }. Kept when edits invalidate the results.
+const analyzedFiles = new Map();
 let codeLensEmitter;
 let extContext;
 let statusItem;
@@ -193,7 +199,7 @@ async function ceDefaultCompiler(baseUrl, lang) {
 }
 
 async function refreshStatusBar() {
-  if (!statusItem) return;
+  if (!statusItem || analysisBusy.size) return;
   const document = vscode.window.activeTextEditor?.document;
   if (!document || !LANGS.includes(document.languageId)) return statusItem.hide();
   try {
@@ -239,6 +245,9 @@ function activate(context) {
       // while symbols are being collected, so an earlier snapshot can be stale.
       const cached = analysisFor(document);
       const functions = sourceFunctionsOf(document, tree);
+      if (analysisBusy.has(fileKey(document))) {
+        return functions.map(sym => new vscode.CodeLens(sym.range, { title: '$(sync~spin) Analyzing…', command: 'asmLens.showOutput' }));
+      }
       const templates = templateTargetsOf(document, functions);
       const extra = templateLenses(document, templates);
       if (!cached) {
@@ -438,6 +447,20 @@ function activate(context) {
     if (!result) result = inlinedResultFor(sym, cached, key);
     if (!result) return vscode.window.showInformationMessage(`No emitted code for ${functionName}. It may be unused, fully inlined, or a template that is never instantiated.`);
     showAssembly(result, cached);
+  }));
+
+  // Saving a file analyzes again the newest analysis that used it: the file's
+  // own, or (for a header) that of the file including it.
+  context.subscriptions.push(vscode.workspace.onDidSaveTextDocument(document => {
+    if (!config().get('reanalyzeOnSave', true) || !LANGS.includes(document.languageId)) return;
+    const key = docPathKey(document);
+    let newest;
+    for (const [rootKey, entry] of analyzedFiles) {
+      if ((rootKey === fileKey(document) || entry.deps.has(key)) && (!newest || entry.stamp > newest.stamp)) newest = entry;
+    }
+    if (!newest) return;
+    if (newest.uri.toString() === document.uri.toString()) return analyzeDocument(document, { auto: true });
+    vscode.workspace.openTextDocument(newest.uri).then(d => analyzeDocument(d, { auto: true }), () => {});
   }));
 
   context.subscriptions.push(vscode.workspace.onDidChangeTextDocument(event => {
@@ -769,16 +792,91 @@ function firstErrorMessage(errText) {
 }
 
 // ---------------------------------------------------------------------------
+// Progress and cancellation
+//
+// Each analysis runs as a "job" (progress reporter + cancellation) kept in
+// async-local storage, so the compile helpers below find it without passing it
+// through every call.
+
+const jobContext = new AsyncLocalStorage();
+
+class Cancelled extends Error { constructor() { super('Cancelled.'); this.name = 'Cancelled'; } }
+
+function report(message) {
+  const job = jobContext.getStore();
+  if (job) job.report(message);
+}
+function throwIfCancelled() {
+  if (jobContext.getStore()?.cancelled) throw new Cancelled();
+}
+
+// Runs `task` with a progress UI: a notification with a progress bar and a
+// Cancel button when the user asked for the analysis, a status-bar spinner for
+// automatic ones (on save). The status-bar item and the CodeLens spin meanwhile.
+function withJob(document, auto, task) {
+  const name = path.basename(document.fileName);
+  return vscode.window.withProgress({
+    location: auto ? vscode.ProgressLocation.Window : vscode.ProgressLocation.Notification,
+    title: auto ? `Asm Lens: ${name}` : `Asm Lens: analyzing ${name}`,
+    cancellable: !auto
+  }, (progress, token) => {
+    const job = {
+      cancelled: false,
+      aborts: new Set(),
+      children: new Set(),
+      report(message) {
+        progress.report({ message });
+        setBusyStatus(message);
+      }
+    };
+    token?.onCancellationRequested?.(() => {
+      job.cancelled = true;
+      for (const c of job.aborts) c.abort();
+      for (const child of [...job.children]) child.kill();
+    });
+    return jobContext.run(job, task);
+  });
+}
+
+function setBusyStatus(message) {
+  if (!statusItem) return;
+  statusItem.text = `$(sync~spin) Asm Lens${message ? `: ${message}` : ''}`;
+  statusItem.tooltip = 'Asm Lens is compiling. Click to change the compiler.';
+  statusItem.show();
+}
+
+// ---------------------------------------------------------------------------
 // Analysis
 
-async function analyzeDocument(document) {
+async function analyzeDocument(document, { auto = false } = {}) {
   const key = fileKey(document);
-  if (analysisBusy.has(key)) return;
+  if (analysisBusy.has(key)) { if (auto) rerunAfter.add(key); return; }
   if (!LANGS.includes(document.languageId)) {
     return vscode.window.showWarningMessage(`Asm Lens supports C, C++, Objective-C, Rust, Go, Python, Zig, Swift, D and Fortran files (this file is "${document.languageId}").`);
   }
   analysisBusy.add(key);
+  if (!analyzedFiles.has(key)) analyzedFiles.set(key, { uri: document.uri, deps: new Set([docPathKey(document)]), stamp: 0 });
+  codeLensEmitter?.fire();
   try {
+    await withJob(document, auto, () => runAnalysis(document));
+  } finally {
+    analysisBusy.delete(key);
+    codeLensEmitter?.fire();
+    refreshStatusBar();
+    if (rerunAfter.delete(key)) analyzeDocument(document, { auto: true });
+  }
+}
+
+async function runAnalysis(document) {
+  // Ask the language server for the file's functions now, in parallel with the
+  // compile (it can be slow while it indexes); the answer is used at the end.
+  const job = jobContext.getStore();
+  if (job) {
+    job.symbols = Promise.resolve(vscode.commands.executeCommand('vscode.executeDocumentSymbolProvider', document.uri)).then(s => s || [], () => []);
+    job.symbolsVersion = document.version;
+  }
+  try {
+    report('reading settings…');
     const settings = config();
     const resolved = await resolveSettings(document);
     if (resolved.configError) vscode.window.showWarningMessage(`Asm Lens: ${resolved.configError} Using VS Code settings instead.`);
@@ -791,6 +889,7 @@ async function analyzeDocument(document) {
     // MSVC does not know __attribute__((used)), so headers are compiled as they are.
     const msvc = /^vcpp|msvc/i.test(`${compilerId} ${resolved.active.name || ''}`);
     const prepared = prepareCSource(document, { keep: !msvc });
+    report('finding local headers…');
     const includeBundle = await collectLocalIncludes(document, resolved.includePaths, {
       maxFiles: resolved.maxIncludeFiles, buildFolders: resolved.buildFolders,
       excludePaths: resolved.excludePaths, uploadSystemHeaders: resolved.uploadSystemHeaders
@@ -854,10 +953,14 @@ async function analyzeDocument(document) {
     if (!functions.length && prepared.isHeader) return reportHeaderWithoutCode(document);
     vscode.window.showInformationMessage(`Asm Lens: found ${functions.length} emitted function bodies${includeBundle.pathMap.length ? `; uploaded ${includeBundle.pathMap.length} local header(s)` : ''}${notes.length ? ` (${notes.join('; ')}; see the Asm Lens output)` : ''}.`);
   } catch (e) {
+    if (e.name === 'Cancelled' || jobContext.getStore()?.cancelled) {
+      outputChannel.appendLine(`Cancelled: ${document.fileName}`);
+      return;
+    }
     const message = e.name === 'AbortError' ? 'Compiler Explorer request timed out.' : e.message;
     outputChannel.appendLine(`Error: ${message}`);
     vscode.window.showErrorMessage(`Asm Lens: ${message}`);
-  } finally { analysisBusy.delete(key); }
+  }
 }
 
 function reportHeaderWithoutCode(document) {
@@ -899,9 +1002,14 @@ let lastStamp = 0;
 // Parses rows (Compiler Explorer style), matches functions with the document's
 // symbols, stores the analysis and refreshes CodeLens.
 async function recordAnalysis(document, o) {
+  throwIfCancelled();
+  report('matching functions with the source…');
   const rootPathKey = docPathKey(document);
   const functions = parseFunctions(o.rows, o.resolveRef);
-  const symbols = await vscode.commands.executeCommand('vscode.executeDocumentSymbolProvider', document.uri) || [];
+  const job = jobContext.getStore();
+  const symbols = (job?.symbols && job.symbolsVersion === document.version
+    ? await job.symbols
+    : await vscode.commands.executeCommand('vscode.executeDocumentSymbolProvider', document.uri)) || [];
   const allSourceFunctions = sourceFunctionsOf(document, symbols);
   const matched = functions.map(fn => {
     const symbol = matchSourceSymbol(fn.name, allSourceFunctions, fn, rootPathKey, { requireName: o.requireName });
@@ -933,6 +1041,7 @@ async function recordAnalysis(document, o) {
     sourceVersion: document.version
   };
   lastAnalysis.set(fileKey(document), result);
+  analyzedFiles.set(fileKey(document), { uri: document.uri, deps, stamp: lastStamp });
   codeLensEmitter?.fire();
   return result;
 }
@@ -946,29 +1055,41 @@ function splitArgs(s) {
 }
 
 function runProcess(cmd, args, { cwd, input, timeoutMs }) {
+  const job = jobContext.getStore();
+  if (job?.cancelled) return Promise.reject(new Cancelled());
   return new Promise((resolve, reject) => {
     let child;
-    try { child = spawn(cmd, args, { cwd, windowsHide: true }); } catch (e) { return reject(e); }
+    // Its own process group (POSIX), so cancelling also stops what the compiler started (cc1plus, as, ...).
+    try { child = spawn(cmd, args, { cwd, windowsHide: true, detached: !IS_WIN }); } catch (e) { return reject(e); }
     const out = [], err = [];
-    let killed = false;
-    const timer = setTimeout(() => { killed = true; child.kill('SIGKILL'); }, timeoutMs || 60000);
+    let done = false;
+    const finish = fn => { if (done) return; done = true; clearTimeout(timer); job?.children.delete(entry); fn(); };
+    const entry = { kill: () => { killTree(child); finish(() => reject(new Cancelled())); } };
+    job?.children.add(entry);
+    const timer = setTimeout(() => { killTree(child); finish(() => reject(new Error(`${cmd} timed out.`))); }, timeoutMs || 60000);
     child.stdout.on('data', d => out.push(d));
     child.stderr.on('data', d => err.push(d));
-    child.on('error', e => {
-      clearTimeout(timer);
+    child.on('error', e => finish(() => {
       if (e.code !== 'ENOENT') return reject(e);
       const missing = new Error(`"${cmd}" was not found. Install it or set "compiler" in .asm-lens.json.`);
       missing.code = 'ENOENT';
       reject(missing);
-    });
-    child.on('close', code => {
-      clearTimeout(timer);
-      if (killed) return reject(new Error(`${cmd} timed out.`));
-      resolve({ code, stdout: Buffer.concat(out).toString('utf8'), stderr: Buffer.concat(err).toString('utf8') });
-    });
+    }));
+    child.on('close', code => finish(() => resolve({ code, stdout: Buffer.concat(out).toString('utf8'), stderr: Buffer.concat(err).toString('utf8') })));
     child.stdin.on('error', () => {});
     child.stdin.end(input || '');
   });
+}
+
+// Stops a process and everything it started.
+function killTree(child) {
+  if (!child.pid) return;
+  try {
+    if (IS_WIN) spawn('taskkill', ['/pid', String(child.pid), '/T', '/F'], { windowsHide: true }).on('error', () => child.kill());
+    else process.kill(-child.pid, 'SIGKILL');
+  } catch (_) {
+    try { child.kill('SIGKILL'); } catch (__) { /* already gone */ }
+  }
 }
 
 // [[folder with symlinks resolved, folder as the editor names it], ...]
@@ -1025,6 +1146,7 @@ async function analyzeLocal(document, resolved, settings) {
       ...(stubbed.length ? [`-I${stubDir}`] : []),
       '-S', '-g', '-fdiagnostics-color=never', '-x', lang, '-o', '-', '-'
     ];
+    report(attempt === 1 ? `compiling with ${path.basename(compiler)}…` : `compiling again (${attempt}/${maxAttempts}), working around errors…`);
     const r = await runProcess(compiler, args, { cwd, input: source, timeoutMs });
     if (r.code === 0) { asm = r.stdout; break; }
     const err = r.stderr.replace(ANSI_RE, '');
@@ -1079,6 +1201,7 @@ async function analyzeLocal(document, resolved, settings) {
   }
 
   // Demangle names (if c++filt exists) so they match source function names.
+  report('reading the assembly…');
   const macho = isMachO(asm);
   if (macho) asm = prepareMachO(asm);
   asm = await demangle(asm, [['c++filt', []], ['llvm-cxxfilt', []]], cwd, timeoutMs);
@@ -1124,12 +1247,14 @@ async function analyzeOtherLanguage(document, resolved, settings) {
   let rows, resolveRef, compilerId, compilerLabel;
   if (resolved.mode === 'local') {
     if (!lang.local) throw new Error(`Local mode is not available for ${lang.label}. Add a ${lang.label} compiler with "mode": "remote" to .asm-lens.json to use Compiler Explorer for it.`);
+    report(`compiling with ${path.basename(resolved.localCompiler || '')}…`);
     ({ rows, resolveRef } = await compileOtherLocally(document, resolved, splitArgs(flags), timeoutMs));
     compilerId = resolved.localCompiler;
     compilerLabel = `${path.basename(compilerId)} (local)`;
   } else {
     compilerId = resolved.active.isDefault ? await ceDefaultCompiler(resolved.baseUrl, lang) : resolved.active.id;
     compilerLabel = resolved.active.isDefault ? `${lang.label} ${compilerId}` : resolved.active.name || compilerId;
+    report(`compiling with ${compilerId} on ${hostOf(resolved.baseUrl)}…`);
     const data = await postCompile({ baseUrl: resolved.baseUrl, compilerId, language: lang.id, timeoutMs, source: document.getText(), files: [], flags });
     if (data.code !== undefined && data.code !== 0) {
       const err = stderrText(data) || `Compiler exited with code ${data.code}`;
@@ -1206,22 +1331,50 @@ async function compileOtherLocally(document, resolved, flags, timeoutMs) {
 // remaining errors are inside specific functions, those functions are blanked
 // out -- keeping every line number intact -- and we retry.
 
-const CE_FILTERS = { binary: false, binaryObject: false, commentOnly: false, demangle: true, directives: false, execute: false, intel: true, labels: true, libraryCode: false, trim: false };
+// Directives (debug info, section switches) and comment-only lines are left out
+// on the server: the per-row source metadata still maps every instruction to its
+// line, and the reply is 5 to 15 times smaller.
+const CE_FILTERS = { binary: false, binaryObject: false, commentOnly: true, demangle: true, directives: true, execute: false, intel: true, labels: true, libraryCode: false, trim: false };
+
+function hostOf(url) { try { return new URL(url).host; } catch (_) { return url; } }
+
+// Replies for identical requests (same code, headers, compiler and flags), so
+// analyzing unchanged code again is instant. Kept in memory for the session.
+const replyCache = new Map();
+const REPLY_CACHE_SIZE = 40;
 
 async function postCompile({ baseUrl, compilerId, language, timeoutMs, source, files, flags }) {
+  const url = `${baseUrl}/api/compiler/${encodeURIComponent(compilerId)}/compile`;
+  const body = JSON.stringify({ source, lang: language, ...(files.length ? { files } : {}), options: { userArguments: flags, filters: CE_FILTERS } });
+  const cacheKey = crypto.createHash('sha1').update(`${url}\n${body}`).digest('hex');
+  if (replyCache.has(cacheKey)) {
+    const cached = replyCache.get(cacheKey);
+    replyCache.delete(cacheKey);
+    replyCache.set(cacheKey, cached);
+    return JSON.parse(cached);
+  }
+  throwIfCancelled();
+  const job = jobContext.getStore();
   const controller = new AbortController();
+  job?.aborts.add(controller);
   const timeout = setTimeout(() => controller.abort(), timeoutMs);
-  let response;
+  let response, text;
   try {
-    response = await fetch(`${baseUrl}/api/compiler/${encodeURIComponent(compilerId)}/compile`, {
+    response = await fetch(url, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
-      body: JSON.stringify({ source, lang: language, ...(files.length ? { files } : {}), options: { userArguments: flags, filters: CE_FILTERS } }),
+      body,
       signal: controller.signal
     });
-  } finally { clearTimeout(timeout); }
+    text = await response.text();
+  } catch (e) {
+    if (job?.cancelled) throw new Cancelled();
+    throw e;
+  } finally { clearTimeout(timeout); job?.aborts.delete(controller); }
   if (!response.ok) throw new Error(`Compiler Explorer returned HTTP ${response.status}. Check the compiler ID and network connection.`);
-  return response.json();
+  replyCache.set(cacheKey, text);
+  if (replyCache.size > REPLY_CACHE_SIZE) replyCache.delete(replyCache.keys().next().value);
+  return JSON.parse(text);
 }
 
 function stderrText(data) {
@@ -1242,6 +1395,7 @@ async function compileWithRecovery(opts) {
   let flags = [opts.flags, ...includeBundle.includeFlags].filter(Boolean).join(' ');
   let lastErr = '';
   for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    report(attempt === 1 ? `compiling with ${opts.compilerId} on ${hostOf(opts.baseUrl)}…` : `compiling again (${attempt}/${maxAttempts}), working around errors…`);
     const data = await postCompile({ ...opts, source, files, flags });
     if (data.code === undefined || data.code === 0) {
       if (attempt > 1) outputChannel.appendLine(`Compiled after ${attempt - 1} recovery step(s).`);

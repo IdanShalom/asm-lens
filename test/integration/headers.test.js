@@ -88,7 +88,7 @@ async function unoptimizedScenario(t, config) {
   const dir = makeProject({ 'mathx.hxx': fixture('headers', 'mathx.hxx'), 'user.cpp': fixture('headers', 'user.cpp') }, config);
   const x = start(dir);
   assert.deepEqual((await x.analyze('user.cpp')).error, []);
-  assert.match(await x.lensAt('mathx.hxx', L.square), /^\$\(symbol-numeric\) 2 instantiations · \d+ \/ \d+ instructions · .* via user\.cpp$/);
+  assert.match(await x.lensAt('mathx.hxx', L.square), /^\$\(symbol-numeric\) 2 instantiations · \d+ \/ \d+ instructions · .* via user\.cpp$/, x.describe('mathx.hxx'));
   for (const line of [L.clamp, L.cube, L.twice]) assert.match(await x.lensAt('mathx.hxx', line), /^\$\(symbol-numeric\) \d+ instructions · .* via user\.cpp$/, `line ${line}`);
   const names = x.analysis('mathx.hxx').functions.map(f => f.name).join('\n');
   assert.match(names, /square<int>/);

@@ -28,6 +28,10 @@ Go, Python, Zig, Swift, D and Fortran are supported too.
   compiler would find them; a missing header is replaced by an empty file; a function
   that does not compile is skipped and marked *Not compiled*, and the rest is analyzed.
 - **Remote or local**, per project or per compiler, on Windows, Linux and macOS.
+- **Fast, and visibly working**: a progress notification shows each step (finding headers,
+  compiling, retrying around errors) with a **Cancel** button; the status bar and the CodeLens
+  spin while it runs. Saving re-analyzes automatically, unchanged code is answered from a cache,
+  and Compiler Explorer is asked for compact replies.
 
 ## Quick start
 
@@ -35,6 +39,9 @@ Go, Python, Zig, Swift, D and Fortran are supported too.
 2. Click **Analyze with Asm Lens** above any function (or run **Asm Lens: Analyze Current File**,
    or right-click in the editor).
 3. Click a count to open the assembly view. Hover lines in either view.
+
+While it compiles, a notification shows what is happening and lets you cancel. After that,
+saving the file updates the counts by itself.
 
 By default the file is compiled on godbolt.org with GCC 15.2 and `-O2 -masm=intel`.
 Choose another compiler with the compiler name in the status bar (bottom right) or
@@ -51,7 +58,7 @@ project, run **Asm Lens: Open or Create Project Config** (see [`.asm-lens.json`]
 | Headers             | Found locally and uploaded with their folder layout            | Read from disk by the compiler; `includePaths` become `-I`    |
 | Standard library    | The server's                                                   | Yours                                                          |
 | Target              | What the server's compiler targets (mostly Linux x86-64)       | Your OS and CPU (x86-64, arm64; ELF, COFF or Mach-O)           |
-| Speed               | A network round trip (about 0.5–5 s)                           | Usually well under a second                                    |
+| Speed               | A network round trip (about 0.5–5 s); unchanged code is answered from a cache | Usually well under a second                                    |
 | Works offline       | No                                                             | Yes                                                            |
 | Unsaved edits       | Used                                                           | Used                                                           |
 | Missing headers, failing functions | Recovered (see below)                           | Recovered the same way                                         |
@@ -201,6 +208,7 @@ Each object in `compilers` may have:
 |---------|---------|---------|
 | `asmLens.mode` | `remote` | Where to compile when `.asm-lens.json` does not say. |
 | `asmLens.localCompiler` | `""` (= `g++`) | Local C/C++ compiler when `.asm-lens.json` does not name one. |
+| `asmLens.reanalyzeOnSave` | `true` | Saving a file that was analyzed (or a header an analyzed file uses) analyzes it again, with a status-bar spinner instead of a notification. |
 | `asmLens.baseUrl` | `https://godbolt.org` | Compiler Explorer server. |
 | `asmLens.compilerId` | `g152` | Compiler Explorer compiler for C/C++ without a project file. **Select Compiler** sets it. |
 | `asmLens.compilerName` | `GCC (selected ID)` | Its label in the CodeLens. |

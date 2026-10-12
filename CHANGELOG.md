@@ -33,6 +33,16 @@
 - `.asm-lens.json`: compilers listed for one language are no longer used for others; the schema now
   lists every option (`mode`, `compiler`, `defines`, `excludePaths`, … were reported as unknown).
 
+### Faster, with progress
+- A progress notification shows each step (finding headers, compiling, retrying around errors)
+  with a Cancel button that stops the request or the compiler and everything it started. The
+  status bar and the CodeLens spin while an analysis runs.
+- Saving a file that was analyzed (or a header an analyzed file uses) analyzes it again
+  (`asmLens.reanalyzeOnSave`).
+- Compiler Explorer is asked to leave out directives and comment lines: replies are 5 to 15 times
+  smaller with the same results. Identical requests are answered from an in-memory cache.
+- The language server's symbols are fetched while the code compiles, not after.
+
 ### New
 - Languages: Rust, Go, Python (bytecode), Zig, Swift, D and Fortran, on Compiler Explorer and (except D)
   with a local compiler.

@@ -103,7 +103,8 @@ function createVscode(options = {}) {
     selectionListeners: [],
     workspaceState: new Map(),
     globalState: new Map(),
-    shownDocuments: []
+    shownDocuments: [],
+    progress: []
   };
 
   // Like VS Code: a setting that is not set returns the default declared in package.json.
@@ -159,7 +160,7 @@ function createVscode(options = {}) {
       createFileSystemWatcher() { return { onDidChange() {}, onDidCreate() {}, onDidDelete() {}, dispose() {} }; },
       onDidChangeConfiguration() { return { dispose() {} }; },
       onDidChangeTextDocument(fn) { state.changeListener = fn; return { dispose() {} }; },
-      onDidSaveTextDocument() { return { dispose() {} }; },
+      onDidSaveTextDocument(fn) { state.saveListener = fn; return { dispose() {} }; },
       onDidCloseTextDocument() { return { dispose() {} }; }
     },
     window: {
@@ -203,7 +204,15 @@ function createVscode(options = {}) {
         state.shownDocuments.push(doc.fileName);
         return state.activeEditor;
       },
-      async withProgress(_opts, task) { return task({ report() {} }, new CancellationTokenSource().token); },
+      // Records progress; tests cancel the running one with state.cancelProgress().
+      async withProgress(opts, task) {
+        const listeners = [];
+        const token = { isCancellationRequested: false, onCancellationRequested(fn) { listeners.push(fn); return { dispose() {} }; } };
+        const entry = { opts, messages: [], cancel() { token.isCancellationRequested = true; listeners.forEach(fn => fn()); } };
+        state.progress.push(entry);
+        state.cancelProgress = () => entry.cancel();
+        return task({ report(p) { if (p && p.message) entry.messages.push(p.message); } }, token);
+      },
       onDidChangeVisibleTextEditors() { return { dispose() {} }; },
       onDidChangeActiveTextEditor() { return { dispose() {} }; },
       onDidChangeTextEditorSelection(fn) { state.selectionListeners.push(fn); return { dispose() {} }; }

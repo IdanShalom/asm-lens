@@ -41,7 +41,9 @@ test('normalizeName: MSVC-mangled names (Clang for Windows/MSVC)', () => {
     '??1Acc@mx@@QEAA@XZ': '~Acc',
     '??8S@@QEBA_NU0@@Z': 'operator==',
     '??R<lambda_1>@@QEBAHH@Z': 'operator()',
-    '?main@@YAHXZ': 'main'
+    '?main@@YAHXZ': 'main',
+    '"??$square@H@@YAHH@Z"': 'square',
+    '"?push@Acc@mx@@QEAAXH@Z"': 'push'
   };
   for (const [input, expected] of Object.entries(cases)) assert.equal(asm.normalizeName(input), expected, input);
 });

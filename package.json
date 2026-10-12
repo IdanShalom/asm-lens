@@ -151,6 +151,11 @@
           "default": "",
           "description": "C/C++ compiler for local mode (a GCC- or Clang-compatible command or path, e.g. g++, clang++, /usr/bin/g++-14). Empty means g++. Other languages use their own compiler (rustc, go, python3, swiftc, zig, gfortran)."
         },
+        "asmLens.reanalyzeOnSave": {
+          "type": "boolean",
+          "default": true,
+          "description": "Analyze again when you save a file that was analyzed (or a header used by an analyzed file), so the counts stay current without clicking."
+        },
         "asmLens.baseUrl": {
           "type": "string",
           "default": "https://godbolt.org",
