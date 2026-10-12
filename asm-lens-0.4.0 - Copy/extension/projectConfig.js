@@ -75,6 +75,12 @@ function normalizeConfig(raw, baseDir) {
   const out = { compilers: [], includePaths: [], warnings };
   if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
     warnings.push('The config file must contain a JSON object.');
+    if (raw.mode !== undefined) {
+    const m = String(raw.mode).toLowerCase();
+    if (m === 'local' || m === 'remote') out.mode = m;
+    else warnings.push(`Unknown "mode": ${JSON.stringify(raw.mode)} (use "local" or "remote").`);
+  }
+  if (typeof raw.compiler === 'string' && raw.compiler.trim()) out.compiler = raw.compiler.trim();
     return out;
   }
   if (typeof raw.baseUrl === 'string' && raw.baseUrl.trim()) out.baseUrl = raw.baseUrl.trim().replace(/\/$/, '');
@@ -96,6 +102,7 @@ function normalizeConfig(raw, baseDir) {
     if (defs) entry.defines = defs;
     const extra = normalizeFlags(item.extraFlags, `compilers[${i}].extraFlags`, warnings);
     if (extra) entry.extraFlags = extra;
+    if (typeof item.compiler === 'string' && item.compiler.trim()) entry.compiler = item.compiler.trim();
     out.compilers.push(entry);
   });
 
