@@ -11,7 +11,7 @@ const VIRTUAL_ROOT = 'asm_lens';
 // analysis cache, keyed by the URI of the document that was analyzed (the "root").
 let lastAnalysis = new Map();
 let outputPanel;
-// What the assembly panel is currently showing: { analysis, result, fileKeys }.
+// What the assembly panel is currently showing: { analysis, result, fileKeys, groups, stale }.
 let panelState;
 let outputChannel;
 let analysisBusy = new Set();
@@ -20,6 +20,8 @@ let extContext;
 let statusItem;
 let lineDecoration;
 let tokenDecoration;
+let paletteDecorations = [];
+let syncTimer;
 
 function config() { return vscode.workspace.getConfiguration('asmLens'); }
 function fileKey(document) { return document.uri.toString(); }
@@ -31,6 +33,49 @@ function docPathKey(document) { return document.uri.scheme === 'file' ? normPath
 // Settings: VS Code settings, overridden by the project's .asm-lens.json
 
 const DEFAULT_BUILD_FOLDERS = ['build', 'Build', 'builds', '_build', 'out', 'bin', 'cmake-build-*', 'generated', 'gen', '.build'];
+
+// Folders whose headers are never uploaded: unconfigured copies of standard
+// libraries (e.g. 3rdparty/pin-llvm-project.git/libcxx) shadow the compiler's own headers.
+const DEFAULT_EXCLUDES = ['**/libcxx/**', '**/libc++/**', '**/libcxxabi/**', '**/*llvm-project*/**', '**/*.git/**', '**/sysroot/**', '**/node_modules/**'];
+
+const SYSTEM_HEADERS = new Set(`assert.h complex.h ctype.h errno.h fenv.h float.h inttypes.h iso646.h limits.h locale.h math.h setjmp.h signal.h
+stdalign.h stdarg.h stdatomic.h stdbool.h stddef.h stdint.h stdio.h stdlib.h stdnoreturn.h string.h tgmath.h threads.h time.h uchar.h wchar.h wctype.h
+unistd.h fcntl.h pthread.h dlfcn.h dirent.h sched.h semaphore.h poll.h termios.h syslog.h strings.h alloca.h malloc.h elf.h link.h features.h
+endian.h byteswap.h execinfo.h ucontext.h cpuid.h immintrin.h x86intrin.h emmintrin.h xmmintrin.h pmmintrin.h smmintrin.h intrin.h
+algorithm any array atomic barrier bit bitset cassert cctype cerrno cfenv cfloat charconv chrono cinttypes climits clocale cmath codecvt compare complex
+concepts condition_variable coroutine csetjmp csignal cstdarg cstddef cstdint cstdio cstdlib cstring ctime cuchar cwchar cwctype deque exception execution
+expected filesystem format forward_list fstream functional future initializer_list iomanip ios iosfwd iostream istream iterator latch limits list locale
+map memory memory_resource mutex new numbers numeric optional ostream print queue random ranges ratio regex scoped_allocator semaphore set shared_mutex
+source_location span sstream stack stacktrace stdexcept stop_token streambuf string string_view syncstream system_error thread tuple type_traits
+typeindex typeinfo unordered_map unordered_set utility valarray variant vector version`.split(/\s+/));
+const SYSTEM_HEADER_DIRS = /^(?:bits|sys|linux|asm|asm-generic|gnu|net|netinet|arpa|machine|mach|ext|tr1|experimental|__\w*)\//;
+
+function isSystemHeader(name) {
+  const n = String(name).replace(/\\/g, '/').replace(/^\.\//, '');
+  return SYSTEM_HEADERS.has(n) || SYSTEM_HEADER_DIRS.test(n) || /^__/.test(n);
+}
+
+// Minimal glob: ** = any folders, * = any chars except '/', ? = one char.
+// A bare name like "vendor" means "any folder named vendor".
+function globToRegExp(glob) {
+  let s = String(glob).replace(/\\/g, '/').trim();
+  if (!s.includes('/') && !s.includes('*')) s = `**/${s}/**`;
+  let re = '';
+  for (let i = 0; i < s.length; i++) {
+    const c = s[i];
+    if (c === '*' && s[i + 1] === '*') { i++; if (s[i + 1] === '/') { i++; re += '(?:.*/)?'; } else re += '.*'; }
+    else if (c === '*') re += '[^/]*';
+    else if (c === '?') re += '[^/]';
+    else re += c.replace(/[.+^${}()|[\]\\]/g, '\\$&');
+  }
+  return new RegExp(`^${re}$`, 'i');
+}
+
+const PALETTE = [
+  'rgba(255, 99, 71, 0.20)', 'rgba(60, 179, 113, 0.20)', 'rgba(65, 105, 225, 0.24)', 'rgba(255, 215, 0, 0.20)',
+  'rgba(186, 85, 211, 0.20)', 'rgba(0, 206, 209, 0.20)', 'rgba(255, 140, 0, 0.20)', 'rgba(154, 205, 50, 0.20)',
+  'rgba(255, 105, 180, 0.20)', 'rgba(100, 149, 237, 0.24)'
+];
 
 function readConfigText(file) {
   const open = (vscode.workspace.textDocuments || []).find(d => d.uri.scheme === 'file' && normPath(d.uri.fsPath) === normPath(file));
@@ -72,7 +117,11 @@ async function resolveSettings(document) {
     // Project folders first, in the order written, then the VS Code setting.
     includePaths: [...(c?.includePaths || []), ...settingsPaths],
     buildFolders: c?.buildFolders ?? DEFAULT_BUILD_FOLDERS,
-    maxIncludeFiles: c?.maxIncludeFiles ?? s.get('maxIncludeFiles', 80)
+    maxIncludeFiles: c?.maxIncludeFiles ?? s.get('maxIncludeFiles', 80),
+    excludePaths: [...DEFAULT_EXCLUDES, ...(c?.excludePaths || [])],
+    defines: [...(c?.defines || []), ...(active.defines || [])],
+    extraFlags: [c?.extraFlags, active.extraFlags].filter(Boolean).join(' '),
+    uploadSystemHeaders: c?.uploadSystemHeaders === true
   };
 }
 
@@ -104,6 +153,9 @@ function activate(context) {
     border: '1px solid', borderColor: new vscode.ThemeColor('editor.findMatchBorder')
   });
   context.subscriptions.push(lineDecoration, tokenDecoration);
+  paletteDecorations = PALETTE.map(color => vscode.window.createTextEditorDecorationType({ backgroundColor: color, isWholeLine: true }));
+  context.subscriptions.push(...paletteDecorations);
+  context.subscriptions.push(vscode.window.onDidChangeVisibleTextEditors(() => applySourceColors()));
   codeLensEmitter = new vscode.EventEmitter();
   context.subscriptions.push(codeLensEmitter);
 
@@ -180,7 +232,9 @@ function activate(context) {
     if (!LANGS.includes(document.languageId)) return;
     const analysis = analysisFor(document);
     if (!analysis) return;
-    syncAsmHighlight(analysis, docPathKey(document), event.selections[0].active.line);
+    const line = event.selections[0].active.line;
+    clearTimeout(syncTimer);
+    syncTimer = setTimeout(() => syncAsmHighlight(analysis, docPathKey(document), line), 50);
   }));
 
   context.subscriptions.push(vscode.commands.registerCommand('asmLens.analyzeFile', async (uri) => {
@@ -285,6 +339,7 @@ function activate(context) {
     for (const [k, analysis] of lastAnalysis) {
       if (k === fileKey(event.document) || analysis.deps.has(key)) { lastAnalysis.delete(k); changed = true; }
     }
+    if (panelState && panelState.analysis.deps.has(key)) { panelState.stale = true; clearSourceColors(); clearSourceHighlight(); }
     if (changed) codeLensEmitter?.fire();
   }));
 }
@@ -377,11 +432,15 @@ async function analyzeDocument(document) {
     const settings = config();
     const resolved = await resolveSettings(document);
     if (resolved.configError) vscode.window.showWarningMessage(`Asm Lens: ${resolved.configError} Using VS Code settings instead.`);
-    const { baseUrl, flags, language } = resolved;
+    const { baseUrl, language } = resolved;
+    const flags = [resolved.flags, ...resolved.defines.map(d => `-D${d}`), resolved.extraFlags].filter(Boolean).join(' ');
     const compilerId = resolved.active.id;
     const timeoutMs = settings.get('requestTimeoutMs', 30000);
     const source = document.getText();
-    const includeBundle = await collectLocalIncludes(document, resolved.includePaths, { maxFiles: resolved.maxIncludeFiles, buildFolders: resolved.buildFolders });
+    const includeBundle = await collectLocalIncludes(document, resolved.includePaths, {
+      maxFiles: resolved.maxIncludeFiles, buildFolders: resolved.buildFolders,
+      excludePaths: resolved.excludePaths, uploadSystemHeaders: resolved.uploadSystemHeaders
+    });
     const maxAttempts = Math.max(1, Number(settings.get('maxRecoveryAttempts', 12)));
     const recoverErrors = settings.get('skipFailingFunctions', true);
     const compiled = await compileWithRecovery({
@@ -397,7 +456,7 @@ async function analyzeDocument(document) {
     const mappedInstr = functions.reduce((n, f) => n + f.instructionRows.filter(r => r.ref).length, 0);
     const metaRows = asmRows.filter(r => r && typeof r === 'object' && r.source).length;
     outputChannel.appendLine(`Source mapping: ${mappedInstr}/${totalInstr} instructions mapped to local files (${metaRows} rows carried Compiler Explorer source metadata).`);
-    if (totalInstr && !mappedInstr) outputChannel.appendLine('  No instruction could be mapped: hover highlighting needs debug line info from the compiler. Sample rows: ' + JSON.stringify(asmRows.filter(r => r && typeof r === 'object').slice(0, 6)));
+    if (totalInstr && !mappedInstr) outputChannel.appendLine('  No instruction could be mapped: hover highlighting needs debug line info from the compiler. Sample rows: ' + JSON.stringify(asmRows.slice(0, 5)));
     const symbols = await vscode.commands.executeCommand('vscode.executeDocumentSymbolProvider', document.uri) || [];
     const allSourceFunctions = sourceFunctionsOf(document, symbols);
     const matched = functions.map(fn => {
@@ -433,16 +492,18 @@ async function analyzeDocument(document) {
     codeLensEmitter?.fire();
     const notes = [];
     if (includeBundle.unresolved.length) notes.push(`${includeBundle.unresolved.length} quoted include(s) not found`);
-    if (compiled.stubbed.length) notes.push(`${compiled.stubbed.length} missing header(s) replaced by empty files`);
+    if (compiled.stubbed.length) notes.push(`${compiled.stubbed.length} header(s) replaced by empty files`);
     if (compiled.skipped.length) notes.push(`${compiled.skipped.length} function/declaration(s) skipped because they do not compile`);
     if (includeBundle.truncated) notes.push(`include upload limited to ${includeBundle.files.length} files`);
-    outputChannel.appendLine(`Compiled ${document.fileName} with ${compilerId} ${effectiveFlags}; sent ${includeBundle.pathMap.length} local header file(s); found ${functions.length} emitted function bodies.`);
+    outputChannel.appendLine(`Compiled ${document.fileName} with ${compilerId} ${effectiveFlags}; sent ${includeBundle.pathMap.length} local header file(s); found ${functions.length} emitted function(s).${notes.length ? ' ' + notes.join('; ') + '.' : ''}`);
     for (const d of includeBundle.autoDirs) outputChannel.appendLine(`  auto-detected include directory: ${d}`);
-    for (const n of compiled.stubbed) outputChannel.appendLine(`  missing header treated as empty: ${n}`);
+    for (const e of includeBundle.pathMap) outputChannel.appendLine(`  uploaded ${e.virtual}  <-  ${e.real}`);
+    if (includeBundle.skippedSystem?.length) outputChannel.appendLine(`  system headers left to the compiler: ${includeBundle.skippedSystem.join(', ')}`);
+    for (const n of compiled.stubbed) outputChannel.appendLine(`  header treated as empty: ${n}`);
     for (const k of compiled.skipped) outputChannel.appendLine(`  skipped (does not compile): ${k.name || '(declaration)'} at ${path.basename(k.file)}:${k.startLine + 1}-${k.endLine + 1}`);
     for (const u of includeBundle.unresolved) outputChannel.appendLine(`  not found: #include "${u.name}" (from ${u.from})`);
     if (includeBundle.truncated) outputChannel.appendLine('  include discovery stopped at the asmLens.maxIncludeFiles limit.');
-    vscode.window.showInformationMessage(`Asm Lens: found ${functions.length} emitted function bodies${includeBundle.pathMap.length ? `; uploaded ${includeBundle.pathMap.length} local header(s)` : ''}${notes.length ? ` (${notes.join('; ')} — see Asm Lens output)` : ''}. Source was sent to ${baseUrl}.`);
+    vscode.window.showInformationMessage(`Asm Lens: found ${functions.length} emitted function bodies${includeBundle.pathMap.length ? `; uploaded ${includeBundle.pathMap.length} local header(s)` : ''}${notes.length ? ` (${notes.join('; ')}; see the Asm Lens output)` : ''}.`);
   } catch (e) {
     const message = e.name === 'AbortError' ? 'Compiler Explorer request timed out.' : e.message;
     outputChannel.appendLine(`Error: ${message}`);
@@ -456,10 +517,10 @@ async function analyzeDocument(document) {
 //
 // A function that does not use a missing header should still be analyzable.
 // When the compiler stops because of a missing include, we retry with that
-// include replaced by an empty file. When the remaining errors are inside
-// specific functions (they used something from the missing header), those
-// functions are blanked out -- keeping every line number intact -- and we retry,
-// so every other function still gets its assembly.
+// include replaced by an empty file. Uploaded headers that fail in the
+// preprocessor (#error, malformed #if) are emptied the same way. When the
+// remaining errors are inside specific functions, those functions are blanked
+// out -- keeping every line number intact -- and we retry.
 
 const ANSI_RE = /\x1b\[[0-9;]*[A-Za-z]/g;
 const CE_FILTERS = { binary: false, binaryObject: false, commentOnly: false, demangle: true, directives: false, execute: false, intel: true, labels: true, libraryCode: false, trim: false };
@@ -489,6 +550,14 @@ function missingIncludesFrom(errText) {
   const names = new Set();
   for (const m of errText.matchAll(/fatal error:\s*(.+?):\s*No such file or directory/g)) names.add(m[1].trim());
   return [...names];
+}
+
+// Files that broke during preprocessing (#error, malformed #if, ...).
+function preprocessorErrorFilesFrom(errText) {
+  const files = new Set();
+  const re = /^(.+?):\d+(?::\d+)?:\s*(?:fatal )?error:\s*(?:#error|#if|#elif|missing binary operator|missing '\)'|invalid preprocessing directive|unterminated|token ".*" is not valid|operator '.*' has no)/gm;
+  for (const m of errText.matchAll(re)) files.add(m[1].trim());
+  return [...files];
 }
 
 // [{ file, line (0-based) }] for every `error:` diagnostic.
@@ -525,6 +594,16 @@ async function compileWithRecovery(opts) {
       stubbed.push(name);
       progressed = true;
     }
+    // 1b. An uploaded header that fails in the preprocessor -> empty stand-in.
+    for (const bad of preprocessorErrorFilesFrom(lastErr)) {
+      const norm = bad.replace(/\\/g, '/');
+      const f = files.find(x => !stubNames.has(x.filename) && !x.filename.endsWith('.asm_lens_keep') && (norm === x.filename || norm.endsWith('/' + x.filename)));
+      if (!f) continue;
+      f.contents = '\n';
+      stubNames.add(f.filename);
+      stubbed.push(`${f.filename} (preprocessor error; add the needed "defines" to .asm-lens.json?)`);
+      progressed = true;
+    }
     if (progressed) {
       if (!/(^|\s)-I\.(\s|$)/.test(flags)) flags += ' -I.';
       continue;
@@ -532,7 +611,6 @@ async function compileWithRecovery(opts) {
     if (!recoverErrors) break;
 
     // 2. Errors inside functions -> blank those functions out and retry.
-    const mainFile = {};
     for (const loc of errorLocationsFrom(lastErr)) {
       let target;
       if (/^<source>$|^<stdin>$|(^|\/)example\.\w+$/.test(loc.file.replace(/\\/g, '/'))) target = 'main';
@@ -751,7 +829,7 @@ function isInstructionLine(line) {
   if (/^(?:[A-Za-z_.$?@][\w.$?@]*):/.test(line)) return false;
   const token = line.split(/\s+/)[0];
   if (!token || token.startsWith('.')) return false;
-  if (/^(?:section|global|type|size|align|p2align|file|loc|cfi_|intel_syntax|att_syntax|ident|weak|hidden|globl|end|proc|endp|public|extern|assume|segment|ends|equ|db|dw|dd|dq|dt|org|include|macro|endm)$/i.test(token)) return false;
+  if (/^(?:section|global|type|size|align|p2align|file|loc|cfi_\w*|intel_syntax|att_syntax|ident|weak|hidden|globl|end|proc|endp|public|extern|assume|segment|ends|equ|db|dw|dd|dq|dt|org|include|includelib|macro|endm|title|subttl|model|code|data|const|byte|word|dword|qword|zero|string|ascii|asciz|long|quad|short|value|text|bss|comm|lcomm|set|option|ALIGN|PUBLIC|EXTRN)$/i.test(token)) return false;
   return /^[A-Za-z][A-Za-z0-9_.]*$/.test(token);
 }
 function finalizeFunction(fn) {
@@ -802,59 +880,100 @@ function findFunctionResult(symbol, functions, docKey) {
 // Assembly panel and highlighting
 
 function showAssembly(result, analysis) {
-  if (!outputPanel || outputPanel._isDisposed) {
-    outputPanel = vscode.window.createWebviewPanel('asmLensAssembly', 'Asm Lens Assembly', vscode.ViewColumn.Beside, { enableScripts: true });
+  if (!outputPanel) {
+    outputPanel = vscode.window.createWebviewPanel('asmLensAssembly', 'Asm Lens Assembly', { viewColumn: vscode.ViewColumn.Beside, preserveFocus: true }, { enableScripts: true, retainContextWhenHidden: true });
     outputPanel.onDidDispose(() => {
       clearSourceHighlight();
+      clearSourceColors();
       outputPanel = undefined;
       panelState = undefined;
     });
+    outputPanel.onDidChangeViewState(e => { if (e.webviewPanel.visible) applySourceColors(); else { clearSourceColors(); clearSourceHighlight(); } });
     outputPanel.webview.onDidReceiveMessage(handleWebviewMessage);
   }
   const displayRows = cleanAssemblyRowsForDisplay(result);
   const fileKeys = [];
+  const colorOf = new Map();
+  const groups = [];
   for (const row of displayRows) {
-    if (row.ref && !fileKeys.includes(row.ref.key)) fileKeys.push(row.ref.key);
+    if (!row.ref) continue;
+    if (!fileKeys.includes(row.ref.key)) fileKeys.push(row.ref.key);
+    const g = `${row.ref.key}\n${row.ref.line}`;
+    if (!colorOf.has(g)) {
+      colorOf.set(g, colorOf.size % PALETTE.length);
+      groups.push({ key: row.ref.key, line: row.ref.line, color: colorOf.get(g) });
+    }
   }
-  panelState = { analysis, result, fileKeys };
+  panelState = { analysis, result, fileKeys, groups, stale: false };
+  const colorize = config().get('colorizeLines', true);
   outputPanel.title = `Assembly: ${result.sourceName || result.name}`;
   const rowsHtml = displayRows.map(row => {
+    let cls = 'asm-line';
     let attrs = '';
     if (row.ref) {
       attrs = ` data-f="${fileKeys.indexOf(row.ref.key)}" data-l="${row.ref.line}"`;
       if (row.ref.column !== undefined) attrs += ` data-c="${row.ref.column}"`;
+      if (colorize) cls += ` c${colorOf.get(`${row.ref.key}\n${row.ref.line}`)}`;
     }
-    return `<span class="asm-line"${attrs}>${escapeHtml(row.text)}</span>`;
+    return `<span class="${cls}"${attrs}>${escapeHtml(row.text)}</span>`;
   }).join('\n');
   const title = escapeHtml(`${result.sourceName || result.name} — ${result.count} instructions`);
   const meta = escapeHtml(`${analysis.compilerLabel} · ${analysis.compilerId} · ${analysis.flags}`);
   const nonce = crypto.randomBytes(16).toString('base64');
-  outputPanel.webview.html = `<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; script-src 'nonce-${nonce}';"><style>
+  const paletteCss = PALETTE.map((c, i) => `.c${i}{background:${c}}`).join('\n');
+  const noMap = displayRows.some(r => r.ref) ? '' : '<p class="meta">No source mapping is available for this function, so hover highlighting is disabled.</p>';
+  outputPanel.webview.html = `<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; script-src 'nonce-${nonce}';">
+<style>
 body{font-family:var(--vscode-font-family);color:var(--vscode-foreground);padding:16px}
 .asm{font-family:var(--vscode-editor-font-family);font-size:var(--vscode-editor-font-size);white-space:pre;overflow:auto;background:var(--vscode-editor-background);padding:12px;border:1px solid var(--vscode-panel-border)}
 .asm-line{display:block;min-height:1em}
 .asm-line[data-l]{cursor:pointer}
-.asm-line[data-l]:hover{background:var(--vscode-editor-hoverHighlightBackground)}
-.asm-line.hl{background:var(--vscode-editor-findMatchHighlightBackground)}
+${paletteCss}
+.asm-line.hl{background:var(--vscode-editor-findMatchHighlightBackground);outline:1px solid var(--vscode-editor-findMatchBorder, var(--vscode-focusBorder))}
 .asm-line.hl-self{background:var(--vscode-editor-findMatchBackground)}
 .meta{color:var(--vscode-descriptionForeground);margin-bottom:14px}
-</style></head><body><h2>${title}</h2><div class="meta">${meta}</div>${displayRows.some(r => r.ref) ? '' : '<p class="meta">No source mapping is available for this function, so hover highlighting is off. See the Asm Lens output channel.</p>'}<pre class="asm">${rowsHtml}</pre><p>Hover an instruction to highlight its source line and every instruction generated from the same line; hover or move the cursor over a source line to highlight its instructions here. Click an instruction to jump to its source. Instruction count excludes labels, directives, comments, and blank lines. This is compiler output for the current source and flags, not necessarily the final linked binary.</p><script nonce="${nonce}">
+</style></head><body><h2>${title}</h2><div class="meta">${meta}</div>${noMap}<div class="asm">${rowsHtml}</div>
+<script nonce="${nonce}">
 const vscode=acquireVsCodeApi();
 const groups=new Map();
 const mapped=[...document.querySelectorAll('.asm-line[data-l]')];
 const gk=el=>el.dataset.f+':'+el.dataset.l;
 for(const el of mapped){const k=gk(el);if(!groups.has(k))groups.set(k,[]);groups.get(k).push(el);}
-function clearMarks(){document.querySelectorAll('.hl,.hl-self').forEach(e=>e.classList.remove('hl','hl-self'));}
-function mark(k,self,scroll){clearMarks();const els=groups.get(k)||[];els.forEach(e=>e.classList.add('hl'));if(self)self.classList.add('hl-self');if(scroll&&els.length)els[0].scrollIntoView({block:'nearest'});}
+let current='';let leaveTimer;
+function clearMarks(){current='';document.querySelectorAll('.hl,.hl-self').forEach(e=>e.classList.remove('hl','hl-self'));}
+function mark(k,self,scroll){clearMarks();current=k;const els=groups.get(k)||[];els.forEach(e=>e.classList.add('hl'));if(self)self.classList.add('hl-self');if(scroll&&els.length)els[0].scrollIntoView({block:'nearest'});}
 const payload=(type,el)=>({type,file:Number(el.dataset.f),line:Number(el.dataset.l),column:el.dataset.c===undefined?undefined:Number(el.dataset.c)});
 for(const el of mapped){
-  el.addEventListener('mouseenter',()=>{mark(gk(el),el,false);vscode.postMessage(payload('highlight',el));});
-  el.addEventListener('mouseleave',()=>{clearMarks();vscode.postMessage({type:'clearHighlight'});});
+  el.addEventListener('mouseenter',()=>{clearTimeout(leaveTimer);const k=gk(el);const same=k===current;mark(k,el,false);if(!same)vscode.postMessage(payload('highlight',el));});
   el.addEventListener('click',()=>vscode.postMessage(payload('open',el)));
 }
-window.addEventListener('message',e=>{const m=e.data||{};if(m.type==='highlightAsm')mark(m.file+':'+m.line,null,true);else if(m.type==='clearAsm')clearMarks();});
+const box=document.querySelector('.asm');
+if(box)box.addEventListener('mouseleave',()=>{leaveTimer=setTimeout(()=>{clearMarks();vscode.postMessage({type:'clearHighlight'});},150);});
+window.addEventListener('message',e=>{const m=e.data||{};if(m.type==='highlightAsm'){const k=m.file+':'+m.line;if(k!==current)mark(k,null,true);}else if(m.type==='clearAsm')clearMarks();});
 </script></body></html>`;
-  outputPanel.reveal(vscode.ViewColumn.Beside);
+  outputPanel.reveal(vscode.ViewColumn.Beside, true);
+  applySourceColors();
+}
+
+// Persistent CE-style coloring: each source line gets the same color as its instructions.
+function applySourceColors() {
+  clearSourceColors();
+  if (!outputPanel || !outputPanel.visible || !panelState || panelState.stale || !config().get('colorizeLines', true)) return;
+  const byKey = new Map();
+  for (const g of panelState.groups) {
+    if (!byKey.has(g.key)) byKey.set(g.key, PALETTE.map(() => []));
+    byKey.get(g.key)[g.color].push(g.line);
+  }
+  for (const [key, perColor] of byKey) {
+    for (const editor of visibleEditorsFor(key)) {
+      const count = editor.document.lineCount;
+      perColor.forEach((lines, i) => editor.setDecorations(paletteDecorations[i], lines.filter(l => l < count).map(l => editor.document.lineAt(l).range)));
+    }
+  }
+}
+function clearSourceColors() {
+  for (const editor of vscode.window.visibleTextEditors) for (const d of paletteDecorations) editor.setDecorations(d, []);
 }
 
 function handleWebviewMessage(message) {
@@ -872,7 +991,7 @@ function handleWebviewMessage(message) {
   if (!real) return;
   const pos = new vscode.Position(message.line, column || 0);
   vscode.window.showTextDocument(vscode.Uri.file(real), { selection: new vscode.Range(pos, pos), viewColumn: vscode.ViewColumn.One, preserveFocus: false })
-    .then(() => highlightSource(key, message.line, column), () => { /* file may have been deleted */ });
+    .then(() => { applySourceColors(); highlightSource(key, message.line, column); }, () => { /* file may have been deleted */ });
 }
 
 function visibleEditorsFor(key) {
@@ -905,7 +1024,7 @@ function clearSourceHighlight() {
 // Source -> assembly: highlight the panel's instructions for the hovered or
 // selected source line (only when the panel shows this analysis).
 function syncAsmHighlight(analysis, key, line) {
-  if (!outputPanel || !panelState || panelState.analysis !== analysis) return;
+  if (!outputPanel || !panelState || panelState.stale || panelState.analysis.rootKey !== analysis.rootKey) return;
   if (!config().get('highlightOnHover', true)) return;
   const file = panelState.fileKeys.indexOf(key);
   const hasRows = file >= 0 && panelState.result.instructionRows.some(r => r.ref && r.ref.key === key && r.ref.line === line);
@@ -976,7 +1095,7 @@ function stripBlockComments(text) {
 }
 
 async function collectLocalIncludes(document, configuredIncludePaths, limits = {}) {
-  const empty = { files: [], includeFlags: [], pathMap: [], unresolved: [], unresolvedAll: [], autoDirs: [], truncated: false };
+  const empty = { files: [], includeFlags: [], pathMap: [], unresolved: [], unresolvedAll: [], autoDirs: [], truncated: false, skippedSystem: [] };
   if (document.uri.scheme !== 'file') return empty;
   const mainPath = path.resolve(document.uri.fsPath);
   const mainDir = path.dirname(mainPath);
@@ -1003,6 +1122,10 @@ async function collectLocalIncludes(document, configuredIncludePaths, limits = {
   const maxFiles = Math.max(1, Number(limits.maxFiles) || 80);
   const maxFileBytes = 1024 * 1024;
   const maxDepth = 32;
+  const excludeRes = (limits.excludePaths || DEFAULT_EXCLUDES).map(globToRegExp);
+  const relOf = p => { const r = path.relative(baseDir, p).replace(/\\/g, '/'); return r.startsWith('..') ? path.resolve(p).replace(/\\/g, '/') : r; };
+  const isExcluded = p => excludeRes.some(re => re.test(relOf(p)));
+  const skippedSystem = new Set();
 
   // Prefer the editor's (possibly unsaved) text over what is on disk.
   const openDocs = new Map();
@@ -1037,7 +1160,7 @@ async function collectLocalIncludes(document, configuredIncludePaths, limits = {
       let items;
       try { items = await fs.readdir(d, { withFileTypes: true }); } catch (_) { return; }
       for (const it of items) {
-        if (it.isDirectory()) { if (it.name !== 'node_modules' && it.name !== '.git') await walk(path.join(d, it.name), depth + 1); }
+        if (it.isDirectory()) { const sub = path.join(d, it.name); if (it.name !== 'node_modules' && it.name !== '.git' && !isExcluded(sub + '/x')) await walk(sub, depth + 1); }
         else if (HEADER_EXT.test(it.name)) out.push(path.join(d, it.name));
       }
     };
@@ -1056,6 +1179,7 @@ async function collectLocalIncludes(document, configuredIncludePaths, limits = {
     const tail = ('/' + name.replace(/\\/g, '/')).replace(/\/\.\//g, '/').toLowerCase();
     for (const f of index) {
       const norm = f.replace(/\\/g, '/');
+      if (isExcluded(f)) continue;
       if (!norm.toLowerCase().endsWith(tail)) continue;
       const root = path.resolve(f.slice(0, f.length - name.length - 1));
       const text = await readText(f);
@@ -1088,6 +1212,8 @@ async function collectLocalIncludes(document, configuredIncludePaths, limits = {
   // search folder in priority order, then folders found automatically.
   async function locate(name, quoted, includerDir) {
     if (quoted) { const h = await direct(includerDir, name); if (h) return h; }
+    // Standard/system headers come from the compiler, never from workspace copies.
+    if (!limits.uploadSystemHeaders && isSystemHeader(name)) return { system: true };
     for (const e of searchEntries) {
       const h = await direct(e.dir, name);
       if (h) return h;
@@ -1110,11 +1236,13 @@ async function collectLocalIncludes(document, configuredIncludePaths, limits = {
       const name = match[2].trim();
       if (!name || path.isAbsolute(name)) continue;
       const hit = await locate(name, quoted, path.dirname(realPath));
+      if (hit && hit.system) { skippedSystem.add(name); continue; }
       if (!hit) {
         unresolvedAll.push(name);
         if (quoted) unresolved.push({ name, from: path.relative(baseDir, realPath) || realPath });
         continue;
       }
+      if (isExcluded(hit.real)) { skippedSystem.add(name); continue; }
       const nk = normPath(hit.real);
       if (visited.has(nk)) continue;
       if (found.size >= maxFiles) { truncated = true; return; }
@@ -1126,7 +1254,7 @@ async function collectLocalIncludes(document, configuredIncludePaths, limits = {
   }
 
   await visit(mainPath, document.getText(), 0);
-  if (found.size === 0) return { ...empty, unresolved, unresolvedAll };
+  if (found.size === 0) return { ...empty, unresolved, unresolvedAll, skippedSystem: [...skippedSystem] };
 
   const rootDir = commonAncestor([mainDir, ...includeDirs, ...[...found.values()].map(f => path.dirname(f.real))]);
   const entries = [...found.values()].map(f => ({ real: f.real, virtual: toVirtualPath(f.virtualReal || f.real, rootDir), text: f.text }));
@@ -1140,7 +1268,7 @@ async function collectLocalIncludes(document, configuredIncludePaths, limits = {
   }
   const includeFlags = includeDirs.map(d => `-I${toVirtualPath(d, rootDir)}`);
   const pathMap = entries.map(f => ({ real: f.real, virtual: f.virtual }));
-  return { files, includeFlags, pathMap, unresolved, unresolvedAll, autoDirs, truncated };
+  return { files, includeFlags, pathMap, unresolved, unresolvedAll, autoDirs, truncated, skippedSystem: [...skippedSystem] };
 }
 
 function escapeHtml(s) {
@@ -1150,5 +1278,10 @@ function deactivate() { if (outputPanel) outputPanel.dispose(); }
 module.exports = {
   activate, deactivate,
   // exported for tests
-  _internals: { resolveSettings, showAssembly, handleWebviewMessage, syncAsmHighlight, _state: () => ({ panelState }), blankEnclosingDeclaration, missingIncludesFrom, errorLocationsFrom, compileWithRecovery, collectLocalIncludes, makeRefResolver, parseFunctions, buildLineIndex, cleanAssemblyRowsForDisplay, toVirtualPath, findFunctionResult }
+  _internals: {
+    resolveSettings, showAssembly, handleWebviewMessage, syncAsmHighlight, _state: () => ({ panelState }),
+    blankEnclosingDeclaration, missingIncludesFrom, preprocessorErrorFilesFrom, errorLocationsFrom, compileWithRecovery,
+    collectLocalIncludes, parseFunctions, makeRefResolver, isInstructionLine, cleanAssemblyRowsForDisplay, buildLineIndex,
+    maskCode, classifyFunctionSegment, guessFunctionSymbols, isSystemHeader, globToRegExp
+  }
 };
