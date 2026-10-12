@@ -40,7 +40,7 @@ const DEFAULT_EXCLUDES = ['**/libcxx/**', '**/libc++/**', '**/libcxxabi/**', '**
 
 const SYSTEM_HEADERS = new Set(`assert.h complex.h ctype.h errno.h fenv.h float.h inttypes.h iso646.h limits.h locale.h math.h setjmp.h signal.h
 stdalign.h stdarg.h stdatomic.h stdbool.h stddef.h stdint.h stdio.h stdlib.h stdnoreturn.h string.h tgmath.h threads.h time.h uchar.h wchar.h wctype.h
-unistd.h fcntl.h pthread.h dlfcn.h dirent.h sched.h semaphore.h poll.h termios.h syslog.h strings.h alloca.h malloc.h elf.h link.h features.h
+unistd.h fcntl.h pthread.h dlfcn.h dirent.h sched.h semaphore.h poll.h termios.h syslog.h strings.h alloca.h malloc.h elf.h link.h features.h syscall.h
 endian.h byteswap.h execinfo.h ucontext.h cpuid.h immintrin.h x86intrin.h emmintrin.h xmmintrin.h pmmintrin.h smmintrin.h intrin.h
 algorithm any array atomic barrier bit bitset cassert cctype cerrno cfenv cfloat charconv chrono cinttypes climits clocale cmath codecvt compare complex
 concepts condition_variable coroutine csetjmp csignal cstdarg cstddef cstdint cstdio cstdlib cstring ctime cuchar cwchar cwctype deque exception execution
@@ -1266,7 +1266,12 @@ async function collectLocalIncludes(document, configuredIncludePaths, limits = {
   if (!files.some(f => f.filename.startsWith(mainVirtualDir + '/'))) {
     files.push({ filename: `${mainVirtualDir}/.asm_lens_keep`, contents: '\n' });
   }
-  const includeFlags = includeDirs.map(d => `-I${toVirtualPath(d, rootDir)}`);
+    // An auto-detected folder that holds files named like system headers (e.g. pbits/errno.h)
+  // would hide the compiler's own headers, so it is not added as -I.
+  const shadowsSystem = d => entries.some(e => path.dirname(path.resolve(e.real)) === d && isSystemHeader(path.basename(e.real)));
+  const includeFlags = includeDirs
+    .filter(d => !(autoDirs.includes(d) && shadowsSystem(d)))
+    .map(d => `-I${toVirtualPath(d, rootDir)}`);
   const pathMap = entries.map(f => ({ real: f.real, virtual: f.virtual }));
   return { files, includeFlags, pathMap, unresolved, unresolvedAll, autoDirs, truncated, skippedSystem: [...skippedSystem] };
 }
