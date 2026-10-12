@@ -403,8 +403,23 @@ function sourceFunctionsOf(document, tree) {
   return functions;
 }
 
+// Line of the `}` that closes the body opened at or after `startLine` (masked text, so
+// braces in comments/strings/#directives are ignored). Falls back to `startLine`.
+function findBodyEndLine(maskedLines, startLine) {
+  let depth = 0, opened = false;
+  for (let i = startLine; i < maskedLines.length && i < startLine + 5000; i++) {
+    for (const c of maskedLines[i]) {
+      if (c === '{') { depth++; opened = true; }
+      else if (c === '}' && opened && --depth === 0) return i;
+    }
+  }
+  return startLine;
+}
+
 function guessFunctionSymbols(document) {
-  const lines = document.getText().split(/\r?\n/);
+  const text = document.getText();
+  const lines = text.split(/\r?\n/);
+  const maskedLines = maskCode(text).text.split(/\r?\n/);
   const out = [];
   const seen = new Set();
   const ignored = new Set(['if', 'for', 'while', 'switch', 'catch', 'sizeof', 'decltype', 'return', 'new', 'delete']);
@@ -413,8 +428,6 @@ function guessFunctionSymbols(document) {
     if (/^\s*(?:#|\/\/|\/\*|\*|using\b|typedef\b|class\b|struct\b|enum\b)/.test(line)) continue;
     const m = line.match(/^\s*(?:(?:[\w:<>~,*&]+\s+)+)?([~A-Za-z_]\w*(?:::\w+)*(?:<[^{};]*>)?)\s*\([^;{}]*\)\s*(?:const\b\s*)?(?:noexcept\b\s*)?(?:->\s*[\w:<>*& ]+)?\s*(\{)?\s*(?:\/\/.*)?$/);
     if (!m || ignored.has(m[1])) continue;
-    // Avoid ordinary declarations: require an opening brace on this line or
-    // one of the next two lines (supports the common brace-on-next-line style).
     let hasBody = Boolean(m[2]);
     if (!hasBody) {
       for (let j = i + 1; j < Math.min(lines.length, i + 3); j++) {
@@ -424,7 +437,13 @@ function guessFunctionSymbols(document) {
     }
     if (!hasBody || seen.has(`${m[1]}:${i}`)) continue;
     seen.add(`${m[1]}:${i}`);
-    out.push({ name: m[1], kind: vscode.SymbolKind.Function, range: new vscode.Range(i, 0, i, line.length), selectionRange: new vscode.Range(i, 0, i, line.length), children: [] });
+    const end = findBodyEndLine(maskedLines, i);
+    out.push({
+      name: m[1], kind: vscode.SymbolKind.Function,
+      range: new vscode.Range(i, 0, end, (lines[end] || '').length),
+      selectionRange: new vscode.Range(i, 0, i, line.length),
+      children: []
+    });
   }
   return out;
 }
