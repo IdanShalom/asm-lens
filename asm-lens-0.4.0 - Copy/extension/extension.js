@@ -188,13 +188,19 @@ function activate(context) {
       const key = docPathKey(document);
       const viaRoot = cached.rootKey !== fileKey(document) ? ` · via ${path.basename(cached.rootPath)}` : '';
       return functions.map(sym => {
-        const result = findFunctionResult(sym, cached.functions, key);
-        const wasSkipped = !result && (cached.skipped || []).some(k => k.key === key && sym.range.start.line >= k.startLine && sym.range.start.line <= k.endLine);
-        const title = result
-          ? `$(symbol-numeric) ${result.count} instructions · ${cached.compilerLabel} · ${cached.flags}${viaRoot}`
-          : wasSkipped
-            ? `$(warning) Not compiled · this function has compile errors (missing include?) · ${cached.compilerLabel}`
-            : `$(info) Assembly unavailable · ${cached.compilerLabel}`;
+        const results = findAllFunctionResults(sym, cached.functions, key, cached.rootPathKey);
+        const result = results[0];
+        const inlined = !result ? inlinedResultFor(sym, cached, key) : undefined;
+        const wasSkipped = !result && !inlined && (cached.skipped || []).some(k => k.key === key && sym.range.start.line >= k.startLine && sym.range.start.line <= k.endLine);
+        const title = results.length > 1
+          ? `$(symbol-numeric) ${results.length} instantiations · ${results.map(r => r.count).join(' / ')} instructions · ${cached.compilerLabel}${viaRoot}`
+          : result
+            ? `$(symbol-numeric) ${result.count} instructions · ${cached.compilerLabel} · ${cached.flags}${viaRoot}`
+            : inlined
+              ? `$(symbol-numeric) ${inlined.count} inlined instructions · used in ${inlined.users.length} function(s)${viaRoot}`
+              : wasSkipped
+                ? `$(warning) Not compiled · this function has compile errors (missing include?) · ${cached.compilerLabel}`
+                : `$(info) No code emitted (not used, or a template never instantiated) · ${cached.compilerLabel}`;
         return new vscode.CodeLens(sym.range, {
           title,
           command: 'asmLens.showAssembly',
@@ -240,8 +246,20 @@ function activate(context) {
     const analysis = analysisFor(document);
     if (!analysis) return;
     const line = event.selections[0].active.line;
+    const key = docPathKey(document);
+    const byUser = event.kind === vscode.TextEditorSelectionChangeKind.Mouse || event.kind === vscode.TextEditorSelectionChangeKind.Keyboard;
     clearTimeout(syncTimer);
-    syncTimer = setTimeout(() => syncAsmHighlight(analysis, docPathKey(document), line), 50);
+    syncTimer = setTimeout(() => {
+      if (byUser && config().get('followCursor', true)) {
+        const fn = functionForLine(analysis, key, line);
+        if (fn && (!panelState || panelState.result !== fn || panelState.stale)) {
+          showAssembly(fn, analysis);
+          setTimeout(() => syncAsmHighlight(analysis, key, line), 200);
+          return;
+        }
+      }
+      syncAsmHighlight(analysis, key, line);
+    }, 50);
   }));
 
   context.subscriptions.push(vscode.commands.registerCommand('asmLens.analyzeFile', async (uri) => {
@@ -332,9 +350,21 @@ function activate(context) {
     if (!document) return;
     const cached = analysisFor(document);
     if (!cached) return analyzeDocument(document);
-    const symbol = Number.isInteger(line) ? { name: functionName, range: new vscode.Range(line, 0, line, 0) } : { name: functionName };
-    const result = findFunctionResult(symbol, cached.functions, docPathKey(document));
-    if (!result) return vscode.window.showInformationMessage(`No emitted assembly found for ${functionName}. It may have been optimized away or inlined.`);
+    const key = docPathKey(document);
+    const tree = await vscode.commands.executeCommand('vscode.executeDocumentSymbolProvider', document.uri);
+    const sym = sourceFunctionsOf(document, tree).find(s => s.name === functionName && (!Number.isInteger(line) || s.range.start.line === line))
+      || (Number.isInteger(line) ? { name: functionName, range: new vscode.Range(line, 0, line, 0) } : { name: functionName });
+    const results = findAllFunctionResults(sym, cached.functions, key, cached.rootPathKey);
+    let result = results[0];
+    if (results.length > 1) {
+      const pick = await vscode.window.showQuickPick(
+        results.map(f => ({ label: f.name, description: `${f.count} instructions`, f })),
+        { placeHolder: `${functionName}: choose an instantiation` });
+      if (!pick) return;
+      result = pick.f;
+    }
+    if (!result) result = inlinedResultFor(sym, cached, key);
+    if (!result) return vscode.window.showInformationMessage(`No emitted code for ${functionName}. It may be unused, fully inlined, or a template that is never instantiated.`);
     showAssembly(result, cached);
   }));
 
@@ -403,18 +433,48 @@ function isFunctionSymbol(s) {
   return [vscode.SymbolKind.Function, vscode.SymbolKind.Method, vscode.SymbolKind.Constructor, vscode.SymbolKind.Operator].includes(s.kind);
 }
 
-// The analysis that covers `document`: its own, or the newest one that uploaded
-// it as an included header.
+// Which emitted function holds the instructions for `line` of file `key`.
+function functionForLine(analysis, key, line) {
+  const users = analysis.functions.filter(f => f.instructionRows.some(r => r.ref && r.ref.key === key && r.ref.line === line));
+  if (users.length) {
+    const own = key === analysis.rootPathKey
+      ? users.find(f => f.sourceRange && f.sourceRange.start.line <= line && line <= f.sourceRange.end.line)
+      : undefined;
+    return own || users.slice().sort((a, b) => a.count - b.count)[0];
+  }
+  if (key === analysis.rootPathKey) {
+    return analysis.functions.find(f => f.sourceRange && f.sourceRange.start.line <= line && line <= f.sourceRange.end.line);
+  }
+  return undefined;
+}
+
+// A function's instructions as inlined into the functions that use it.
+function inlinedResultFor(sym, analysis, key) {
+  if (!sym || !sym.range) return undefined;
+  const s = sym.range.start.line, e = sym.range.end.line;
+  const rows = [];
+  const users = new Set();
+  for (const f of analysis.functions) {
+    const mine = f.instructionRows.filter(r => r.ref && r.ref.key === key && r.ref.line >= s && r.ref.line <= e);
+    if (!mine.length) continue;
+    users.add(f.sourceName || f.name);
+    rows.push(...mine);
+  }
+  if (!rows.length) return undefined;
+  return { name: sym.name, sourceName: `${sym.name} (inlined)`, rows, instructionRows: rows, count: rows.length, users: [...users], fileKeys: new Set([key]) };
+}
+
+// The analysis that covers `document`: its own (if it found code), else the newest one that included it.
 function analysisFor(document) {
   const own = lastAnalysis.get(fileKey(document));
-  if (own) return own;
-  if (document.uri.scheme !== 'file') return undefined;
+  if (own && own.functions.length) return own;
+  if (document.uri.scheme !== 'file') return own;
   const key = docPathKey(document);
   let best;
   for (const analysis of lastAnalysis.values()) {
-    if (analysis.deps.has(key) && (!best || analysis.timestamp > best.timestamp)) best = analysis;
+    if (analysis !== own && analysis.deps.has(key) && (!best || analysis.timestamp > best.timestamp)) best = analysis;
   }
-  return best;
+  return best || own;
 }
 
 function functionAtSignature(document, position, analysis, key) {
@@ -676,6 +736,11 @@ async function analyzeLocal(document, resolved, settings) {
   const paths = new Map([[rootPathKey, document.uri.fsPath]]);
   for (const k of fileKeys) if (k !== rootPathKey) paths.set(k, k);
 
+  if (!functions.length && /\.(h|hh|hpp|hxx|h\+\+|inl|ipp|tcc|PH|H)$/.test(document.uri.fsPath)) {
+    vscode.window.showInformationMessage('Asm Lens: a header emits no code on its own. Analyze a .cpp that includes it (e.g. gsc.cpp), then come back to this file.');
+    return;
+  }
+  
   lastAnalysis.set(key, {
     functions: matched,
     lineIndex: buildLineIndex(matched),
@@ -1047,21 +1112,45 @@ function buildLineIndex(functions) {
   return index;
 }
 
-function normalizeName(name) {
-  return String(name || '').replace(/^.*::/, '').replace(/\s+/g, '').replace(/[&*]/g, '').replace(/\(.*$/, '').replace(/\[clone.*\]$/, '');
+// Drops <...> template arguments (nesting-aware).
+function stripTemplateArgs(s) {
+  let out = '', depth = 0;
+  for (const c of s) {
+    if (c === '<') { depth++; continue; }
+    if (c === '>') { if (depth) depth--; continue; }
+    if (!depth) out += c;
+  }
+  return out;
 }
-// Picks the source function for an emitted assembly function.
-// 1) By location: the source function whose range contains most of the function's mapped lines
-//    (this tells overloads apart). 2) Fallback: by name, as before.
+// "ns::Foo<int>::bar<std::string>(std::vector<int> const&) const" -> "bar"
+function normalizeName(name) {
+  let s = String(name || '').replace(/\s*\[clone.*\]$/, '');
+  if (!/\boperator\b/.test(s)) {
+    let depth = 0, cut = s.length;
+    for (let i = 0; i < s.length; i++) {
+      const c = s[i];
+      if (c === '<') depth++;
+      else if (c === '>' && depth) depth--;
+      else if (c === '(' && !depth) { cut = i; break; }
+    }
+    s = stripTemplateArgs(s.slice(0, cut));
+  } else {
+    s = s.replace(/\(.*$/, '');
+  }
+  return s.replace(/^.*::/, '').replace(/\s+/g, '').replace(/[&*]/g, '');
+}
+
+// Source function for an emitted function: by location first (overloads, template
+// instantiations), then by name.
 function matchSourceSymbol(asmName, symbols, fn, docKey) {
   if (fn && docKey) {
-    const lines = fn.instructionRows.filter(r => r.ref && r.ref.key === docKey).map(r => r.ref.line);
+    const mapped = fn.instructionRows.filter(r => r.ref);
+    const lines = mapped.filter(r => r.ref.key === docKey).map(r => r.ref.line);
     if (lines.length) {
       let best, bestHits = 0;
       for (const s of symbols) {
         if (!s.range) continue;
         const hits = lines.filter(l => l >= s.range.start.line && l <= s.range.end.line).length;
-        // Prefer more hits; on a tie prefer the smaller (inner) range.
         if (hits > bestHits || (hits && hits === bestHits && best &&
             (s.range.end.line - s.range.start.line) < (best.range.end.line - best.range.start.line))) {
           best = s; bestHits = hits;
@@ -1069,14 +1158,14 @@ function matchSourceSymbol(asmName, symbols, fn, docKey) {
       }
       if (best) return best;
     }
+    // All of its code comes from other files (e.g. a header template): not a function of this file.
+    if (mapped.length && !lines.length) return undefined;
   }
   const norm = normalizeName(asmName);
-  return symbols.find(s => normalizeName(s.name) === norm)
-    || symbols.find(s => asmName.includes(s.name) || s.name.includes(asmName))
-    || symbols.find(s => normalizeName(s.name).split('(')[0] === norm.split('(')[0]);
+  return symbols.find(s => normalizeName(s.name) === norm);
 }
-// Finds the analyzed function for a source symbol. By position first, so overloads
-// with the same name stay separate; then by name.
+
+// The analyzed function for a source symbol: by position first, then by name.
 function findFunctionResult(symbol, functions, docKey) {
   if (!symbol) return undefined;
   const usable = f => !docKey || !f.fileKeys || f.fileKeys.size === 0 || f.fileKeys.has(docKey);
@@ -1093,6 +1182,23 @@ function findFunctionResult(symbol, functions, docKey) {
   const normalized = normalizeName(symbol.name);
   return functions.find(f => usable(f) && (normalizeName(f.sourceName) === normalized || normalizeName(f.name) === normalized))
     || functions.find(f => usable(f) && (normalizeName(f.sourceName).startsWith(normalized) || normalizeName(f.name).startsWith(normalized)));
+}
+
+// Every emitted function for a source symbol (all template instantiations).
+function findAllFunctionResults(symbol, functions, docKey, rootKey) {
+  if (!symbol) return [];
+  const usable = f => !docKey || !f.fileKeys || f.fileKeys.size === 0 || f.fileKeys.has(docKey);
+  if (symbol.range && docKey === rootKey) {
+    const all = functions.filter(f => usable(f) && f.sourceRange && f.sourceRange.start.line === symbol.range.start.line);
+    if (all.length) return all;
+  }
+  if (docKey !== rootKey) {
+    const norm = normalizeName(symbol.name);
+    const all = functions.filter(f => f.fileKeys && f.fileKeys.has(docKey) && !f.sourceRange && normalizeName(f.name) === norm);
+    if (all.length) return all;
+  }
+  const one = findFunctionResult(symbol, functions, docKey);
+  return one ? [one] : [];
 }
 
 // ---------------------------------------------------------------------------
