@@ -36,7 +36,7 @@ const DEFAULT_BUILD_FOLDERS = ['build', 'Build', 'builds', '_build', 'out', 'bin
 
 // Folders whose headers are never uploaded: unconfigured copies of standard
 // libraries (e.g. 3rdparty/pin-llvm-project.git/libcxx) shadow the compiler's own headers.
-const DEFAULT_EXCLUDES = ['**/libcxx/**', '**/libc++/**', '**/libcxxabi/**', '**/*llvm-project*/**', '**/*.git/**', '**/sysroot/**', '**/node_modules/**'];
+const DEFAULT_EXCLUDES = ['**/libcxx/**', '**/libc++/**', '**/libcxxabi/**', '**/*llvm-project*/**', '**/sysroot/**', '**/node_modules/**'];
 
 const SYSTEM_HEADERS = new Set(`assert.h complex.h ctype.h errno.h fenv.h float.h inttypes.h iso646.h limits.h locale.h math.h setjmp.h signal.h
 stdalign.h stdarg.h stdatomic.h stdbool.h stddef.h stdint.h stdio.h stdlib.h stdnoreturn.h string.h tgmath.h threads.h time.h uchar.h wchar.h wctype.h
