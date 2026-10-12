@@ -125,7 +125,10 @@ async function resolveSettings(document) {
     extraFlags: [c?.extraFlags, active.extraFlags].filter(Boolean).join(' '),
     uploadSystemHeaders: c?.uploadSystemHeaders === true,
     mode: c?.mode || 'remote',
-    localCompiler: active.compiler || c?.compiler || 'g++'
+    localCompiler: (() => {
+      const c0 = active.compiler || c?.compiler || 'g++';
+      return /^\.\.?[\\/]/.test(c0) && project?.file ? path.resolve(path.dirname(project.file), c0) : c0;
+    })()
   };
 }
 
@@ -195,7 +198,7 @@ function activate(context) {
         return new vscode.CodeLens(sym.range, {
           title,
           command: 'asmLens.showAssembly',
-          arguments: [document.uri, sym.name]
+          arguments: [document.uri, sym.name, sym.range.start.line]
         });
       });
     }
@@ -324,12 +327,13 @@ function activate(context) {
     if (!exists) vscode.window.showInformationMessage('Created .asm-lens.json. List your compilers and include folders in order of priority.');
   }));
 
-  context.subscriptions.push(vscode.commands.registerCommand('asmLens.showAssembly', async (uri, functionName) => {
+  context.subscriptions.push(vscode.commands.registerCommand('asmLens.showAssembly', async (uri, functionName, line) => {
     const document = uri ? await vscode.workspace.openTextDocument(uri) : vscode.window.activeTextEditor?.document;
     if (!document) return;
     const cached = analysisFor(document);
     if (!cached) return analyzeDocument(document);
-    const result = findFunctionResult({ name: functionName }, cached.functions, docPathKey(document));
+    const symbol = Number.isInteger(line) ? { name: functionName, range: new vscode.Range(line, 0, line, 0) } : { name: functionName };
+    const result = findFunctionResult(symbol, cached.functions, docPathKey(document));
     if (!result) return vscode.window.showInformationMessage(`No emitted assembly found for ${functionName}. It may have been optimized away or inlined.`);
     showAssembly(result, cached);
   }));
@@ -1071,11 +1075,19 @@ function matchSourceSymbol(asmName, symbols, fn, docKey) {
     || symbols.find(s => asmName.includes(s.name) || s.name.includes(asmName))
     || symbols.find(s => normalizeName(s.name).split('(')[0] === norm.split('(')[0]);
 }
-// `docKey`, when given, rejects functions whose instructions all come from other
-// files, so a same-named function elsewhere is not shown on this document.
+// Finds the analyzed function for a source symbol. By position first, so overloads
+// with the same name stay separate; then by name.
 function findFunctionResult(symbol, functions, docKey) {
   if (!symbol) return undefined;
   const usable = f => !docKey || !f.fileKeys || f.fileKeys.size === 0 || f.fileKeys.has(docKey);
+  if (symbol.range) {
+    const line = symbol.range.start.line;
+    const byRange = functions.find(f => usable(f) && f.sourceRange && f.sourceRange.start.line === line);
+    if (byRange) return byRange;
+    // Another overload with this name was matched by position: don't reuse its assembly.
+    const norm = normalizeName(symbol.name);
+    if (functions.some(f => f.sourceRange && normalizeName(f.sourceName) === norm)) return undefined;
+  }
   const exact = functions.find(f => usable(f) && (f.sourceName === symbol.name || f.name === symbol.name));
   if (exact) return exact;
   const normalized = normalizeName(symbol.name);
