@@ -2,7 +2,7 @@
   "name": "asm-lens",
   "displayName": "Asm Lens",
   "description": "Show compiler-generated assembly counts for C/C++ functions, upload local includes recursively, and highlight source and assembly in both directions on hover.",
-  "version": "0.4.0",
+  "version": "0.5.0",
   "publisher": "local-dev",
   "license": "MIT",
   "engines": {
@@ -96,6 +96,11 @@
           "type": "boolean",
           "default": true,
           "description": "Highlight matching assembly instructions when hovering or moving the cursor over a source line, and the matching source line when hovering an instruction."
+        },
+        "asmLens.colorizeLines": {
+          "type": "boolean",
+          "default": true,
+          "description": "Color each source line and its assembly instructions with the same color, like Compiler Explorer."
         },
         "asmLens.maxIncludeFiles": {
           "type": "number",
