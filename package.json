@@ -12,7 +12,7 @@
     "Programming Languages",
     "Other"
   ],
-  "main": "./extension.js",
+  "main": "./src/extension.js",
   "activationEvents": [
     "onLanguage:c",
     "onLanguage:cpp",
@@ -129,7 +129,7 @@
           ".asm-lens.json",
           "asm-lens.json"
         ],
-        "url": "./asm-lens.schema.json"
+        "url": "./schemas/asm-lens.schema.json"
       }
     ]
   }
