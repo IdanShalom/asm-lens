@@ -2,6 +2,8 @@ const vscode = require('vscode');
 const fs = require('fs/promises');
 const path = require('path');
 const crypto = require('crypto');
+const os = require('os');
+const { spawn } = require('child_process');
 const projectConfig = require('./projectConfig');
 
 const LANGS = ['c', 'cpp', 'objective-c', 'objective-cpp'];
@@ -121,7 +123,9 @@ async function resolveSettings(document) {
     excludePaths: [...DEFAULT_EXCLUDES, ...(c?.excludePaths || [])],
     defines: [...(c?.defines || []), ...(active.defines || [])],
     extraFlags: [c?.extraFlags, active.extraFlags].filter(Boolean).join(' '),
-    uploadSystemHeaders: c?.uploadSystemHeaders === true
+    uploadSystemHeaders: c?.uploadSystemHeaders === true,
+    mode: c?.mode || 'remote',
+    localCompiler: active.compiler || c?.compiler || 'g++'
   };
 }
 
@@ -432,6 +436,7 @@ async function analyzeDocument(document) {
     const settings = config();
     const resolved = await resolveSettings(document);
     if (resolved.configError) vscode.window.showWarningMessage(`Asm Lens: ${resolved.configError} Using VS Code settings instead.`);
+    if (resolved.mode === 'local') return await analyzeLocal(document, resolved, settings);
     const { baseUrl, language } = resolved;
     const flags = [resolved.flags, ...resolved.defines.map(d => `-D${d}`), resolved.extraFlags].filter(Boolean).join(' ');
     const compilerId = resolved.active.id;
@@ -511,7 +516,159 @@ async function analyzeDocument(document) {
   } finally { analysisBusy.delete(key); }
 }
 
+// ---------------------------------------------------------------------------
+// Local mode: compile only the current file with a local compiler (no upload,
+// no project build). Headers are read straight from disk by the compiler.
 
+function splitArgs(s) {
+  return (String(s || '').match(/(?:[^\s"']+|"[^"]*"|'[^']*')+/g) || []).map(a => a.replace(/^(["'])(.*)\1$/, '$2'));
+}
+
+function runProcess(cmd, args, { cwd, input, timeoutMs }) {
+  return new Promise((resolve, reject) => {
+    let child;
+    try { child = spawn(cmd, args, { cwd }); } catch (e) { return reject(e); }
+    const out = [], err = [];
+    let killed = false;
+    const timer = setTimeout(() => { killed = true; child.kill('SIGKILL'); }, timeoutMs || 60000);
+    child.stdout.on('data', d => out.push(d));
+    child.stderr.on('data', d => err.push(d));
+    child.on('error', e => {
+      clearTimeout(timer);
+      reject(e.code === 'ENOENT' ? new Error(`"${cmd}" was not found. Install it or set "compiler" in .asm-lens.json.`) : e);
+    });
+    child.on('close', code => {
+      clearTimeout(timer);
+      if (killed) return reject(new Error(`${cmd} timed out.`));
+      resolve({ code, stdout: Buffer.concat(out).toString('utf8'), stderr: Buffer.concat(err).toString('utf8') });
+    });
+    child.stdin.on('error', () => {});
+    child.stdin.end(input || '');
+  });
+}
+
+// Maps `.file`/`.loc` paths from local compiler output to local files.
+// "<stdin>" is the analyzed file (it is compiled from the editor buffer).
+function makeLocalRefResolver(mainKey, cwd) {
+  return function resolveRef(row) {
+    const s = row && typeof row === 'object' ? row.source : undefined;
+    if (!s || !Number.isInteger(s.line) || s.line <= 0) return undefined;
+    const line = s.line - 1;
+    const column = Number.isInteger(s.column) && s.column > 0 ? s.column - 1 : undefined;
+    const file = String(s.file || '');
+    if (!file || file === '<stdin>' || file === '-') return { key: mainKey, line, column };
+    const abs = path.isAbsolute(file) ? file : path.resolve(cwd, file);
+    if (/^\/usr\/|\/include\/c\+\+\//.test(abs.replace(/\\/g, '/'))) return undefined; // system headers
+    return { key: normPath(abs), line, column };
+  };
+}
+
+async function analyzeLocal(document, resolved, settings) {
+  if (document.uri.scheme !== 'file') throw new Error('Local mode needs a file that is saved on disk.');
+  const key = fileKey(document);
+  const rootPathKey = docPathKey(document);
+  const cwd = path.dirname(document.uri.fsPath);
+  const baseDir = vscode.workspace.getWorkspaceFolder?.(document.uri)?.uri.fsPath || cwd;
+  const compiler = resolved.localCompiler;
+  const timeoutMs = settings.get('requestTimeoutMs', 30000);
+  const maxAttempts = Math.max(1, Number(settings.get('maxRecoveryAttempts', 12)));
+  const recoverErrors = settings.get('skipFailingFunctions', true);
+  const incDirs = (resolved.includePaths || []).map(p => p && typeof p === 'object' ? p.dir : (path.isAbsolute(p) ? p : path.resolve(baseDir, p)));
+  const flags = [resolved.flags, ...resolved.defines.map(d => `-D${d}`), resolved.extraFlags].filter(Boolean).join(' ');
+  const lang = resolved.language === 'c' ? 'c' : 'c++';
+
+  // Empty stand-ins for headers that are not found anywhere.
+  const stubDir = path.join(os.tmpdir(), 'asm-lens-stubs-' + crypto.createHash('md5').update(document.uri.fsPath).digest('hex').slice(0, 10));
+  await fs.rm(stubDir, { recursive: true, force: true });
+  const stubbed = [];
+  const skipped = [];
+  let source = document.getText();
+  let asm;
+  const started = Date.now();
+
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    const args = [
+      ...splitArgs(flags), ...incDirs.map(d => `-I${d}`), '-iquote', cwd,
+      ...(stubbed.length ? [`-I${stubDir}`] : []),
+      '-S', '-g1', '-fdiagnostics-color=never', '-x', lang, '-o', '-', '-'
+    ];
+    const r = await runProcess(compiler, args, { cwd, input: source, timeoutMs });
+    if (r.code === 0) { asm = r.stdout; break; }
+    const err = r.stderr.replace(ANSI_RE, '');
+    let progressed = false;
+    for (const name of missingIncludesFrom(err)) {
+      const stub = stubFilename(name);
+      if (!stub || stubbed.includes(name)) continue;
+      const target = path.join(stubDir, stub);
+      await fs.mkdir(path.dirname(target), { recursive: true });
+      await fs.writeFile(target, '\n');
+      stubbed.push(name);
+      progressed = true;
+    }
+    if (!progressed && recoverErrors) {
+      for (const loc of errorLocationsFrom(err)) {
+        if (loc.file !== '<stdin>') continue;
+        const cut = blankEnclosingDeclaration(source, loc.line);
+        if (!cut) continue;
+        source = cut.text;
+        skipped.push({ name: cut.name, file: document.fileName, key: rootPathKey, startLine: cut.startLine, endLine: cut.endLine });
+        progressed = true;
+      }
+    }
+    if (!progressed || attempt === maxAttempts) {
+      outputChannel.appendLine(`Local compile command: ${compiler} ${args.join(' ')}  (cwd ${cwd})`);
+      outputChannel.appendLine('--- full compiler output ---\n' + err);
+      const errorsOnly = err.split('\n').filter(l => /\berror\b|fatal/i.test(l)).slice(0, 25).join('\n');
+      throw new Error((errorsOnly || err).slice(0, 1800));
+    }
+  }
+
+  // Demangle names (if c++filt exists) so they match source function names.
+  try {
+    const d = await runProcess('c++filt', [], { cwd, input: asm, timeoutMs });
+    if (d.code === 0 && d.stdout) asm = d.stdout;
+  } catch (_) { /* c++filt not installed: keep mangled names */ }
+
+  const rows = asm.split(/\r?\n/);
+  const functions = parseFunctions(rows, makeLocalRefResolver(rootPathKey, cwd));
+  const symbols = await vscode.commands.executeCommand('vscode.executeDocumentSymbolProvider', document.uri) || [];
+  const allSourceFunctions = sourceFunctionsOf(document, symbols);
+  const matched = functions.map(fn => {
+    const symbol = matchSourceSymbol(fn.name, allSourceFunctions);
+    return { ...fn, sourceName: symbol?.name || fn.name, sourceRange: symbol?.range, sourceSelection: symbol?.selectionRange };
+  });
+  const fileKeys = new Set([rootPathKey]);
+  for (const f of functions) for (const k of f.fileKeys) fileKeys.add(k);
+  const paths = new Map([[rootPathKey, document.uri.fsPath]]);
+  for (const k of fileKeys) if (k !== rootPathKey) paths.set(k, k);
+
+  lastAnalysis.set(key, {
+    functions: matched,
+    lineIndex: buildLineIndex(matched),
+    asmText: asm,
+    asmRows: rows,
+    compilerId: compiler,
+    compilerLabel: `${path.basename(compiler)} (local)`,
+    flags,
+    includeCount: 0,
+    rootKey: key,
+    configFile: resolved.configFile,
+    rootPath: document.uri.fsPath,
+    rootPathKey,
+    deps: fileKeys,
+    paths,
+    timestamp: Date.now(),
+    skipped,
+    stubbed,
+    sourceVersion: document.version
+  });
+  codeLensEmitter?.fire();
+  const ms = Date.now() - started;
+  outputChannel.appendLine(`Local compile of ${document.fileName} with ${compiler} ${flags} took ${ms} ms; found ${functions.length} emitted function(s).`);
+  for (const n of stubbed) outputChannel.appendLine(`  missing header treated as empty: ${n}`);
+  for (const k of skipped) outputChannel.appendLine(`  skipped (does not compile): ${k.name || '(declaration)'} at line ${k.startLine + 1}-${k.endLine + 1}`);
+  vscode.window.showInformationMessage(`Asm Lens (local): found ${functions.length} emitted function bodies in ${ms} ms${stubbed.length || skipped.length ? ' (see the Asm Lens output)' : ''}.`);
+}
 // ---------------------------------------------------------------------------
 // Compile with recovery
 //
@@ -594,8 +751,9 @@ async function compileWithRecovery(opts) {
       stubbed.push(name);
       progressed = true;
     }
-    // 1b. An uploaded header that fails in the preprocessor -> empty stand-in.
-    for (const bad of preprocessorErrorFilesFrom(lastErr)) {
+    // 1b. Optionally: an uploaded header that fails in the preprocessor -> empty stand-in.
+    // Off by default: a #error usually means a missing define, and emptying the header hides that.
+    for (const bad of (config().get('stubFailingHeaders', false) ? preprocessorErrorFilesFrom(lastErr) : [])) {
       const norm = bad.replace(/\\/g, '/');
       const f = files.find(x => !stubNames.has(x.filename) && !x.filename.endsWith('.asm_lens_keep') && (norm === x.filename || norm.endsWith('/' + x.filename)));
       if (!f) continue;
