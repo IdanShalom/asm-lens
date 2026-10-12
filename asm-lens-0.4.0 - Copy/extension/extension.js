@@ -502,7 +502,7 @@ function functionAtSignature(document, position, analysis, key) {
     if (hit) return hit;
   }
   const guessed = guessFunctionSymbols(document).find(s => s.range.start.line === position.line);
-  return guessed ? findFunctionResult(guessed, analysis.functions, key) : undefined;
+  return guessed ? findFunctionResult(guessed, analysis.functions, key, analysis.rootPathKey) : undefined;
 }
 
 // ---------------------------------------------------------------------------
@@ -694,7 +694,10 @@ async function analyzeLocal(document, resolved, settings) {
   await fs.rm(stubDir, { recursive: true, force: true });
   const stubbed = [];
   const skipped = [];
-  let source = document.getText();
+  const isHeader = HEADER_RE.test(document.uri.fsPath);
+  const originalSource = document.getText();
+  let source = isHeader ? keepHeaderFunctions(originalSource) : originalSource;
+  let keptHeader = isHeader;
   let asm;
   const started = Date.now();
 
@@ -727,6 +730,12 @@ async function analyzeLocal(document, resolved, settings) {
         progressed = true;
       }
     }
+    if (!progressed && keptHeader) {
+      keptHeader = false;
+      source = originalSource;
+      outputChannel.appendLine('  header: retrying without __attribute__((used))');
+      continue;
+    }
     if (!progressed || attempt === maxAttempts) {
       outputChannel.appendLine(`Local compile command: ${compiler} ${args.join(' ')}  (cwd ${cwd})`);
       outputChannel.appendLine('--- full compiler output ---\n' + err);
@@ -755,8 +764,8 @@ async function analyzeLocal(document, resolved, settings) {
   const paths = new Map([[rootPathKey, document.uri.fsPath]]);
   for (const k of fileKeys) if (k !== rootPathKey) paths.set(k, k);
 
-  if (!functions.length && /\.(h|hh|hpp|hxx|h\+\+|inl|ipp|tcc|PH|H)$/.test(document.uri.fsPath)) {
-    vscode.window.showInformationMessage('Asm Lens: a header emits no code on its own. Analyze a .cpp that includes it (e.g. gsc.cpp), then come back to this file.');
+  if (!functions.length && isHeader) {
+    vscode.window.showInformationMessage('Asm Lens: this header emitted no code (only templates or declarations). Analyze a .cpp that uses it, then come back to this file.');
     return;
   }
   
@@ -918,6 +927,17 @@ function stubFilename(name) {
   const norm = path.posix.normalize(String(name).replace(/\\/g, '/'));
   if (!norm || norm.startsWith('../') || norm === '..' || path.posix.isAbsolute(norm)) return undefined;
   return norm;
+}
+
+const HEADER_RE = /\.(h|hh|hpp|hxx|h\+\+|inl|ipp|tcc|PH|H)$/;
+
+// For analyzing a header on its own: mark its static/inline functions
+// __attribute__((used)) so the compiler emits them even though nothing calls them.
+// Edits are on the same line, so line numbers are unchanged.
+function keepHeaderFunctions(text) {
+  return text.replace(
+    /^([ \t]*)((?:static|inline|__inline__|__inline)(?:[ \t]+(?:static|inline|__inline__|__inline|constexpr))*)(?=[ \t])(?![ \t]+namespace\b)/gm,
+    '$1__attribute__((used)) $2');
 }
 
 // Blank the function (signature and body) or statement that contains `line`,
@@ -1185,10 +1205,10 @@ function matchSourceSymbol(asmName, symbols, fn, docKey) {
 }
 
 // The analyzed function for a source symbol: by position first, then by name.
-function findFunctionResult(symbol, functions, docKey) {
+function findFunctionResult(symbol, functions, docKey, rootKey) {
   if (!symbol) return undefined;
   const usable = f => !docKey || !f.fileKeys || f.fileKeys.size === 0 || f.fileKeys.has(docKey);
-  if (symbol.range) {
+  if (symbol.range && (!rootKey || docKey === rootKey)) {
     const line = symbol.range.start.line;
     const byRange = functions.find(f => usable(f) && f.sourceRange && f.sourceRange.start.line === line);
     if (byRange) return byRange;
@@ -1216,7 +1236,7 @@ function findAllFunctionResults(symbol, functions, docKey, rootKey) {
     const all = functions.filter(f => f.fileKeys && f.fileKeys.has(docKey) && !f.sourceRange && normalizeName(f.name) === norm);
     if (all.length) return all;
   }
-  const one = findFunctionResult(symbol, functions, docKey);
+  const one = findFunctionResult(symbol, functions, docKey, rootKey);
   return one ? [one] : [];
 }
 
