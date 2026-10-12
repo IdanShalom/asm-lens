@@ -91,12 +91,17 @@ async function unoptimizedScenario(t, config) {
   assert.match(await x.lensAt('mathx.hxx', L.square), /^\$\(symbol-numeric\) 2 instantiations · \d+ \/ \d+ instructions · .* via user\.cpp$/, x.describe('mathx.hxx'));
   for (const line of [L.clamp, L.cube, L.twice]) assert.match(await x.lensAt('mathx.hxx', line), /^\$\(symbol-numeric\) \d+ instructions · .* via user\.cpp$/, `line ${line}`);
   const names = x.analysis('mathx.hxx').functions.map(f => f.name).join('\n');
-  assert.match(names, /square<int>/);
-  assert.match(names, /square<double>/);
-  assert.match(names, /cube_int/);
+  if (/\?\?\$square@H@/.test(names)) {
+    // Clang for Windows (MSVC names): readable only when llvm-undname is installed.
+    assert.ok(!hasCommand('llvm-undname', ['--version']), `llvm-undname is installed but the names were not demangled:\n${names}`);
+  } else {
+    assert.match(names, /square<int>/);
+    assert.match(names, /square<double>/);
+    assert.match(names, /cube_int/);
+  }
   // The .cpp's own function is not mistaken for the header's cube().
   const cubeLens = await x.lensAt('mathx.hxx', L.cube);
-  const cube = x.analysis('mathx.hxx').functions.find(f => /cube<int>/.test(f.name));
+  const cube = x.analysis('mathx.hxx').functions.find(f => /cube<int>|\?\?\$cube@H@/.test(f.name));
   assert.ok(cube && cubeLens.includes(` ${cube.count} instructions`));
 }
 

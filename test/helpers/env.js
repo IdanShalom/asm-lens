@@ -76,6 +76,16 @@ function start(dir, options = {}) {
       return all.find(l => l.line === line && l.command !== 'asmLens.instantiateTemplate')?.title;
     },
     analysis(rel) { return ctx.ext._internals.analysisFor(ctx.vscode._openDocument(at(rel))); },
+    // Edits like the editor does: replaces text from (line, char) to (endLine, endChar), 0-based, and fires the change event.
+    edit(rel, line, char, endLine, endChar, text) {
+      const doc = ctx.vscode._openDocument(at(rel));
+      const lines = doc.getText().split('\n');
+      const before = lines.slice(0, line).join('\n') + (line ? '\n' : '') + lines[line].slice(0, char);
+      const after = lines[endLine].slice(endChar) + (endLine + 1 < lines.length ? '\n' + lines.slice(endLine + 1).join('\n') : '');
+      doc.setText(before + text + after);
+      ctx.state.changeListener({ document: doc, contentChanges: [{ range: new ctx.vscode.Range(line, char, endLine, endChar), text }] });
+      return doc;
+    },
     // A readable dump of the analysis covering `rel`, for assertion messages.
     describe(rel) {
       const a = this.analysis(rel);

@@ -151,10 +151,27 @@
           "default": "",
           "description": "C/C++ compiler for local mode (a GCC- or Clang-compatible command or path, e.g. g++, clang++, /usr/bin/g++-14). Empty means g++. Other languages use their own compiler (rustc, go, python3, swiftc, zig, gfortran)."
         },
-        "asmLens.reanalyzeOnSave": {
-          "type": "boolean",
-          "default": true,
-          "description": "Analyze again when you save a file that was analyzed (or a header used by an analyzed file), so the counts stay current without clicking."
+        "asmLens.reanalyzeOn": {
+          "type": "string",
+          "enum": [
+            "edit",
+            "save",
+            "never"
+          ],
+          "default": "edit",
+          "enumDescriptions": [
+            "Analyze again in the background when you pause typing (and when you save). Results below an edit stay visible meanwhile.",
+            "Analyze again when you save.",
+            "Only when you ask (CodeLens or command)."
+          ],
+          "description": "When a file that was analyzed (or a header an analyzed file uses) changes, analyze it again. The whole file is recompiled, since a change can affect every function that inlines the edited one."
+        },
+        "asmLens.reanalyzeDelayMs": {
+          "type": "number",
+          "default": 1000,
+          "minimum": 200,
+          "maximum": 10000,
+          "description": "With \"asmLens.reanalyzeOn\": \"edit\", how long typing must pause before analyzing again."
         },
         "asmLens.baseUrl": {
           "type": "string",

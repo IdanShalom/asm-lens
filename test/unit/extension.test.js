@@ -284,17 +284,99 @@ test('language-server symbols are used, and the source scan adds what they miss'
   assert.deepEqual(fns.map(s => s.name), ['f()', 'main']);
 });
 
-test('editing a file invalidates the analyses that used it', async () => {
-  const dir = makeProject({ 'a.cpp': 'int f() { return 1; }\n' });
-  const ce = fakeCompilerExplorer(() => ({ code: 0, asm: asmFor(['f()', 1]) }));
+test('editing keeps the results: lines below move, only edited functions change, one compile after the pause', async () => {
+  const src = 'int a() { return 1; }\nint b() { return 2; }\nint c() { return 3; }\n';
+  const dir = makeProject({ 'a.cpp': src });
+  const ce = fakeCompilerExplorer(body => {
+    const lines = body.source.split('\n');
+    const out = [];
+    lines.forEach((l, i) => { const m = /^int (\w)\(\)/.exec(l); if (m) out.push(...asmFor([`${m[1]}()`, i + 1])); });
+    return { code: 0, asm: out };
+  });
   try {
-    const x = start(dir);
+    const x = start(dir, { settings: { 'asmLens.reanalyzeDelayMs': 200 } });
     await x.analyze('a.cpp');
-    assert.ok(x.analysis('a.cpp'));
-    const doc = x.open('a.cpp');
-    doc.setText('int f() { return 2; }\n');
-    x.state.changeListener({ document: doc, contentChanges: [{}] });
-    assert.equal(x.analysis('a.cpp'), undefined);
+    assert.equal(ce.requests.length, 1);
+    // Two new lines at the top: everything moves down two lines, nothing is "changed".
+    x.edit('a.cpp', 0, 0, 0, 0, '// one\n// two\n');
+    const moved = await x.lenses('a.cpp');
+    assert.deepEqual(moved.map(l => [l.line, l.title.split(' · ')[0]]), [[3, '$(symbol-numeric) 2 instructions'], [4, '$(symbol-numeric) 2 instructions'], [5, '$(symbol-numeric) 2 instructions']]);
+    const hover = x.state.hoverProviders[0].provider.provideHover(x.open('a.cpp'), new x.vscode.Position(3, 15));
+    assert.match(hover.contents.value, /\*\*b\*\*|Line 4/, 'hover follows the moved line');
+    // Typing inside b(): only b() is "updating"; a() and c() keep their numbers.
+    x.edit('a.cpp', 3, 17, 3, 18, '20');
+    x.edit('a.cpp', 3, 18, 3, 18, '0');
+    const typing = await x.lenses('a.cpp');
+    assert.deepEqual(typing.map(l => l.title.split(' · ')[0]), ['$(symbol-numeric) 2 instructions', '$(sync~spin) Updating…', '$(symbol-numeric) 2 instructions']);
+    assert.equal(x.state.hoverProviders[0].provider.provideHover(x.open('a.cpp'), new x.vscode.Position(3, 5)), undefined, 'no stale instructions on an edited line');
+    assert.equal(ce.requests.length, 1, 'nothing is compiled while typing');
+    await new Promise(r => setTimeout(r, 400));
+    assert.equal(ce.requests.length, 2, 'one compile after the pause');
+    assert.deepEqual((await x.lenses('a.cpp')).map(l => [l.line, l.title.split(' · ')[0]]), [[3, '$(symbol-numeric) 2 instructions'], [4, '$(symbol-numeric) 2 instructions'], [5, '$(symbol-numeric) 2 instructions']]);
+    assert.equal(x.state.progress.at(-1).opts.location, x.vscode.ProgressLocation.Window, 'background analyses do not pop up a notification');
+  } finally { ce.restore(); }
+});
+
+test('editing while a compile runs cancels it; the next one starts after the pause', async () => {
+  const dir = makeProject({ 'a.cpp': 'int a() { return 1; }\n' });
+  const real = global.fetch;
+  const calls = [];
+  global.fetch = (url, init) => new Promise((resolve, reject) => {
+    const call = { body: JSON.parse(init.body), aborted: false };
+    calls.push(call);
+    init.signal.addEventListener('abort', () => { call.aborted = true; const e = new Error('aborted'); e.name = 'AbortError'; reject(e); });
+    setTimeout(() => resolve({ ok: true, status: 200, json: async () => ({ code: 0, asm: asmFor(['a()', 1]) }), text: async () => JSON.stringify({ code: 0, asm: asmFor(['a()', 1]) }) }), 300);
+  });
+  try {
+    const x = start(dir, { settings: { 'asmLens.reanalyzeDelayMs': 200 } });
+    await x.analyze('a.cpp');
+    x.edit('a.cpp', 0, 17, 0, 18, '2');
+    await new Promise(r => setTimeout(r, 250));      // the background compile has started
+    assert.equal(calls.length, 2);
+    x.edit('a.cpp', 0, 17, 0, 18, '3');               // ... and is now outdated
+    assert.equal(calls[1].aborted, true);
+    await new Promise(r => setTimeout(r, 700));
+    assert.equal(calls.length, 3);
+    assert.match(calls[2].body.source, /return 3;/);
+    assert.equal(x.state.messages.error.length, 0);
+    assert.ok(x.state.outputLines.some(l => l.startsWith('Outdated')));
+  } finally { global.fetch = real; }
+});
+
+test('reanalyzeOn "save" and "never"', async () => {
+  const dir = makeProject({ 'a.cpp': 'int a() { return 1; }\n' });
+  const ce = fakeCompilerExplorer(() => ({ code: 0, asm: asmFor(['a()', 1]) }));
+  try {
+    const x = start(dir, { settings: { 'asmLens.reanalyzeOn': 'save', 'asmLens.reanalyzeDelayMs': 200 } });
+    await x.analyze('a.cpp');
+    x.edit('a.cpp', 0, 18, 0, 19, '5');
+    await new Promise(r => setTimeout(r, 300));
+    assert.equal(ce.requests.length, 1, 'no compile while editing');
+    const lens = (await x.lenses('a.cpp'))[0];
+    assert.equal(lens.title, '$(edit) Changed since the last analysis · click to update');
+    assert.equal(lens.command, 'asmLens.analyzeFile');
+    await x.state.saveListener(x.open('a.cpp'));
+    assert.equal(ce.requests.length, 2, 'saving compiles');
+    x.state.settings['asmLens.reanalyzeOn'] = 'never';
+    x.edit('a.cpp', 0, 18, 0, 19, '6');
+    await x.state.saveListener(x.open('a.cpp'));
+    await new Promise(r => setTimeout(r, 300));
+    assert.equal(ce.requests.length, 2, 'never: only on request');
+  } finally { ce.restore(); }
+});
+
+test('the open assembly view follows the new code after a re-analysis', async () => {
+  const dir = makeProject({ 'a.cpp': 'int a() { return 1; }\n' });
+  let n = 0;
+  const ce = fakeCompilerExplorer(() => ({ code: 0, asm: [{ text: 'a():' }, ...Array.from({ length: ++n }, () => ({ text: '        nop', source: { file: null, line: 1 } }))] }));
+  try {
+    const x = start(dir, { settings: { 'asmLens.reanalyzeDelayMs': 200 } });
+    await x.analyze('a.cpp');
+    await x.state.commands.get('asmLens.showAssembly')(x.vscode.Uri.file(x.at('a.cpp')), 'a', 0);
+    assert.match(x.state.webviewHtml, /a — 1 instructions/);
+    x.edit('a.cpp', 0, 18, 0, 19, '2');
+    await new Promise(r => setTimeout(r, 400));
+    assert.match(x.state.webviewHtml, /a — 2 instructions/);
   } finally { ce.restore(); }
 });
 
@@ -426,9 +508,8 @@ test('unchanged code is not compiled twice (reply cache)', async () => {
     await x.analyze('a.cpp');
     await x.analyze('a.cpp');
     assert.equal(ce.requests.length, 1);
-    const doc = x.open('a.cpp');
-    doc.setText('int f() { return 2; }\n');
-    x.state.changeListener({ document: doc, contentChanges: [{}] });
+    x.state.settings['asmLens.reanalyzeOn'] = 'never';
+    x.edit('a.cpp', 0, 17, 0, 18, '2');
     await x.analyze('a.cpp');
     assert.equal(ce.requests.length, 2);
   } finally { ce.restore(); }
@@ -440,17 +521,16 @@ test('saving a header analyzes again the .cpp whose results it shows (unless tur
   try {
     const x = start(dir);
     await x.analyze('u.cpp');
-    const header = x.open('m.hxx');
-    header.setText('#pragma once\ninline int h() { return 7; }\n');
-    x.state.changeListener({ document: header, contentChanges: [{}] });
-    assert.equal(x.analysis('m.hxx'), undefined, 'the edit invalidated the results');
+    x.state.settings['asmLens.reanalyzeOn'] = 'save';
+    const header = x.edit('m.hxx', 1, 25, 1, 26, '7');
+    assert.match(await x.lensAt('m.hxx', 2), /Changed since the last analysis/, 'the edited header function is marked');
     await x.state.saveListener(header);
     await new Promise(r => setTimeout(r, 50));
     assert.equal(ce.requests.length, 2);
     assert.equal(x.analysis('m.hxx').rootPath, x.at('u.cpp'));
     await x.state.saveListener(x.open('other.hxx'));
     assert.equal(ce.requests.length, 2, 'an unrelated file does not trigger anything');
-    x.state.settings['asmLens.reanalyzeOnSave'] = false;
+    x.state.settings['asmLens.reanalyzeOn'] = 'never';
     await x.state.saveListener(x.open('u.cpp'));
     assert.equal(ce.requests.length, 2);
   } finally { ce.restore(); }

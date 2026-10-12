@@ -30,8 +30,10 @@ Go, Python, Zig, Swift, D and Fortran are supported too.
 - **Remote or local**, per project or per compiler, on Windows, Linux and macOS.
 - **Fast, and visibly working**: a progress notification shows each step (finding headers,
   compiling, retrying around errors) with a **Cancel** button; the status bar and the CodeLens
-  spin while it runs. Saving re-analyzes automatically, unchanged code is answered from a cache,
-  and Compiler Explorer is asked for compact replies.
+  spin while it runs. Unchanged code is answered from a cache, and Compiler Explorer is asked
+  for compact replies.
+- **Live while you edit**: results stay on screen and move with the text; only the functions you
+  change show *Updating…*, and the file is analyzed again in the background when you pause typing.
 
 ## Quick start
 
@@ -40,8 +42,25 @@ Go, Python, Zig, Swift, D and Fortran are supported too.
    or right-click in the editor).
 3. Click a count to open the assembly view. Hover lines in either view.
 
-While it compiles, a notification shows what is happening and lets you cancel. After that,
-saving the file updates the counts by itself.
+While it compiles, a notification shows what is happening and lets you cancel. After that the
+counts follow your edits by themselves (see [Editing](#editing)).
+
+## Editing
+
+You do not need to analyze again after a change:
+
+- Results stay visible while you type. Counts below an edit move with the text; a function you change
+  shows **Updating…** (or *Changed since the last analysis*), the others keep their numbers.
+- When you pause typing (`asmLens.reanalyzeDelayMs`, 1 s) the file is analyzed again in the background,
+  with a spinner in the status bar instead of a notification. A newer edit cancels a compile of the older
+  text. The open assembly view switches to the new code of the same function.
+- Editing a header updates the `.cpp` whose results it shows.
+- The whole file is compiled each time, because that is the smallest unit a compiler works on, and a change
+  to one function can change every function it is inlined into (or, for a type or a `#define`, everything
+  after it). Compiling less would give wrong numbers. What is skipped is everything else: unchanged code
+  is answered from a cache, and replies are kept small.
+
+Set `asmLens.reanalyzeOn` to `save` to compile only when you save, or `never` to compile only when you ask.
 
 By default the file is compiled on godbolt.org with GCC 15.2 and `-O2 -masm=intel`.
 Choose another compiler with the compiler name in the status bar (bottom right) or
@@ -208,7 +227,8 @@ Each object in `compilers` may have:
 |---------|---------|---------|
 | `asmLens.mode` | `remote` | Where to compile when `.asm-lens.json` does not say. |
 | `asmLens.localCompiler` | `""` (= `g++`) | Local C/C++ compiler when `.asm-lens.json` does not name one. |
-| `asmLens.reanalyzeOnSave` | `true` | Saving a file that was analyzed (or a header an analyzed file uses) analyzes it again, with a status-bar spinner instead of a notification. |
+| `asmLens.reanalyzeOn` | `edit` | When an analyzed file (or a header it uses) changes: `edit` analyzes again in the background once typing pauses (and on save), `save` only on save, `never` only when you ask. |
+| `asmLens.reanalyzeDelayMs` | `1000` | With `edit`: how long typing must pause first. |
 | `asmLens.baseUrl` | `https://godbolt.org` | Compiler Explorer server. |
 | `asmLens.compilerId` | `g152` | Compiler Explorer compiler for C/C++ without a project file. **Select Compiler** sets it. |
 | `asmLens.compilerName` | `GCC (selected ID)` | Its label in the CodeLens. |

@@ -21,6 +21,9 @@
   signatures, in-class methods, templates, operators, constructors with initializer lists.
 
 ### Fixes
+- Clang for Windows (MSVC target): names are matched without a demangler and demangled with
+  `llvm-undname` when it is installed.
+- Swift without `swift-demangle` on the PATH (Linux): functions are found and named.
 - Clang on Compiler Explorer: LLVM comment lines (`# %bb.0:`) were counted as functions, splitting
   every function in two.
 - Local mode with Clang: `.cpp` lines were not mapped when Clang names the input `<dir>/<stdin>`;
@@ -37,8 +40,10 @@
 - A progress notification shows each step (finding headers, compiling, retrying around errors)
   with a Cancel button that stops the request or the compiler and everything it started. The
   status bar and the CodeLens spin while an analysis runs.
-- Saving a file that was analyzed (or a header an analyzed file uses) analyzes it again
-  (`asmLens.reanalyzeOnSave`).
+- Editing no longer throws the results away: counts below an edit move with the text, only the
+  edited functions show *Updating…*, and the file is analyzed again in the background when typing
+  pauses (`asmLens.reanalyzeOn`: `edit`, `save` or `never`; `asmLens.reanalyzeDelayMs`). A newer
+  edit cancels the compile of older text; the open assembly view follows the new code.
 - Compiler Explorer is asked to leave out directives and comment lines: replies are 5 to 15 times
   smaller with the same results. Identical requests are answered from an in-memory cache.
 - The language server's symbols are fetched while the code compiles, not after.

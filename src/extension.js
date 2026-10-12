@@ -31,8 +31,12 @@ let outputPanel;
 let panelState;
 let outputChannel;
 let analysisBusy = new Set();
-// Files to analyze again once their running analysis ends (saved meanwhile).
+// Files to analyze again once their running analysis ends (edited or saved meanwhile).
 const rerunAfter = new Set();
+// The running analysis of each file (to cancel it when it is outdated), and the
+// pending automatic re-analyses: file key -> job / timer.
+const runningJobs = new Map();
+const reanalysisTimers = new Map();
 // Files analyzed in this session, for re-analysis on save:
 // file key -> { uri, deps (file path keys it used), stamp (when) }. Kept when edits invalidate the results.
 const analyzedFiles = new Map();
@@ -245,7 +249,7 @@ function activate(context) {
       // while symbols are being collected, so an earlier snapshot can be stale.
       const cached = analysisFor(document);
       const functions = sourceFunctionsOf(document, tree);
-      if (analysisBusy.has(fileKey(document))) {
+      if (analysisBusy.has(fileKey(document)) && !cached) {
         return functions.map(sym => new vscode.CodeLens(sym.range, { title: '$(sync~spin) Analyzing…', command: 'asmLens.showOutput' }));
       }
       const templates = templateTargetsOf(document, functions);
@@ -259,10 +263,17 @@ function activate(context) {
       }
       const key = docPathKey(document);
       const viaRoot = cached.rootKey !== fileKey(document) ? ` · via ${path.basename(cached.rootPath)}` : '';
+      const updating = reanalysisTimers.has(cached.rootKey) || analysisBusy.has(cached.rootKey);
       return [...functions.map(sym => {
         const results = findAllFunctionResults(sym, cached.functions, key, cached.rootPathKey);
         const result = results[0];
         const inlined = !result ? inlinedResultFor(sym, cached, key) : undefined;
+        // Edited since the last compile: its old numbers would be wrong.
+        if (isStale(cached, key, sym.range, results.length ? results : inlined ? [inlined] : [])) {
+          return new vscode.CodeLens(sym.range, updating
+            ? { title: '$(sync~spin) Updating…', command: 'asmLens.showOutput' }
+            : { title: '$(edit) Changed since the last analysis · click to update', command: 'asmLens.analyzeFile', arguments: [vscode.Uri.file(cached.rootPath)] });
+        }
         const wasSkipped = !result && !inlined && (cached.skipped || []).some(k => k.key === key && sym.range.start.line >= k.startLine && sym.range.start.line <= k.endLine);
         const title = results.length > 1
           ? `$(symbol-numeric) ${results.length} instantiations · ${results.map(r => r.count).join(' / ')} instructions · ${cached.compilerLabel}${viaRoot}`
@@ -290,6 +301,7 @@ function activate(context) {
       const analysis = analysisFor(document);
       if (!analysis) return undefined;
       const key = docPathKey(document);
+      if ((analysis.edits || []).some(e => e.key === key && e.start <= position.line && position.line <= e.end)) return undefined;
       syncAsmHighlight(analysis, key, position.line);
 
       // Hovering the function's own signature line previews the whole function.
@@ -449,32 +461,116 @@ function activate(context) {
     showAssembly(result, cached);
   }));
 
-  // Saving a file analyzes again the newest analysis that used it: the file's
-  // own, or (for a header) that of the file including it.
+  // Saving analyzes again the newest analysis that used the file: its own, or
+  // (for a header) that of the file including it.
   context.subscriptions.push(vscode.workspace.onDidSaveTextDocument(document => {
-    if (!config().get('reanalyzeOnSave', true) || !LANGS.includes(document.languageId)) return;
-    const key = docPathKey(document);
-    let newest;
-    for (const [rootKey, entry] of analyzedFiles) {
-      if ((rootKey === fileKey(document) || entry.deps.has(key)) && (!newest || entry.stamp > newest.stamp)) newest = entry;
-    }
-    if (!newest) return;
-    if (newest.uri.toString() === document.uri.toString()) return analyzeDocument(document, { auto: true });
-    vscode.workspace.openTextDocument(newest.uri).then(d => analyzeDocument(d, { auto: true }), () => {});
+    if (reanalyzeMode() === 'never' || !LANGS.includes(document.languageId)) return;
+    const target = analysisToUpdate(document);
+    if (!target) return;
+    clearTimeout(reanalysisTimers.get(target.rootKey));
+    reanalysisTimers.delete(target.rootKey);
+    return reanalyze(target, document);
   }));
 
+  // Editing keeps the results: lines below an edit move with the text, the
+  // edited functions are marked as changed, and (by default) the file is
+  // analyzed again in the background once typing pauses.
   context.subscriptions.push(vscode.workspace.onDidChangeTextDocument(event => {
     if (event.contentChanges.length === 0) return;
-    // Invalidate every analysis that used this document, either as the analyzed
-    // file or as an uploaded header.
     const key = docPathKey(event.document);
     let changed = false;
-    for (const [k, analysis] of lastAnalysis) {
-      if (k === fileKey(event.document) || analysis.deps.has(key)) { lastAnalysis.delete(k); changed = true; }
+    for (const analysis of lastAnalysis.values()) {
+      if (analysis.rootKey === fileKey(event.document) || analysis.deps.has(key)) { applyEdits(analysis, key, event.contentChanges); changed = true; }
     }
     if (panelState && panelState.analysis.deps.has(key)) { panelState.stale = true; clearSourceColors(); clearSourceHighlight(); }
+    if (reanalyzeMode() === 'edit' && LANGS.includes(event.document.languageId)) {
+      const target = analysisToUpdate(event.document);
+      if (target) {
+        // A compile of the old text is useless now; the timer starts the next one.
+        runningJobs.get(target.rootKey)?.cancel('outdated');
+        clearTimeout(reanalysisTimers.get(target.rootKey));
+        const delay = Math.max(200, Number(config().get('reanalyzeDelayMs', 1000)) || 1000);
+        reanalysisTimers.set(target.rootKey, setTimeout(() => {
+          reanalysisTimers.delete(target.rootKey);
+          reanalyze(target, event.document);
+        }, delay));
+        changed = true;
+      }
+    }
     if (changed) codeLensEmitter?.fire();
   }));
+}
+
+function reanalyzeMode() {
+  const mode = config().get('reanalyzeOn', 'edit');
+  return mode === 'save' || mode === 'never' ? mode : 'edit';
+}
+
+// The analyzed file whose results `document` shows (itself, or the newest file
+// that includes it), or undefined.
+function analysisToUpdate(document) {
+  const key = docPathKey(document);
+  let newest;
+  for (const [rootKey, entry] of analyzedFiles) {
+    if ((rootKey === fileKey(document) || entry.deps.has(key)) && (!newest || entry.stamp > newest.stamp)) newest = { ...entry, rootKey };
+  }
+  return newest;
+}
+
+function reanalyze(target, document) {
+  if (target.uri.toString() === document.uri.toString()) return analyzeDocument(document, { auto: true });
+  return Promise.resolve(vscode.workspace.openTextDocument(target.uri)).then(d => analyzeDocument(d, { auto: true }), () => {});
+}
+
+// Moves the results of `analysis` along with edits of file `key`: instruction
+// lines and function ranges below an edit shift by the lines added or removed;
+// the edited lines are remembered (analysis.edits) so the functions there are
+// shown as changed until the next compile.
+function applyEdits(analysis, key, changes) {
+  const refs = new Set();
+  for (const f of analysis.functions) {
+    for (const r of f.rows || []) if (r.ref && r.ref.key === key) refs.add(r.ref);
+    for (const r of f.instructionRows) if (r.ref && r.ref.key === key) refs.add(r.ref);
+  }
+  analysis.edits = analysis.edits || [];
+  const ordered = [...changes].filter(c => c.range).sort((a, b) => b.range.start.line - a.range.start.line || b.range.start.character - a.range.start.character);
+  for (const change of ordered) {
+    const s = change.range.start.line, e = change.range.end.line;
+    const added = (change.text.match(/\n/g) || []).length;
+    const delta = added - (e - s);
+    // Line e is untouched when the change ends at its start (whole lines replaced, or text inserted before it).
+    const untouchedEnd = change.range.end.character === 0 && (s < e || change.range.start.character === 0);
+    const moveLine = l => (l > e || (l === e && untouchedEnd)) ? l + delta : l < s ? l : Math.min(l, s + added);
+    for (const ref of refs) ref.line = moveLine(ref.line);
+    const moveRange = r => r && new vscode.Range(moveLine(r.start.line), r.start.character, Math.max(moveLine(r.start.line), moveLine(r.end.line)), r.end.character);
+    if (key === analysis.rootPathKey) {
+      for (const f of analysis.functions) { f.sourceRange = moveRange(f.sourceRange); f.sourceSelection = moveRange(f.sourceSelection); }
+    }
+    for (const k of analysis.skipped || []) {
+      if (k.key === key) { k.startLine = moveLine(k.startLine); k.endLine = Math.max(k.startLine, moveLine(k.endLine)); }
+    }
+    // The lines that now hold edited text (none when whole lines were only deleted).
+    let span = { key, start: s, end: untouchedEnd ? s + added - 1 : s + added };
+    const kept = [];
+    for (const x of analysis.edits) {
+      if (x.key !== key) { kept.push(x); continue; }
+      const moved = { key, start: moveLine(x.start), end: moveLine(x.end) };
+      if (span.end < span.start || moved.end < span.start - 1 || moved.start > span.end + 1) kept.push(moved);
+      else span = { key, start: Math.min(span.start, moved.start), end: Math.max(span.end, moved.end) };
+    }
+    analysis.edits = span.end < span.start ? kept : [...kept, span];
+  }
+  analysis.lineIndex = buildLineIndex(analysis.functions);
+}
+
+// Whether lines `range` of file `key`, or the instructions of `results`, were
+// edited after the analysis was made.
+function isStale(analysis, key, range, results) {
+  const edits = analysis.edits || [];
+  if (!edits.length) return false;
+  const touched = (k, a, b) => edits.some(x => x.key === k && x.start <= b && a <= x.end);
+  if (range && touched(key, range.start.line, range.end.line)) return true;
+  return results.some(f => (f.instructionRows || []).some(r => r.ref && touched(r.ref.key, r.ref.line, r.ref.line)));
 }
 
 // ---------------------------------------------------------------------------
@@ -815,6 +911,7 @@ function throwIfCancelled() {
 // automatic ones (on save). The status-bar item and the CodeLens spin meanwhile.
 function withJob(document, auto, task) {
   const name = path.basename(document.fileName);
+  const key = fileKey(document);
   return vscode.window.withProgress({
     location: auto ? vscode.ProgressLocation.Window : vscode.ProgressLocation.Notification,
     title: auto ? `Asm Lens: ${name}` : `Asm Lens: analyzing ${name}`,
@@ -829,12 +926,19 @@ function withJob(document, auto, task) {
         setBusyStatus(message);
       }
     };
-    token?.onCancellationRequested?.(() => {
+    // reason: 'user' (Cancel button), 'outdated' (the text changed; a timer
+    // analyzes again) or 'rerun' (analyze again as soon as this one stops).
+    job.cancel = reason => {
+      if (job.cancelled) return;
       job.cancelled = true;
+      job.cancelReason = reason;
+      if (reason === 'rerun') rerunAfter.add(key);
       for (const c of job.aborts) c.abort();
       for (const child of [...job.children]) child.kill();
-    });
-    return jobContext.run(job, task);
+    };
+    token?.onCancellationRequested?.(() => job.cancel('user'));
+    runningJobs.set(key, job);
+    return jobContext.run(job, task).finally(() => { if (runningJobs.get(key) === job) runningJobs.delete(key); });
   });
 }
 
@@ -850,7 +954,10 @@ function setBusyStatus(message) {
 
 async function analyzeDocument(document, { auto = false } = {}) {
   const key = fileKey(document);
-  if (analysisBusy.has(key)) { if (auto) rerunAfter.add(key); return; }
+  if (analysisBusy.has(key)) {
+    if (auto) runningJobs.get(key)?.cancel('rerun');
+    return;
+  }
   if (!LANGS.includes(document.languageId)) {
     return vscode.window.showWarningMessage(`Asm Lens supports C, C++, Objective-C, Rust, Go, Python, Zig, Swift, D and Fortran files (this file is "${document.languageId}").`);
   }
@@ -872,6 +979,7 @@ async function runAnalysis(document) {
   // compile (it can be slow while it indexes); the answer is used at the end.
   const job = jobContext.getStore();
   if (job) {
+    job.startVersion = document.version;
     job.symbols = Promise.resolve(vscode.commands.executeCommand('vscode.executeDocumentSymbolProvider', document.uri)).then(s => s || [], () => []);
     job.symbolsVersion = document.version;
   }
@@ -954,7 +1062,8 @@ async function runAnalysis(document) {
     vscode.window.showInformationMessage(`Asm Lens: found ${functions.length} emitted function bodies${includeBundle.pathMap.length ? `; uploaded ${includeBundle.pathMap.length} local header(s)` : ''}${notes.length ? ` (${notes.join('; ')}; see the Asm Lens output)` : ''}.`);
   } catch (e) {
     if (e.name === 'Cancelled' || jobContext.getStore()?.cancelled) {
-      outputChannel.appendLine(`Cancelled: ${document.fileName}`);
+      const reason = jobContext.getStore()?.cancelReason;
+      outputChannel.appendLine(reason === 'user' || !reason ? `Cancelled: ${document.fileName}` : `Outdated (the file changed while compiling): ${document.fileName}`);
       return;
     }
     const message = e.name === 'AbortError' ? 'Compiler Explorer request timed out.' : e.message;
@@ -1003,6 +1112,12 @@ let lastStamp = 0;
 // symbols, stores the analysis and refreshes CodeLens.
 async function recordAnalysis(document, o) {
   throwIfCancelled();
+  const running = jobContext.getStore();
+  if (running && running.startVersion !== undefined && running.startVersion !== document.version) {
+    // The text changed while compiling: these results belong to the old text.
+    running.cancel(reanalysisTimers.has(fileKey(document)) ? 'outdated' : 'rerun');
+    throw new Cancelled();
+  }
   report('matching functions with the source…');
   const rootPathKey = docPathKey(document);
   const functions = parseFunctions(o.rows, o.resolveRef);
@@ -1043,6 +1158,7 @@ async function recordAnalysis(document, o) {
   lastAnalysis.set(fileKey(document), result);
   analyzedFiles.set(fileKey(document), { uri: document.uri, deps, stamp: lastStamp });
   codeLensEmitter?.fire();
+  refreshPanel(result);
   return result;
 }
 
@@ -1106,6 +1222,34 @@ async function demangle(text, demanglers, cwd, timeoutMs) {
     } catch (_) { /* not installed: try the next one */ }
   }
   return text;
+}
+
+// Clang for Windows (MSVC target) writes MSVC-mangled names, which c++filt does
+// not read; llvm-undname (installed with LLVM) does. Names stay as they are
+// when it is missing.
+async function demangleMsvc(asm, cwd, timeoutMs) {
+  const names = [...new Set((asm.match(/"\?[^"\s]+"/g) || []).map(s => s.slice(1, -1)))];
+  if (!names.length) return asm;
+  const input = `${names.join('\n')}\n`;
+  let out;
+  for (const args of [['--no-calling-convention', '--no-access-specifier', '--no-member-type'], []]) {
+    try {
+      const r = await runProcess('llvm-undname', args, { cwd, input, timeoutMs });
+      if (r.code === 0 && r.stdout) { out = r.stdout; break; }
+    } catch (e) {
+      if (e.name === 'Cancelled') throw e;
+      return asm;
+    }
+  }
+  if (!out) return asm;
+  // Output: each mangled name on a line, its demangled form on the next.
+  const lines = out.split(/\r?\n/).map(l => l.trim());
+  const wanted = new Set(names);
+  const map = new Map();
+  for (let i = 0; i + 1 < lines.length; i++) {
+    if (wanted.has(lines[i]) && lines[i + 1] && !/^error\b/i.test(lines[i + 1]) && !wanted.has(lines[i + 1])) map.set(lines[i], lines[i + 1]);
+  }
+  return map.size ? asm.replace(/"(\?[^"\s]+)"/g, (all, name) => map.get(name) || all) : asm;
 }
 
 function errorsOnly(err) {
@@ -1206,6 +1350,7 @@ async function analyzeLocal(document, resolved, settings) {
   if (macho) asm = prepareMachO(asm);
   asm = await demangle(asm, [['c++filt', []], ['llvm-cxxfilt', []]], cwd, timeoutMs);
   if (macho) asm = finishMachO(asm);
+  asm = await demangleMsvc(asm, cwd, timeoutMs);
 
   const rows = localAsmToRows(asm, cwd);
   const result = await recordAnalysis(document, {
@@ -1552,6 +1697,15 @@ window.addEventListener('message',e=>{const m=e.data||{};if(m.type==='highlightA
 </script></body></html>`;
   outputPanel.reveal(vscode.ViewColumn.Beside, true);
   applySourceColors();
+}
+
+// After an analysis, the open assembly view shows the new code of the same function.
+function refreshPanel(analysis) {
+  if (!outputPanel || !outputPanel.visible || !panelState || panelState.analysis.rootKey !== analysis.rootKey) return;
+  const old = panelState.result;
+  const next = analysis.functions.find(f => f.name === old.name)
+    || (old.sourceName && analysis.functions.find(f => f.sourceName === old.sourceName && !/\(inlined\)$/.test(old.sourceName)));
+  if (next) showAssembly(next, analysis);
 }
 
 // Persistent CE-style coloring: each source line gets the same color as its instructions.
