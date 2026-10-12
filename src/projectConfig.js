@@ -6,6 +6,8 @@ const path = require('path');
 const CONFIG_NAMES = ['.asm-lens.json', path.join('.vscode', 'asm-lens.json')];
 
 const TEMPLATE = `{
+  // "remote": compile on Compiler Explorer (godbolt.org). "local": run "compiler" on this machine.
+  "mode": "remote",
   // First compiler is the default; switch with the status-bar item.
   "compilers": [
     { "id": "g152", "name": "GCC 15.2", "flags": "-O2 -masm=intel" }
@@ -45,10 +47,23 @@ function parseJsonc(text) {
   return JSON.parse(out.replace(/,(\s*[}\]])/g, '$1'));
 }
 
+// Accepted "language" values -> Compiler Explorer language ids.
+const LANGUAGE_NAMES = {
+  c: 'c', 'c++': 'c++', cpp: 'c++', cxx: 'c++',
+  rust: 'rust', rs: 'rust', go: 'go', golang: 'go', python: 'python', py: 'python',
+  zig: 'zig', swift: 'swift', d: 'd', fortran: 'fortran'
+};
+const LANGUAGE_LIST = '"c", "c++", "rust", "go", "python", "zig", "swift", "d" or "fortran"';
+
 function normalizeLanguage(value) {
-  const v = String(value || '').toLowerCase();
-  if (v === 'c') return 'c';
-  if (v === 'c++' || v === 'cpp' || v === 'cxx') return 'c++';
+  return LANGUAGE_NAMES[String(value || '').trim().toLowerCase()];
+}
+
+function normalizeMode(value, label, warnings) {
+  if (value === undefined) return undefined;
+  const m = String(value).toLowerCase();
+  if (m === 'local' || m === 'remote') return m;
+  warnings.push(`Unknown ${label}: ${JSON.stringify(value)} (use "local" or "remote").`);
   return undefined;
 }
 
@@ -80,8 +95,8 @@ function normalizeConfig(raw, baseDir) {
   if (typeof raw.baseUrl === 'string' && raw.baseUrl.trim()) out.baseUrl = raw.baseUrl.trim().replace(/\/$/, '');
   if (typeof raw.flags === 'string') out.flags = raw.flags;
   const lang = normalizeLanguage(raw.language);
-  if (raw.language !== undefined && !lang) warnings.push(`Unknown "language": ${JSON.stringify(raw.language)} (use "c" or "c++").`);
-  if (lang) out.language = lang;
+  if (raw.language !== undefined && (!lang || (lang !== 'c' && lang !== 'c++'))) warnings.push(`Unknown "language": ${JSON.stringify(raw.language)} (use "c" or "c++"; other languages are set per compiler).`);
+  else if (lang) out.language = lang;
   if (Number.isFinite(raw.maxIncludeFiles) && raw.maxIncludeFiles > 0) out.maxIncludeFiles = Math.floor(raw.maxIncludeFiles);
 
   (Array.isArray(raw.compilers) ? raw.compilers : raw.compilers === undefined ? [] : (warnings.push('"compilers" must be an array.'), [])).forEach((c, i) => {
@@ -90,8 +105,10 @@ function normalizeConfig(raw, baseDir) {
     const entry = { id: item.id.trim(), name: typeof item.name === 'string' && item.name.trim() ? item.name.trim() : item.id.trim() };
     if (typeof item.flags === 'string') entry.flags = item.flags;
     const l = normalizeLanguage(item.language);
-    if (item.language !== undefined && !l) warnings.push(`compilers[${i}]: unknown "language" ${JSON.stringify(item.language)}.`);
+    if (item.language !== undefined && !l) warnings.push(`compilers[${i}]: unknown "language" ${JSON.stringify(item.language)} (use ${LANGUAGE_LIST}).`);
     if (l) entry.language = l;
+    const mode = normalizeMode(item.mode, `compilers[${i}].mode`, warnings);
+    if (mode) entry.mode = mode;
     const defs = normalizeDefines(item.defines, `compilers[${i}].defines`, warnings);
     if (defs) entry.defines = defs;
     const extra = normalizeFlags(item.extraFlags, `compilers[${i}].extraFlags`, warnings);
@@ -117,11 +134,8 @@ function normalizeConfig(raw, baseDir) {
   const extraFlags = normalizeFlags(raw.extraFlags, 'extraFlags', warnings);
   if (extraFlags) out.extraFlags = extraFlags;
   if (raw.uploadSystemHeaders !== undefined) out.uploadSystemHeaders = raw.uploadSystemHeaders === true;
-  if (raw.mode !== undefined) {
-    const m = String(raw.mode).toLowerCase();
-    if (m === 'local' || m === 'remote') out.mode = m;
-    else warnings.push(`Unknown "mode": ${JSON.stringify(raw.mode)} (use "local" or "remote").`);
-  }
+  const mode = normalizeMode(raw.mode, '"mode"', warnings);
+  if (mode) out.mode = mode;
   if (typeof raw.compiler === 'string' && raw.compiler.trim()) out.compiler = raw.compiler.trim();
   return out;
 }
@@ -162,4 +176,4 @@ async function readFromDisk(file) {
   try { return await fs.readFile(file, 'utf8'); } catch (_) { return undefined; }
 }
 
-module.exports = { CONFIG_NAMES, TEMPLATE, parseJsonc, normalizeConfig, configBaseDir, loadProjectConfig };
+module.exports = { CONFIG_NAMES, TEMPLATE, LANGUAGE_NAMES, parseJsonc, normalizeConfig, normalizeLanguage, configBaseDir, loadProjectConfig };

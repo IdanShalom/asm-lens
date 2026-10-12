@@ -5,10 +5,23 @@ const crypto = require('crypto');
 const os = require('os');
 const { spawn } = require('child_process');
 const projectConfig = require('./projectConfig');
+const scan = require('./cppScan');
+const languages = require('./languages');
+const {
+  normPath, makeRefResolver, makeLocalRefResolver, localAsmToRows, isMachO, prepareMachO, finishMachO,
+  parseFunctions, buildLineIndex, normalizeName,
+  matchSourceSymbol, findFunctionResult, findAllFunctionResults,
+  ANSI_RE, missingIncludesFrom, preprocessorErrorFilesFrom, errorLocationsFrom, stubFilename,
+  cleanAssemblyRowsForDisplay, cleanAssemblyForDisplay
+} = require('./asm');
+const { maskCode, blankEnclosingDeclaration, keepHeaderFunctions } = scan;
 
-const LANGS = ['c', 'cpp', 'objective-c', 'objective-cpp'];
-const IS_WIN = process.platform === 'win32';
+const LANGS = languages.LANGUAGE_IDS;
 const VIRTUAL_ROOT = 'asm_lens';
+const HEADER_RE = /\.(?:h|hh|hpp|hxx|h\+\+|inl|ipp|tcc|tpp|txx|cuh|ph)$/i;
+// Template instantiations requested per file: { [file key]: [{ kind, expr, keyword }] }.
+const INSTANTIATIONS_KEY = 'asmLens.instantiations';
+const TEMPLATE_ARGS_KEY = 'asmLens.lastTemplateArgs';
 
 // analysis cache, keyed by the URI of the document that was analyzed (the "root").
 let lastAnalysis = new Map();
@@ -27,7 +40,6 @@ let syncTimer;
 
 function config() { return vscode.workspace.getConfiguration('asmLens'); }
 function fileKey(document) { return document.uri.toString(); }
-function normPath(p) { const n = path.resolve(p); return IS_WIN ? n.toLowerCase() : n; }
 function docPathKey(document) { return document.uri.scheme === 'file' ? normPath(document.uri.fsPath) : document.uri.toString(); }
 
 
@@ -94,14 +106,23 @@ async function loadProject(document) {
   return project;
 }
 
+// A relative compiler path in .asm-lens.json ("./tools/gcc") is relative to that file.
+function resolveCompilerPath(command, project) {
+  return command && /^\.\.?[\\/]/.test(command) && project?.file ? path.resolve(path.dirname(project.file), command) : command;
+}
+
 // Everything an analysis needs, for one document.
 async function resolveSettings(document) {
   const s = config();
   const project = await loadProject(document);
   const c = project?.config;
+  const lang = languages.languageOf(document.languageId);
+  if (lang && lang.family !== 'c') return resolveOtherSettings(lang, project, s);
   const docLang = document.languageId === 'c' ? 'c' : 'c++';
-  const all = c?.compilers?.length
-    ? c.compilers
+  // Compilers for other languages (Rust, Python, ...) never apply to C/C++ files.
+  const cFamily = (c?.compilers || []).filter(x => !x.language || x.language === 'c' || x.language === 'c++');
+  const all = cFamily.length
+    ? cFamily
     : [{ id: s.get('compilerId', 'g152'), name: s.get('compilerName', '') || s.get('compilerId', 'g152') }];
   const matching = all.filter(x => !x.language || x.language === docLang);
   const compilers = matching.length ? matching : all;
@@ -124,12 +145,51 @@ async function resolveSettings(document) {
     defines: [...(c?.defines || []), ...(active.defines || [])],
     extraFlags: [c?.extraFlags, active.extraFlags].filter(Boolean).join(' '),
     uploadSystemHeaders: c?.uploadSystemHeaders === true,
-    mode: c?.mode || 'remote',
-    localCompiler: (() => {
-      const c0 = active.compiler || c?.compiler || 'g++';
-      return /^\.\.?[\\/]/.test(c0) && project?.file ? path.resolve(path.dirname(project.file), c0) : c0;
-    })()
+    mode: active.mode || c?.mode || s.get('mode', 'remote'),
+    localCompiler: resolveCompilerPath(active.compiler || c?.compiler || s.get('localCompiler', '') || 'g++', project)
   };
+}
+
+// Settings for Rust, Go, Python, ...: compilers from .asm-lens.json entries with
+// that "language", else the language's Compiler Explorer default. Top-level
+// flags, defines and include paths are C/C++ settings and are not used.
+function resolveOtherSettings(lang, project, s) {
+  const c = project?.config;
+  const compilers = (c?.compilers || []).filter(x => x.language === lang.id);
+  const chosen = extContext?.workspaceState.get(`asmLens.activeCompiler.${lang.id}`);
+  const active = (chosen && (compilers.find(x => x.id === chosen.id) || (chosen.browsed ? { id: chosen.id, name: chosen.name || chosen.id } : undefined)))
+    || compilers[0]
+    || { id: lang.compiler, name: `${lang.label} (Compiler Explorer default)`, isDefault: true };
+  const mode = active.mode || c?.mode || s.get('mode', 'remote');
+  return {
+    lang,
+    configFile: project?.file,
+    configError: project?.error,
+    compilers,
+    active,
+    baseUrl: (c?.baseUrl || s.get('baseUrl', 'https://godbolt.org')).replace(/\/$/, ''),
+    flags: active.flags ?? lang.flags ?? '',
+    extraFlags: active.extraFlags || '',
+    defines: [],
+    includePaths: [],
+    language: lang.id,
+    mode,
+    localCompiler: resolveCompilerPath(active.compiler || lang.local, project)
+  };
+}
+
+// Compiler Explorer's default compiler for a language (cached), or a known one when offline.
+const ceDefaults = new Map();
+async function ceDefaultCompiler(baseUrl, lang) {
+  if (!ceDefaults.has(baseUrl)) {
+    ceDefaults.set(baseUrl, fetch(`${baseUrl}/api/languages?fields=id,defaultCompiler`, { headers: { Accept: 'application/json' } })
+      .then(r => r.ok ? r.json() : [])
+      .then(list => new Map((Array.isArray(list) ? list : []).filter(l => l && l.defaultCompiler).map(l => [l.id, l.defaultCompiler])))
+      .catch(() => new Map()));
+  }
+  const map = await ceDefaults.get(baseUrl);
+  if (!map.size) ceDefaults.delete(baseUrl);
+  return map.get(lang.id) || lang.compiler;
 }
 
 async function refreshStatusBar() {
@@ -138,8 +198,9 @@ async function refreshStatusBar() {
   if (!document || !LANGS.includes(document.languageId)) return statusItem.hide();
   try {
     const r = await resolveSettings(document);
-    statusItem.text = `$(chip) ${r.active.name || r.active.id}`;
-    statusItem.tooltip = `Asm Lens compiler: ${r.active.id}\n${r.configFile ? `Config: ${r.configFile}` : 'No .asm-lens.json (using VS Code settings)'}\nClick to change`;
+    const local = r.mode === 'local';
+    statusItem.text = `$(chip) ${local ? `${path.basename(r.localCompiler || '')} (local)` : r.active.name || r.active.id}`;
+    statusItem.tooltip = `Asm Lens compiler: ${local ? `${r.localCompiler} on this machine` : `${r.active.id} on ${r.baseUrl}`}\n${r.configFile ? `Config: ${r.configFile}` : 'No .asm-lens.json (using VS Code settings)'}\nClick to change`;
     statusItem.show();
   } catch (_) { statusItem.hide(); }
 }
@@ -178,16 +239,18 @@ function activate(context) {
       // while symbols are being collected, so an earlier snapshot can be stale.
       const cached = analysisFor(document);
       const functions = sourceFunctionsOf(document, tree);
+      const templates = templateTargetsOf(document, functions);
+      const extra = templateLenses(document, templates);
       if (!cached) {
-        return functions.map(sym => new vscode.CodeLens(sym.range, {
+        return [...functions.map(sym => new vscode.CodeLens(sym.range, {
           title: '$(play) Analyze with Asm Lens',
           command: 'asmLens.analyzeFile',
           arguments: [document.uri]
-        }));
+        })), ...extra];
       }
       const key = docPathKey(document);
       const viaRoot = cached.rootKey !== fileKey(document) ? ` · via ${path.basename(cached.rootPath)}` : '';
-      return functions.map(sym => {
+      return [...functions.map(sym => {
         const results = findAllFunctionResults(sym, cached.functions, key, cached.rootPathKey);
         const result = results[0];
         const inlined = !result ? inlinedResultFor(sym, cached, key) : undefined;
@@ -200,13 +263,15 @@ function activate(context) {
               ? `$(symbol-numeric) ${inlined.count} inlined instructions · used in ${inlined.users.length} function(s)${viaRoot}`
               : wasSkipped
                 ? `$(warning) Not compiled · this function has compile errors (missing include?) · ${cached.compilerLabel}`
-                : `$(info) No code emitted (not used, or a template never instantiated) · ${cached.compilerLabel}`;
+                : templates.has(sym)
+                  ? `$(info) No code emitted: template not instantiated · ${cached.compilerLabel}${viaRoot}`
+                  : `$(info) No code emitted (not used, or a template never instantiated) · ${cached.compilerLabel}`;
         return new vscode.CodeLens(sym.range, {
           title,
           command: 'asmLens.showAssembly',
           arguments: [document.uri, sym.name, sym.range.start.line]
         });
-      });
+      }), ...extra];
     }
   };
   context.subscriptions.push(vscode.languages.registerCodeLensProvider(selector, provider));
@@ -269,6 +334,10 @@ function activate(context) {
     await analyzeDocument(document);
   }));
 
+  context.subscriptions.push(vscode.commands.registerCommand('asmLens.instantiateTemplate', instantiateTemplate));
+  context.subscriptions.push(vscode.commands.registerCommand('asmLens.manageInstantiations', manageInstantiations));
+  context.subscriptions.push(vscode.commands.registerCommand('asmLens.showOutput', () => outputChannel.show(true)));
+
   statusItem = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Right, 100);
   statusItem.command = 'asmLens.selectCompiler';
   context.subscriptions.push(statusItem);
@@ -318,7 +387,10 @@ function activate(context) {
         chosen = { id: selected.compiler.id, name: selected.compiler.name || selected.compiler.id };
         browsed = true;
       }
-      if (settings?.configFile) {
+      const other = settings?.lang && settings.lang.family !== 'c' ? settings.lang : undefined;
+      if (other) {
+        await extContext.workspaceState.update(`asmLens.activeCompiler.${other.id}`, { id: chosen.id, name: chosen.name, browsed });
+      } else if (settings?.configFile) {
         await extContext.workspaceState.update('asmLens.activeCompiler', { id: chosen.id, name: chosen.name, browsed });
       } else {
         await config().update('compilerId', chosen.id, vscode.ConfigurationTarget.Global);
@@ -416,7 +488,29 @@ function findBodyEndLine(maskedLines, startLine) {
   return startLine;
 }
 
+// Function definitions found in the source text: the C/C++ scanner (one-line
+// bodies, multi-line signatures, in-class methods, templates) plus the line
+// patterns below; for other languages their own finder.
 function guessFunctionSymbols(document) {
+  const text = document.getText();
+  const lines = text.split(/\r?\n/);
+  const toSymbol = g => ({
+    name: g.name, kind: vscode.SymbolKind.Function,
+    range: new vscode.Range(g.startLine, 0, g.endLine, (lines[g.endLine] || '').length),
+    selectionRange: new vscode.Range(g.nameLine, 0, g.nameLine, (lines[g.nameLine] || '').length),
+    children: []
+  });
+  const lang = languages.languageOf(document.languageId);
+  if (lang && lang.family !== 'c') return languages.guessFunctions(lang.key, text).map(toSymbol);
+  const found = scan.guessCFunctions(text).map(toSymbol);
+  for (const g of guessFunctionSymbolsByLine(document)) {
+    const line = g.range.start.line;
+    if (!found.some(s => s.range.start.line <= line && line <= s.selectionRange.start.line)) found.push(g);
+  }
+  return found;
+}
+
+function guessFunctionSymbolsByLine(document) {
   const text = document.getText();
   const lines = text.split(/\r?\n/);
   const maskedLines = maskCode(text).text.split(/\r?\n/);
@@ -483,13 +577,15 @@ function inlinedResultFor(sym, analysis, key) {
   return { name: sym.name, sourceName: `${sym.name} (inlined)`, rows, instructionRows: rows, count: rows.length, users: [...users], fileKeys: new Set([key]) };
 }
 
-// The analysis that covers `document`: its own (if it found code), else the newest one that included it.
+// The analysis that covers `document`: the newest of its own analysis (if it
+// found code) and the analyses of files that include it. A header analyzed on
+// its own and later used by an analyzed .cpp shows the .cpp's results, until
+// it is analyzed (or a template in it instantiated) again.
 function analysisFor(document) {
   const own = lastAnalysis.get(fileKey(document));
-  if (own && own.functions.length) return own;
   if (document.uri.scheme !== 'file') return own;
   const key = docPathKey(document);
-  let best;
+  let best = own && own.functions.length ? own : undefined;
   for (const analysis of lastAnalysis.values()) {
     if (analysis !== own && analysis.deps.has(key) && (!best || analysis.timestamp > best.timestamp)) best = analysis;
   }
@@ -501,8 +597,162 @@ function functionAtSignature(document, position, analysis, key) {
     const hit = analysis.functions.find(f => f.sourceRange && (f.sourceSelection || f.sourceRange).contains(position));
     if (hit) return hit;
   }
-  const guessed = guessFunctionSymbols(document).find(s => s.range.start.line === position.line);
+  const guessed = guessFunctionSymbols(document).find(s => s.range.start.line <= position.line && position.line <= s.selectionRange.start.line);
   return guessed ? findFunctionResult(guessed, analysis.functions, key, analysis.rootPathKey) : undefined;
+}
+
+// ---------------------------------------------------------------------------
+// Template instantiation (C++)
+
+function describeInstantiation(it) {
+  return it.kind === 'class' ? `template ${it.keyword || 'class'} ${it.expr}` : it.expr;
+}
+
+function instantiationsFor(document) {
+  const all = extContext?.workspaceState.get(INSTANTIATIONS_KEY, {}) || {};
+  return Array.isArray(all[docPathKey(document)]) ? all[docPathKey(document)] : [];
+}
+
+async function setInstantiations(document, list) {
+  const all = { ...(extContext.workspaceState.get(INSTANTIATIONS_KEY, {}) || {}) };
+  if (list.length) all[docPathKey(document)] = list; else delete all[docPathKey(document)];
+  await extContext.workspaceState.update(INSTANTIATIONS_KEY, all);
+}
+
+// Source symbol -> template target, for the C++ functions of `document` that are templates.
+const templateCache = new WeakMap();
+function templateTargetsOf(document, functions) {
+  const out = new Map();
+  if (!/cpp/.test(document.languageId)) return out;
+  let cached = templateCache.get(document);
+  if (!cached || cached.version !== document.version) {
+    const text = document.getText();
+    cached = { version: document.version, text, defs: scan.scanDefinitions(text) };
+    templateCache.set(document, cached);
+  }
+  for (const sym of functions) {
+    const line = (sym.selectionRange || sym.range).start.line;
+    const target = scan.templateTargetAt(cached.text, line, cached.defs);
+    if (target && !target.unsupported) out.set(sym, target);
+  }
+  return out;
+}
+
+function templateLenses(document, templates) {
+  const out = [];
+  const lines = new Set();
+  for (const [sym, target] of templates) {
+    if (lines.has(sym.range.start.line)) continue;
+    lines.add(sym.range.start.line);
+    out.push(new vscode.CodeLens(sym.range, {
+      title: '$(symbol-type-parameter) Instantiate…',
+      tooltip: `Choose template arguments for ${target.label} and see the code for them`,
+      command: 'asmLens.instantiateTemplate',
+      arguments: [document.uri, (sym.selectionRange || sym.range).start.line]
+    }));
+  }
+  const list = instantiationsFor(document);
+  if (list.length) {
+    out.push(new vscode.CodeLens(new vscode.Range(0, 0, 0, 0), {
+      title: `$(symbol-type-parameter) Instantiated: ${list.map(describeInstantiation).join(', ')} · edit`,
+      tooltip: 'Template instantiations compiled with this file. Click to remove some.',
+      command: 'asmLens.manageInstantiations',
+      arguments: [document.uri]
+    }));
+  }
+  return out;
+}
+
+function bracketsBalanced(s) {
+  const stack = [];
+  const pairs = { ')': '(', ']': '[', '}': '{', '>': '<' };
+  for (const c of s) {
+    if ('([{<'.includes(c)) stack.push(c);
+    else if (pairs[c]) { if (stack.pop() !== pairs[c]) return false; }
+  }
+  return !stack.length;
+}
+
+// Asks for template arguments for the template at `line` and compiles the file
+// with that instantiation added (after its last line, so line numbers stay).
+async function instantiateTemplate(uri, line) {
+  const editor = vscode.window.activeTextEditor;
+  const document = uri ? await vscode.workspace.openTextDocument(uri) : editor?.document;
+  if (!document) return;
+  if (!/cpp/.test(document.languageId)) return vscode.window.showInformationMessage('Asm Lens: templates can be instantiated in C++ files only.');
+  const at = Number.isInteger(line) ? line : editor?.selection?.active?.line ?? 0;
+  const target = scan.templateTargetAt(document.getText(), at);
+  if (!target) return vscode.window.showInformationMessage('Asm Lens: put the cursor in a template function, or in a member function of a class template, first.');
+  if (target.unsupported) return vscode.window.showWarningMessage(`Asm Lens: ${target.unsupported}`);
+  const remembered = extContext.workspaceState.get(TEMPLATE_ARGS_KEY, {}) || {};
+  const args = [];
+  for (const p of target.prompts) {
+    const value = await vscode.window.showInputBox({
+      title: `Asm Lens: instantiate ${target.label}`,
+      prompt: `Template arguments for ${p.name}<${p.params}>`,
+      value: remembered[p.name] ?? p.suggestion,
+      placeHolder: 'for example: int    or    int, double    or    std::vector<int>',
+      ignoreFocusOut: true,
+      validateInput: v => bracketsBalanced(v) ? undefined : 'The brackets do not match.'
+    });
+    if (value === undefined) return;
+    args.push(value.trim());
+    remembered[p.name] = value.trim();
+  }
+  await extContext.workspaceState.update(TEMPLATE_ARGS_KEY, remembered);
+  const request = target.make(args);
+  const list = instantiationsFor(document);
+  if (!list.some(x => x.kind === request.kind && x.expr === request.expr)) await setInstantiations(document, [...list, request]);
+  outputChannel.appendLine(`Instantiating ${describeInstantiation(request)} in ${document.fileName}`);
+  await analyzeDocument(document);
+}
+
+async function manageInstantiations(uri) {
+  const document = uri ? await vscode.workspace.openTextDocument(uri) : vscode.window.activeTextEditor?.document;
+  if (!document) return;
+  const list = instantiationsFor(document);
+  if (!list.length) return vscode.window.showInformationMessage('Asm Lens: no template instantiations for this file. Click "Instantiate…" above a template to add one.');
+  const picks = await vscode.window.showQuickPick(list.map(it => ({ label: describeInstantiation(it), it })), { canPickMany: true, placeHolder: 'Select the instantiations to remove' });
+  if (!picks || !picks.length) return;
+  await setInstantiations(document, list.filter(it => !picks.some(p => p.it === it)));
+  if (lastAnalysis.has(fileKey(document))) await analyzeDocument(document);
+  else codeLensEmitter?.fire();
+}
+
+// Removes instantiation requests that did not compile and tells the user why.
+async function dropFailedInstantiations(document, failed) {
+  if (!failed.length) return;
+  const list = instantiationsFor(document);
+  const bad = new Set(failed.map(f => f.index));
+  await setInstantiations(document, list.filter((_, i) => !bad.has(i)));
+  for (const f of failed) {
+    const it = list[f.index];
+    if (!it) continue;
+    outputChannel.appendLine(`  instantiation failed and was removed: ${describeInstantiation(it)}: ${f.message || 'compile error'}`);
+    vscode.window.showWarningMessage(`Asm Lens: could not instantiate ${describeInstantiation(it)}${f.message ? `: ${f.message}` : ''}. It was removed; see the Asm Lens output for details.`);
+  }
+}
+
+// Main-file lines (0-based) at or after `firstLine` that an error points at,
+// directly or through its "required from here" / "requested here" notes.
+// Warnings are ignored.
+function instantiationLinesIn(errText, firstLine, isMainFile) {
+  if (firstLine < 0) return [];
+  const lines = new Set();
+  const add = (file, line) => { if (isMainFile(file.trim()) && Number(line) - 1 >= firstLine) lines.add(Number(line) - 1); };
+  for (const m of errText.matchAll(/^(.+?):(\d+)(?::\d+)?:\s*(?:(?:fatal )?error\b|.*\brequired from here\b|note:.*\brequested here\b)/gm)) add(m[1], m[2]);
+  for (const m of errText.matchAll(/^(.+?)\((\d+)(?:,\d+)?\)\s*:\s*(?:(?:fatal )?error\b|note:\s*see reference to)/gm)) add(m[1], m[2]);
+  return [...lines];
+}
+
+function blankLine(text, line) {
+  const lines = text.split('\n');
+  if (line >= 0 && line < lines.length) lines[line] = lines[line].replace(/[^\r]/g, ' ');
+  return lines.join('\n');
+}
+
+function firstErrorMessage(errText) {
+  return errorLocationsFrom(errText)[0]?.message || (errText.split('\n').find(l => /error/i.test(l)) || '').trim().slice(0, 300);
 }
 
 // ---------------------------------------------------------------------------
@@ -512,72 +762,68 @@ async function analyzeDocument(document) {
   const key = fileKey(document);
   if (analysisBusy.has(key)) return;
   if (!LANGS.includes(document.languageId)) {
-    return vscode.window.showWarningMessage('Asm Lens currently supports C and C++ files.');
+    return vscode.window.showWarningMessage(`Asm Lens supports C, C++, Objective-C, Rust, Go, Python, Zig, Swift, D and Fortran files (this file is "${document.languageId}").`);
   }
   analysisBusy.add(key);
   try {
     const settings = config();
     const resolved = await resolveSettings(document);
     if (resolved.configError) vscode.window.showWarningMessage(`Asm Lens: ${resolved.configError} Using VS Code settings instead.`);
+    if (resolved.lang && resolved.lang.family !== 'c') return await analyzeOtherLanguage(document, resolved, settings);
     if (resolved.mode === 'local') return await analyzeLocal(document, resolved, settings);
     const { baseUrl, language } = resolved;
     const flags = [resolved.flags, ...resolved.defines.map(d => `-D${d}`), resolved.extraFlags].filter(Boolean).join(' ');
     const compilerId = resolved.active.id;
     const timeoutMs = settings.get('requestTimeoutMs', 30000);
-    const source = document.getText();
+    // MSVC does not know __attribute__((used)), so headers are compiled as they are.
+    const msvc = /^vcpp|msvc/i.test(`${compilerId} ${resolved.active.name || ''}`);
+    const prepared = prepareCSource(document, { keep: !msvc });
     const includeBundle = await collectLocalIncludes(document, resolved.includePaths, {
       maxFiles: resolved.maxIncludeFiles, buildFolders: resolved.buildFolders,
       excludePaths: resolved.excludePaths, uploadSystemHeaders: resolved.uploadSystemHeaders
     });
     const maxAttempts = Math.max(1, Number(settings.get('maxRecoveryAttempts', 12)));
     const recoverErrors = settings.get('skipFailingFunctions', true);
-    const compiled = await compileWithRecovery({
-      baseUrl, compilerId, language, timeoutMs, source, flags, includeBundle, maxAttempts, recoverErrors, rootFile: document.fileName
-    });
+    const opts = {
+      baseUrl, compilerId, language, timeoutMs, flags, includeBundle, maxAttempts, recoverErrors, rootFile: document.fileName,
+      instFirstLine: prepared.firstLine, original: prepared.plain
+    };
+    let compiled;
+    if (prepared.kept !== undefined) {
+      try { compiled = await compileWithRecovery({ ...opts, source: prepared.kept }); }
+      catch (e) {
+        if (e.name === 'AbortError') throw e;
+        outputChannel.appendLine('  header: retrying without __attribute__((used))');
+      }
+    }
+    if (!compiled) compiled = await compileWithRecovery({ ...opts, source: prepared.plain });
     const { data, effectiveFlags } = compiled;
     const asmRows = Array.isArray(data.asm) ? data.asm : [];
-    const asmText = asmRows.map(x => typeof x === 'string' ? x : x.text || '').join('\n');
     const rootPathKey = docPathKey(document);
-    const resolveRef = makeRefResolver(rootPathKey, includeBundle.pathMap);
-    const functions = parseFunctions(asmRows, resolveRef);
+    const paths = new Map([[rootPathKey, document.uri.fsPath]]);
+    for (const entry of includeBundle.pathMap) paths.set(normPath(entry.real), entry.real);
+    const result = await recordAnalysis(document, {
+      rows: asmRows,
+      resolveRef: makeRefResolver(rootPathKey, includeBundle.pathMap),
+      compilerId,
+      compilerLabel: resolved.active.name || compilerId,
+      flags: effectiveFlags,
+      includeCount: includeBundle.files.length,
+      configFile: resolved.configFile,
+      deps: new Set([rootPathKey, ...includeBundle.pathMap.map(e => normPath(e.real))]),
+      paths,
+      skipped: compiled.skipped.map(k => {
+        const entry = k.key === 'main' ? undefined : includeBundle.pathMap.find(e => e.virtual === k.key);
+        return { ...k, key: k.key === 'main' ? rootPathKey : entry ? normPath(entry.real) : k.key };
+      }),
+      stubbed: compiled.stubbed
+    });
+    const functions = result.functions;
     const totalInstr = functions.reduce((n, f) => n + f.instructionRows.length, 0);
     const mappedInstr = functions.reduce((n, f) => n + f.instructionRows.filter(r => r.ref).length, 0);
     const metaRows = asmRows.filter(r => r && typeof r === 'object' && r.source).length;
     outputChannel.appendLine(`Source mapping: ${mappedInstr}/${totalInstr} instructions mapped to local files (${metaRows} rows carried Compiler Explorer source metadata).`);
     if (totalInstr && !mappedInstr) outputChannel.appendLine('  No instruction could be mapped: hover highlighting needs debug line info from the compiler. Sample rows: ' + JSON.stringify(asmRows.slice(0, 5)));
-    const symbols = await vscode.commands.executeCommand('vscode.executeDocumentSymbolProvider', document.uri) || [];
-    const allSourceFunctions = sourceFunctionsOf(document, symbols);
-    const matched = functions.map(fn => {
-      const symbol = matchSourceSymbol(fn.name, allSourceFunctions, fn, rootPathKey);
-      return { ...fn, sourceName: symbol?.name || fn.name, sourceRange: symbol?.range, sourceSelection: symbol?.selectionRange };
-    });
-    const paths = new Map([[rootPathKey, document.uri.fsPath]]);
-    for (const entry of includeBundle.pathMap) paths.set(normPath(entry.real), entry.real);
-    const result = {
-      functions: matched,
-      lineIndex: buildLineIndex(matched),
-      asmText,
-      asmRows,
-      compilerId,
-      compilerLabel: resolved.active.name || compilerId,
-      flags: effectiveFlags,
-      includeCount: includeBundle.files.length,
-      rootKey: key,
-      configFile: resolved.configFile,
-      rootPath: document.uri.fsPath,
-      rootPathKey,
-      deps: new Set([rootPathKey, ...includeBundle.pathMap.map(e => normPath(e.real))]),
-      paths,
-      timestamp: Date.now(),
-      skipped: compiled.skipped.map(k => {
-        const entry = k.key === 'main' ? undefined : includeBundle.pathMap.find(e => e.virtual === k.key);
-        return { ...k, key: k.key === 'main' ? rootPathKey : entry ? normPath(entry.real) : k.key };
-      }),
-      stubbed: compiled.stubbed,
-      sourceVersion: document.version
-    };
-    lastAnalysis.set(key, result);
-    codeLensEmitter?.fire();
     const notes = [];
     if (includeBundle.unresolved.length) notes.push(`${includeBundle.unresolved.length} quoted include(s) not found`);
     if (compiled.stubbed.length) notes.push(`${compiled.stubbed.length} header(s) replaced by empty files`);
@@ -591,12 +837,91 @@ async function analyzeDocument(document) {
     for (const k of compiled.skipped) outputChannel.appendLine(`  skipped (does not compile): ${k.name || '(declaration)'} at ${path.basename(k.file)}:${k.startLine + 1}-${k.endLine + 1}`);
     for (const u of includeBundle.unresolved) outputChannel.appendLine(`  not found: #include "${u.name}" (from ${u.from})`);
     if (includeBundle.truncated) outputChannel.appendLine('  include discovery stopped at the asmLens.maxIncludeFiles limit.');
+    await dropFailedInstantiations(document, compiled.failedInstantiations);
+    if (!functions.length && prepared.isHeader) return reportHeaderWithoutCode(document);
     vscode.window.showInformationMessage(`Asm Lens: found ${functions.length} emitted function bodies${includeBundle.pathMap.length ? `; uploaded ${includeBundle.pathMap.length} local header(s)` : ''}${notes.length ? ` (${notes.join('; ')}; see the Asm Lens output)` : ''}.`);
   } catch (e) {
     const message = e.name === 'AbortError' ? 'Compiler Explorer request timed out.' : e.message;
     outputChannel.appendLine(`Error: ${message}`);
     vscode.window.showErrorMessage(`Asm Lens: ${message}`);
   } finally { analysisBusy.delete(key); }
+}
+
+function reportHeaderWithoutCode(document) {
+  const templates = /cpp/.test(document.languageId) && scan.scanDefinitions(document.getText()).some(d => d.kind === 'function' && d.templated);
+  vscode.window.showInformationMessage(templates
+    ? 'Asm Lens: this header emitted no code: its functions are templates. Click "Instantiate…" above a template to choose its types, or analyze a .cpp file that uses the header.'
+    : 'Asm Lens: this header emitted no code (it only has declarations). Analyze a .cpp file that uses it, then come back to this file.');
+}
+
+// The text to compile for a C/C++ file. A header compiled on its own gets its
+// functions marked __attribute__((used)) (`kept`, with `plain` as the fallback);
+// requested template instantiations are appended after the last line.
+function prepareCSource(document, { keep = true } = {}) {
+  const original = document.getText();
+  const isHeader = HEADER_RE.test(document.fileName);
+  const insts = /cpp/.test(document.languageId) ? instantiationsFor(document) : [];
+  const withInsts = text => scan.appendInstantiations(text, insts).text;
+  return {
+    isHeader,
+    firstLine: scan.appendInstantiations(original, insts).firstLine,
+    kept: isHeader && keep ? withInsts(keepHeaderFunctions(original)) : undefined,
+    plain: withInsts(original)
+  };
+}
+
+// Undoes __attribute__((used)) on the main-file lines the compiler complains about.
+function revertKeptLines(source, original, lines) {
+  if (!original) return undefined;
+  const a = source.split('\n'), b = original.split('\n');
+  let changed = false;
+  for (const l of lines) {
+    if (a[l] !== undefined && b[l] !== undefined && a[l] !== b[l] && a[l].includes('__attribute__((used))')) { a[l] = b[l]; changed = true; }
+  }
+  return changed ? a.join('\n') : undefined;
+}
+
+let lastStamp = 0;
+
+// Parses rows (Compiler Explorer style), matches functions with the document's
+// symbols, stores the analysis and refreshes CodeLens.
+async function recordAnalysis(document, o) {
+  const rootPathKey = docPathKey(document);
+  const functions = parseFunctions(o.rows, o.resolveRef);
+  const symbols = await vscode.commands.executeCommand('vscode.executeDocumentSymbolProvider', document.uri) || [];
+  const allSourceFunctions = sourceFunctionsOf(document, symbols);
+  const matched = functions.map(fn => {
+    const symbol = matchSourceSymbol(fn.name, allSourceFunctions, fn, rootPathKey, { requireName: o.requireName });
+    return { ...fn, sourceName: symbol?.name || fn.name, sourceRange: symbol?.range, sourceSelection: symbol?.selectionRange };
+  });
+  let deps = o.deps;
+  if (!deps) { deps = new Set([rootPathKey]); for (const f of functions) for (const k of f.fileKeys) deps.add(k); }
+  let paths = o.paths;
+  if (!paths) { paths = new Map([[rootPathKey, document.uri.fsPath]]); for (const k of deps) if (k !== rootPathKey) paths.set(k, k); }
+  lastStamp = Math.max(Date.now(), lastStamp + 1);
+  const result = {
+    functions: matched,
+    lineIndex: buildLineIndex(matched),
+    asmText: o.asmText ?? o.rows.map(r => typeof r === 'string' ? r : r.text || '').join('\n'),
+    asmRows: o.rows,
+    compilerId: o.compilerId,
+    compilerLabel: o.compilerLabel,
+    flags: o.flags,
+    includeCount: o.includeCount || 0,
+    rootKey: fileKey(document),
+    configFile: o.configFile,
+    rootPath: document.uri.fsPath,
+    rootPathKey,
+    deps,
+    paths,
+    timestamp: lastStamp,
+    skipped: o.skipped || [],
+    stubbed: o.stubbed || [],
+    sourceVersion: document.version
+  };
+  lastAnalysis.set(fileKey(document), result);
+  codeLensEmitter?.fire();
+  return result;
 }
 
 // ---------------------------------------------------------------------------
@@ -610,7 +935,7 @@ function splitArgs(s) {
 function runProcess(cmd, args, { cwd, input, timeoutMs }) {
   return new Promise((resolve, reject) => {
     let child;
-    try { child = spawn(cmd, args, { cwd }); } catch (e) { return reject(e); }
+    try { child = spawn(cmd, args, { cwd, windowsHide: true }); } catch (e) { return reject(e); }
     const out = [], err = [];
     let killed = false;
     const timer = setTimeout(() => { killed = true; child.kill('SIGKILL'); }, timeoutMs || 60000);
@@ -618,7 +943,10 @@ function runProcess(cmd, args, { cwd, input, timeoutMs }) {
     child.stderr.on('data', d => err.push(d));
     child.on('error', e => {
       clearTimeout(timer);
-      reject(e.code === 'ENOENT' ? new Error(`"${cmd}" was not found. Install it or set "compiler" in .asm-lens.json.`) : e);
+      if (e.code !== 'ENOENT') return reject(e);
+      const missing = new Error(`"${cmd}" was not found. Install it or set "compiler" in .asm-lens.json.`);
+      missing.code = 'ENOENT';
+      reject(missing);
     });
     child.on('close', code => {
       clearTimeout(timer);
@@ -630,54 +958,29 @@ function runProcess(cmd, args, { cwd, input, timeoutMs }) {
   });
 }
 
-// Maps `.file`/`.loc` paths from local compiler output to local files.
-// "<stdin>" is the analyzed file (it is compiled from the editor buffer).
-function makeLocalRefResolver(mainKey, cwd) {
-  return function resolveRef(row) {
-    const s = row && typeof row === 'object' ? row.source : undefined;
-    if (!s || !Number.isInteger(s.line) || s.line <= 0) return undefined;
-    const line = s.line - 1;
-    const column = Number.isInteger(s.column) && s.column > 0 ? s.column - 1 : undefined;
-    const file = String(s.file || '');
-    if (!file || file === '<stdin>' || file === '-') return { key: mainKey, line, column };
-    const abs = path.isAbsolute(file) ? file : path.resolve(cwd, file);
-    if (/^\/usr\/|\/include\/c\+\+\//.test(abs.replace(/\\/g, '/'))) return undefined; // system headers
-    return { key: normPath(abs), line, column };
-  };
+// [[folder with symlinks resolved, folder as the editor names it], ...]
+function realDirsFor(dirs) {
+  return Promise.all([...new Set(dirs)].map(async d => [await fs.realpath(d).catch(() => d), d]));
 }
 
-// Converts raw `-S -g` output into Compiler Explorer-style rows: { text, source }.
-// Reads .file/.loc for line info and drops assembler directives and comments.
-function localAsmToRows(asm, cwd) {
-  const files = new Map();
-  let cur = null;
-  const rows = [];
-  for (const raw of asm.split(/\r?\n/)) {
-    const line = raw.replace(/\s+$/, '');
-    const t = line.trim();
-    let m;
-    if ((m = t.match(/^\.file\s+(\d+)\s+"([^"]*)"(?:\s+"([^"]*)")?/))) {
-      const name = m[3] !== undefined ? (path.isAbsolute(m[3]) ? m[3] : path.join(m[2] || cwd, m[3])) : m[2];
-      files.set(Number(m[1]), name);
-      continue;
-    }
-    if ((m = t.match(/^\.loc\s+(\d+)\s+(\d+)(?:\s+(\d+))?/))) {
-      const line0 = Number(m[2]);
-      cur = line0 > 0 ? { file: files.get(Number(m[1])) || '<stdin>', line: line0, column: m[3] ? Number(m[3]) : undefined } : null;
-      continue;
-    }
-    if (!t || t.startsWith('#') || t.startsWith('//')) continue;
-    if (/^\.[A-Za-z_]/.test(t) && !/^\.[\w.$]+:/.test(t)) continue;   // directive, not a label
-    if (/^\.L(?:tmp|func_end|fe|ASF|FB|FE|VL|ehtable|Lexception|Ldebug|Linfo|Lsection)/.test(t)) continue; // debug/EH labels
-    const isLabel = /^[^\s].*:\s*(#.*)?$/.test(line);
-    rows.push({ text: line, source: isLabel || !cur ? undefined : { ...cur } });
+// Demangles symbol names with the first demangler that is installed.
+async function demangle(text, demanglers, cwd, timeoutMs) {
+  for (const [cmd, args] of demanglers) {
+    try {
+      const d = await runProcess(cmd, args, { cwd, input: text, timeoutMs });
+      if (d.code === 0 && d.stdout) return d.stdout;
+    } catch (_) { /* not installed: try the next one */ }
   }
-  return rows;
+  return text;
+}
+
+function errorsOnly(err) {
+  const lines = err.split('\n').filter(l => /\berror\b|fatal/i.test(l)).slice(0, 25).join('\n');
+  return (lines || err).slice(0, 1800);
 }
 
 async function analyzeLocal(document, resolved, settings) {
   if (document.uri.scheme !== 'file') throw new Error('Local mode needs a file that is saved on disk.');
-  const key = fileKey(document);
   const rootPathKey = docPathKey(document);
   const cwd = path.dirname(document.uri.fsPath);
   const baseDir = vscode.workspace.getWorkspaceFolder?.(document.uri)?.uri.fsPath || cwd;
@@ -694,10 +997,12 @@ async function analyzeLocal(document, resolved, settings) {
   await fs.rm(stubDir, { recursive: true, force: true });
   const stubbed = [];
   const skipped = [];
-  const isHeader = HEADER_RE.test(document.uri.fsPath);
-  const originalSource = document.getText();
-  let source = isHeader ? keepHeaderFunctions(originalSource) : originalSource;
-  let keptHeader = isHeader;
+  const prepared = prepareCSource(document);
+  let source = prepared.kept ?? prepared.plain;
+  let keptHeader = prepared.kept !== undefined;
+  const failedInstantiations = [];
+  const failedLines = new Set();
+  const isMain = f => /(?:^|[\\/])<stdin>$/.test(f);
   let asm;
   const started = Date.now();
 
@@ -720,9 +1025,24 @@ async function analyzeLocal(document, resolved, settings) {
       stubbed.push(name);
       progressed = true;
     }
+    // A requested template instantiation that does not compile is dropped.
+    if (!progressed) {
+      const message = firstErrorMessage(err);
+      for (const l of instantiationLinesIn(err, prepared.firstLine, isMain)) {
+        if (failedLines.has(l)) continue;
+        failedLines.add(l);
+        source = blankLine(source, l);
+        failedInstantiations.push({ index: l - prepared.firstLine, message });
+        progressed = true;
+      }
+    }
+    if (!progressed && keptHeader) {
+      const reverted = revertKeptLines(source, prepared.plain, errorLocationsFrom(err).filter(loc => isMain(loc.file)).map(loc => loc.line));
+      if (reverted !== undefined) { source = reverted; progressed = true; }
+    }
     if (!progressed && recoverErrors) {
       for (const loc of errorLocationsFrom(err)) {
-        if (loc.file !== '<stdin>') continue;
+        if (!isMain(loc.file)) continue;
         const cut = blankEnclosingDeclaration(source, loc.line);
         if (!cut) continue;
         source = cut.text;
@@ -732,70 +1052,137 @@ async function analyzeLocal(document, resolved, settings) {
     }
     if (!progressed && keptHeader) {
       keptHeader = false;
-      source = originalSource;
+      source = prepared.plain;
+      for (const l of failedLines) source = blankLine(source, l);
+      skipped.length = 0;
       outputChannel.appendLine('  header: retrying without __attribute__((used))');
       continue;
     }
     if (!progressed || attempt === maxAttempts) {
       outputChannel.appendLine(`Local compile command: ${compiler} ${args.join(' ')}  (cwd ${cwd})`);
       outputChannel.appendLine('--- full compiler output ---\n' + err);
-      const errorsOnly = err.split('\n').filter(l => /\berror\b|fatal/i.test(l)).slice(0, 25).join('\n');
-      throw new Error((errorsOnly || err).slice(0, 1800));
+      throw new Error(errorsOnly(err));
     }
   }
 
   // Demangle names (if c++filt exists) so they match source function names.
-  try {
-    const d = await runProcess('c++filt', [], { cwd, input: asm, timeoutMs });
-    if (d.code === 0 && d.stdout) asm = d.stdout;
-  } catch (_) { /* c++filt not installed: keep mangled names */ }
+  const macho = isMachO(asm);
+  if (macho) asm = prepareMachO(asm);
+  asm = await demangle(asm, [['c++filt', []], ['llvm-cxxfilt', []]], cwd, timeoutMs);
+  if (macho) asm = finishMachO(asm);
 
   const rows = localAsmToRows(asm, cwd);
-  asm = rows.map(r => r.text).join('\n');
-  const functions = parseFunctions(rows, makeLocalRefResolver(rootPathKey, cwd));
-  const symbols = await vscode.commands.executeCommand('vscode.executeDocumentSymbolProvider', document.uri) || [];
-  const allSourceFunctions = sourceFunctionsOf(document, symbols);
-  const matched = functions.map(fn => {
-    const symbol = matchSourceSymbol(fn.name, allSourceFunctions, fn, rootPathKey);
-    return { ...fn, sourceName: symbol?.name || fn.name, sourceRange: symbol?.range, sourceSelection: symbol?.selectionRange };
-  });
-  const fileKeys = new Set([rootPathKey]);
-  for (const f of functions) for (const k of f.fileKeys) fileKeys.add(k);
-  const paths = new Map([[rootPathKey, document.uri.fsPath]]);
-  for (const k of fileKeys) if (k !== rootPathKey) paths.set(k, k);
-
-  if (!functions.length && isHeader) {
-    vscode.window.showInformationMessage('Asm Lens: this header emitted no code (only templates or declarations). Analyze a .cpp that uses it, then come back to this file.');
-    return;
-  }
-  
-  lastAnalysis.set(key, {
-    functions: matched,
-    lineIndex: buildLineIndex(matched),
-    asmText: asm,
-    asmRows: rows,
+  const result = await recordAnalysis(document, {
+    rows,
+    resolveRef: makeLocalRefResolver(rootPathKey, cwd, [], await realDirsFor([cwd, baseDir])),
     compilerId: compiler,
     compilerLabel: `${path.basename(compiler)} (local)`,
     flags,
-    includeCount: 0,
-    rootKey: key,
     configFile: resolved.configFile,
-    rootPath: document.uri.fsPath,
-    rootPathKey,
-    deps: fileKeys,
-    paths,
-    timestamp: Date.now(),
-    skipped,
-    stubbed,
-    sourceVersion: document.version
+    skipped: skipped.filter(k => prepared.firstLine < 0 || k.startLine < prepared.firstLine),
+    stubbed
   });
-  codeLensEmitter?.fire();
   const ms = Date.now() - started;
-  outputChannel.appendLine(`Local compile of ${document.fileName} with ${compiler} ${flags} took ${ms} ms; found ${functions.length} emitted function(s).`);
+  outputChannel.appendLine(`Local compile of ${document.fileName} with ${compiler} ${flags} took ${ms} ms; found ${result.functions.length} emitted function(s).`);
   for (const n of stubbed) outputChannel.appendLine(`  missing header treated as empty: ${n}`);
   for (const k of skipped) outputChannel.appendLine(`  skipped (does not compile): ${k.name || '(declaration)'} at line ${k.startLine + 1}-${k.endLine + 1}`);
-  vscode.window.showInformationMessage(`Asm Lens (local): found ${functions.length} emitted function bodies in ${ms} ms${stubbed.length || skipped.length ? ' (see the Asm Lens output)' : ''}.`);
+  await dropFailedInstantiations(document, failedInstantiations);
+  if (!result.functions.length && prepared.isHeader) return reportHeaderWithoutCode(document);
+  vscode.window.showInformationMessage(`Asm Lens (local): found ${result.functions.length} emitted function bodies in ${ms} ms${stubbed.length || skipped.length ? ' (see the Asm Lens output)' : ''}.`);
 }
+
+// ---------------------------------------------------------------------------
+// Rust, Go, Python, Zig, Swift, D, Fortran: one file, compiled as is.
+
+const EMPTY_HINTS = {
+  rust: 'Rust compiles only `pub` functions (and what they use) into a library: make the functions you want to see `pub`, or add `#[no_mangle]`.',
+  zig: 'Zig compiles only exported functions and what they use: mark them `export`.',
+  swift: 'Swift may drop unused private functions: make them `public`.',
+  d: 'Templates are compiled only when used.'
+};
+
+async function analyzeOtherLanguage(document, resolved, settings) {
+  const { lang } = resolved;
+  const timeoutMs = settings.get('requestTimeoutMs', 30000);
+  const rootPathKey = docPathKey(document);
+  const required = lang.requiredFlags && !String(resolved.flags).includes(lang.requiredFlags) ? lang.requiredFlags : '';
+  const flags = [resolved.flags, resolved.extraFlags, required].filter(Boolean).join(' ');
+  const started = Date.now();
+  let rows, resolveRef, compilerId, compilerLabel;
+  if (resolved.mode === 'local') {
+    if (!lang.local) throw new Error(`Local mode is not available for ${lang.label}. Add a ${lang.label} compiler with "mode": "remote" to .asm-lens.json to use Compiler Explorer for it.`);
+    ({ rows, resolveRef } = await compileOtherLocally(document, resolved, splitArgs(flags), timeoutMs));
+    compilerId = resolved.localCompiler;
+    compilerLabel = `${path.basename(compilerId)} (local)`;
+  } else {
+    compilerId = resolved.active.isDefault ? await ceDefaultCompiler(resolved.baseUrl, lang) : resolved.active.id;
+    compilerLabel = resolved.active.isDefault ? `${lang.label} ${compilerId}` : resolved.active.name || compilerId;
+    const data = await postCompile({ baseUrl: resolved.baseUrl, compilerId, language: lang.id, timeoutMs, source: document.getText(), files: [], flags });
+    if (data.code !== undefined && data.code !== 0) {
+      const err = stderrText(data) || `Compiler exited with code ${data.code}`;
+      outputChannel.appendLine(`--- ${compilerId} output ---\n${err}`);
+      throw new Error(err.slice(0, 1800));
+    }
+    rows = languages.remoteRows(lang.key, Array.isArray(data.asm) ? data.asm : []);
+    resolveRef = makeRefResolver(rootPathKey, []);
+  }
+  const result = await recordAnalysis(document, { rows, resolveRef, compilerId, compilerLabel, flags, configFile: resolved.configFile, requireName: lang.requireName });
+  const mine = result.functions.filter(f => f.sourceRange).length;
+  outputChannel.appendLine(`Compiled ${document.fileName} (${lang.label}) with ${compilerId} ${flags} in ${Date.now() - started} ms; found ${result.functions.length} emitted function(s), ${mine} matched to this file.`);
+  const hint = !mine && EMPTY_HINTS[lang.key] ? ` ${EMPTY_HINTS[lang.key]}` : '';
+  vscode.window.showInformationMessage(`Asm Lens: found ${result.functions.length} emitted function bodies (${lang.label}).${hint}`);
+}
+
+// Runs the language's local compiler on the file (or on a temporary copy when the
+// editor has unsaved changes, or the compiler needs one) and returns rows.
+async function compileOtherLocally(document, resolved, flags, timeoutMs) {
+  const { lang } = resolved;
+  const text = document.getText();
+  const real = document.uri.scheme === 'file' ? document.uri.fsPath : undefined;
+  const tmp = await fs.mkdtemp(path.join(os.tmpdir(), 'asm-lens-'));
+  try {
+    const out = path.join(tmp, 'out.s');
+    let file = real || path.join(tmp, `example${path.extname(document.fileName) || ''}`);
+    let spec = languages.localCommand(lang.key, { file, out, flags, text });
+    const copy = spec.copy || !real || (document.isDirty && spec.input === undefined) ? path.join(tmp, path.basename(file)) : undefined;
+    if (copy) {
+      await fs.writeFile(copy, spec.uniqueSuffix ? `${text}\n// asm-lens ${Date.now()}-${crypto.randomBytes(4).toString('hex')}\n` : text);
+      file = copy;
+      spec = languages.localCommand(lang.key, { file, out, flags, text });
+      if (document.isDirty) outputChannel.appendLine(`  compiling a temporary copy with your unsaved changes: ${copy}`);
+    }
+    const cwd = spec.cwdTemp || copy ? tmp : path.dirname(file);
+    const candidates = [resolved.localCompiler];
+    if (lang.key === 'python' && resolved.localCompiler === lang.local) candidates.push('python3', 'python', 'py');
+    let r;
+    for (const cmd of [...new Set(candidates)]) {
+      try { r = await runProcess(cmd, spec.args, { cwd, input: spec.input, timeoutMs }); resolved.localCompiler = cmd; break; }
+      catch (e) { if (e.code !== 'ENOENT' || cmd === candidates[candidates.length - 1]) throw e; }
+    }
+    if (r.code !== 0) {
+      outputChannel.appendLine(`Local compile command: ${resolved.localCompiler} ${spec.args.join(' ')}  (cwd ${cwd})`);
+      outputChannel.appendLine('--- full compiler output ---\n' + (r.stderr || r.stdout));
+      throw new Error(errorsOnly((r.stderr || r.stdout).replace(ANSI_RE, '')));
+    }
+    let output = spec.output === 'file' ? await fs.readFile(out, 'utf8') : spec.output === 'stderr' ? r.stderr : r.stdout;
+    let rows;
+    if (spec.format === 'python') rows = JSON.parse(output);
+    else if (spec.format === 'go') rows = languages.goLocalRows(output, languages.goPackageName(text));
+    else {
+      const macho = isMachO(output);
+      if (macho) output = prepareMachO(output);
+      output = await demangle(output, spec.demanglers || [], cwd, timeoutMs);
+      if (macho) output = finishMachO(output);
+      rows = localAsmToRows(output, cwd);
+    }
+    const aliases = copy ? [copy, await fs.realpath(copy).catch(() => copy)] : [];
+    const dirs = [cwd, real && path.dirname(real), real && vscode.workspace.getWorkspaceFolder?.(document.uri)?.uri.fsPath].filter(Boolean);
+    return { rows, resolveRef: makeLocalRefResolver(docPathKey(document), cwd, aliases, await realDirsFor(dirs)) };
+  } finally {
+    await fs.rm(tmp, { recursive: true, force: true }).catch(() => {});
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Compile with recovery
 //
@@ -806,7 +1193,6 @@ async function analyzeLocal(document, resolved, settings) {
 // remaining errors are inside specific functions, those functions are blanked
 // out -- keeping every line number intact -- and we retry.
 
-const ANSI_RE = /\x1b\[[0-9;]*[A-Za-z]/g;
 const CE_FILTERS = { binary: false, binaryObject: false, commentOnly: false, demangle: true, directives: false, execute: false, intel: true, labels: true, libraryCode: false, trim: false };
 
 async function postCompile({ baseUrl, compilerId, language, timeoutMs, source, files, flags }) {
@@ -829,27 +1215,7 @@ function stderrText(data) {
   return (data.stderr || []).map(x => x.text || '').join('\n').replace(ANSI_RE, '');
 }
 
-// Names of includes the compiler reported as missing.
-function missingIncludesFrom(errText) {
-  const names = new Set();
-  for (const m of errText.matchAll(/fatal error:\s*(.+?):\s*No such file or directory/g)) names.add(m[1].trim());
-  return [...names];
-}
-
-// Files that broke during preprocessing (#error, malformed #if, ...).
-function preprocessorErrorFilesFrom(errText) {
-  const files = new Set();
-  const re = /^(.+?):\d+(?::\d+)?:\s*(?:fatal )?error:\s*(?:#error|#if|#elif|missing binary operator|missing '\)'|invalid preprocessing directive|unterminated|token ".*" is not valid|operator '.*' has no)/gm;
-  for (const m of errText.matchAll(re)) files.add(m[1].trim());
-  return [...files];
-}
-
-// [{ file, line (0-based) }] for every `error:` diagnostic.
-function errorLocationsFrom(errText) {
-  const out = [];
-  for (const m of errText.matchAll(/^(.+?):(\d+)(?::\d+)?:\s*(?:fatal )?error:/gm)) out.push({ file: m[1].trim(), line: Number(m[2]) - 1 });
-  return out;
-}
+const isRemoteMain = f => /^<source>$|^<stdin>$|(^|\/)example\.\w+$/.test(f.replace(/\\/g, '/'));
 
 async function compileWithRecovery(opts) {
   const { includeBundle, maxAttempts, recoverErrors } = opts;
@@ -857,6 +1223,8 @@ async function compileWithRecovery(opts) {
   const stubbed = [];
   const stubNames = new Set();
   const skipped = [];
+  const failedInstantiations = [];
+  const failedLines = new Set();
   let source = opts.source;
   let flags = [opts.flags, ...includeBundle.includeFlags].filter(Boolean).join(' ');
   let lastErr = '';
@@ -864,7 +1232,7 @@ async function compileWithRecovery(opts) {
     const data = await postCompile({ ...opts, source, files, flags });
     if (data.code === undefined || data.code === 0) {
       if (attempt > 1) outputChannel.appendLine(`Compiled after ${attempt - 1} recovery step(s).`);
-      return { data, effectiveFlags: flags, skipped, stubbed };
+      return { data, effectiveFlags: flags, skipped, stubbed, failedInstantiations };
     }
     lastErr = stderrText(data) || `Compiler exited with code ${data.code}`;
 
@@ -893,12 +1261,28 @@ async function compileWithRecovery(opts) {
       if (!/(^|\s)-I\.(\s|$)/.test(flags)) flags += ' -I.';
       continue;
     }
+
+    // 2. A requested template instantiation that does not compile -> drop it.
+    const message = firstErrorMessage(lastErr);
+    for (const l of instantiationLinesIn(lastErr, opts.instFirstLine ?? -1, isRemoteMain)) {
+      if (failedLines.has(l)) continue;
+      failedLines.add(l);
+      source = blankLine(source, l);
+      failedInstantiations.push({ index: l - opts.instFirstLine, message });
+      progressed = true;
+    }
+    if (progressed) continue;
+
+    // 3. __attribute__((used)) added to a header line that the compiler rejects -> remove it there.
+    const reverted = revertKeptLines(source, opts.original, errorLocationsFrom(lastErr).filter(loc => isRemoteMain(loc.file)).map(loc => loc.line));
+    if (reverted !== undefined && reverted !== source) { source = reverted; continue; }
+
     if (!recoverErrors) break;
 
-    // 2. Errors inside functions -> blank those functions out and retry.
+    // 4. Errors inside functions -> blank those functions out and retry.
     for (const loc of errorLocationsFrom(lastErr)) {
       let target;
-      if (/^<source>$|^<stdin>$|(^|\/)example\.\w+$/.test(loc.file.replace(/\\/g, '/'))) target = 'main';
+      if (isRemoteMain(loc.file)) target = 'main';
       else {
         const norm = loc.file.replace(/\\/g, '/');
         const f = files.find(x => !x.filename.endsWith('.asm_lens_keep') && (norm === x.filename || norm.endsWith('/' + x.filename)) && !stubNames.has(x.filename));
@@ -921,324 +1305,7 @@ async function compileWithRecovery(opts) {
   throw new Error(lastErr.slice(0, 1800) + hint);
 }
 
-// Where an empty stand-in for a missing include goes (the remote working
-// directory, which `-I.` adds to the search path). Names that try to leave it are refused.
-function stubFilename(name) {
-  const norm = path.posix.normalize(String(name).replace(/\\/g, '/'));
-  if (!norm || norm.startsWith('../') || norm === '..' || path.posix.isAbsolute(norm)) return undefined;
-  return norm;
-}
 
-const HEADER_RE = /\.(h|hh|hpp|hxx|h\+\+|inl|ipp|tcc|PH|H)$/;
-
-// For analyzing a header on its own: mark its static/inline functions
-// __attribute__((used)) so the compiler emits them even though nothing calls them.
-// Edits are on the same line, so line numbers are unchanged.
-function keepHeaderFunctions(text) {
-  return text.replace(
-    /^([ \t]*)((?:static|inline|__inline__|__inline)(?:[ \t]+(?:static|inline|__inline__|__inline|constexpr))*)(?=[ \t])(?![ \t]+namespace\b)/gm,
-    '$1__attribute__((used)) $2');
-}
-
-// Blank the function (signature and body) or statement that contains `line`,
-// replacing every character but newlines with spaces so line numbers survive.
-// Returns { text, name, startLine, endLine } or undefined if nothing safe to cut.
-function blankEnclosingDeclaration(text, line) {
-  const n = text.length;
-  const masked = maskCode(text);
-  const lineStarts = [0];
-  for (let i = 0; i < n; i++) if (text[i] === '\n') lineStarts.push(i + 1);
-  const lineOf = idx => { let lo = 0, hi = lineStarts.length - 1; while (lo < hi) { const mid = (lo + hi + 1) >> 1; if (lineStarts[mid] <= idx) lo = mid; else hi = mid - 1; } return lo; };
-  const dirEnds = masked.directiveEnds;
-  let dirPtr = 0;
-  const m = masked.text;
-  const stack = []; // { isFunc, declStart }
-  let boundary = 0;
-  let candidate;
-  const inFunc = () => stack.some(s => s.isFunc);
-  const consider = (start, end, name) => {
-    if (candidate) return;
-    // Begin at the first code character, so comments above the declaration stay.
-    const offset = m.slice(start, end).search(/\S/);
-    if (offset < 0) return;
-    const from = start + offset;
-    const first = lineOf(from), last = lineOf(end - 1);
-    if (line >= first && line <= last) candidate = { start: from, end, name, startLine: first, endLine: last };
-  };
-  for (let i = 0; i < n; i++) {
-    while (dirPtr < dirEnds.length && dirEnds[dirPtr] <= i) { if (!inFunc()) boundary = Math.max(boundary, dirEnds[dirPtr]); dirPtr++; }
-    const c = m[i];
-    if (c === '{') {
-      if (inFunc()) { stack.push({ isFunc: false }); continue; }
-      const seg = m.slice(boundary, i).replace(/^\s*(?:public|private|protected)\s*:/, '');
-      const fn = classifyFunctionSegment(seg);
-      stack.push({ isFunc: !!fn, declStart: boundary, name: fn?.name });
-      boundary = i + 1;
-    } else if (c === '}') {
-      const top = stack.pop();
-      if (top && top.isFunc) consider(top.declStart, i + 1, top.name);
-      if (!inFunc()) boundary = i + 1;
-    } else if (c === ';' && !inFunc()) {
-      if (/\S/.test(m.slice(boundary, i))) consider(boundary, i + 1, undefined);
-      boundary = i + 1;
-    }
-  }
-  if (!candidate) return undefined;
-  const out = text.slice(0, candidate.start) + text.slice(candidate.start, candidate.end).replace(/[^\n]/g, ' ') + text.slice(candidate.end);
-  return { text: out, name: candidate.name, startLine: candidate.startLine, endLine: candidate.endLine };
-}
-
-// Looks at the text between the previous boundary and a `{` and decides whether
-// it opens a function body (as opposed to a class, namespace, enum, control block...).
-function classifyFunctionSegment(seg) {
-  const s = seg.replace(/\btemplate\s*<[^;{}]*?>\s*/g, '').trim();
-  if (!s || !s.includes('(')) return undefined;
-  if (/^(?:if|for|while|switch|catch|else|do|try)\b/.test(s)) return undefined;
-  if (/^(?:namespace|class|struct|union|enum|extern)\b/.test(s) && !/\)\s*(?:const|noexcept|override|final|\s)*$/.test(s)) return undefined;
-  if (!/\)\s*(?:(?:const|volatile|noexcept(?:\s*\([^)]*\))?|override|final|&&?|->[^;{}]*|\s)*)$/.test(s) && !/\)\s*:/.test(s) && !/\)\s*\{?$/.test(s)) return undefined;
-  const nm = s.match(/([~A-Za-z_][\w:~]*(?:\s*<[^()]*>)?|operator\s*[^\s(]+)\s*\(/);
-  return { name: nm ? nm[1] : undefined };
-}
-
-// Copy of `text` with comments, string/char literals and preprocessor lines
-// replaced by spaces (newlines kept), plus the offsets where directives end.
-function maskCode(text) {
-  const n = text.length;
-  const out = text.split('');
-  const directiveEnds = [];
-  const blank = (a, b) => { for (let k = a; k < b; k++) if (out[k] !== '\n') out[k] = ' '; };
-  let i = 0, lineStart = true;
-  while (i < n) {
-    const c = text[i];
-    if (c === '\n') { lineStart = true; i++; continue; }
-    if (lineStart && /\s/.test(c)) { i++; continue; }
-    if (lineStart && c === '#') {
-      let j = i;
-      while (j < n && !(text[j] === '\n' && text[j - 1] !== '\\')) j++;
-      // comments inside the directive are blanked along with it
-      blank(i, j); directiveEnds.push(j); i = j; continue;
-    }
-    lineStart = false;
-    if (c === '/' && text[i + 1] === '/') { let j = i; while (j < n && text[j] !== '\n') j++; blank(i, j); i = j; continue; }
-    if (c === '/' && text[i + 1] === '*') { let j = text.indexOf('*/', i + 2); j = j < 0 ? n : j + 2; blank(i, j); i = j; continue; }
-    if (c === '"' || c === "'") {
-      // raw string R"delim( ... )delim"
-      if (c === '"' && text[i - 1] === 'R') {
-        const d = text.slice(i + 1).match(/^([^()\\\s]{0,16})\(/);
-        if (d) { const endTok = ')' + d[1] + '"'; let j = text.indexOf(endTok, i); j = j < 0 ? n : j + endTok.length; blank(i, j); i = j; continue; }
-      }
-      let j = i + 1;
-      while (j < n && text[j] !== c && text[j] !== '\n') { if (text[j] === '\\') j++; j++; }
-      blank(i, Math.min(j + 1, n)); i = j + 1; continue;
-    }
-    i++;
-  }
-  return { text: out.join(''), directiveEnds };
-}
-
-// ---------------------------------------------------------------------------
-// Assembly parsing and source mapping
-
-// Turns Compiler Explorer's per-row `source` metadata into { key, line, column }
-// where `key` identifies a real local file. Rows from files we did not upload
-// (system headers) resolve to undefined instead of being mis-mapped to the
-// analyzed file.
-function makeRefResolver(mainKey, pathMap) {
-  const entries = (pathMap || [])
-    .map(e => ({ virtual: e.virtual, key: normPath(e.real) }))
-    .sort((a, b) => b.virtual.length - a.virtual.length);
-  return function resolveRef(row) {
-    const s = row && typeof row === 'object' ? row.source : undefined;
-    if (s === undefined || s === null) return undefined;
-    if (Number.isInteger(s)) return s > 0 ? { key: mainKey, line: s - 1 } : undefined;
-    if (typeof s !== 'object' || !Number.isInteger(s.line) || s.line <= 0) return undefined;
-    const column = Number.isInteger(s.column) && s.column > 0 ? s.column - 1 : undefined;
-    const line = s.line - 1;
-    const file = s.file;
-    if (file === null || file === undefined || file === 0 || s.mainsource === true) return { key: mainKey, line, column };
-    if (typeof file !== 'string') return undefined;
-    const norm = file.replace(/\\/g, '/');
-    for (const e of entries) {
-      if (norm === e.virtual || norm.endsWith('/' + e.virtual)) return { key: e.key, line, column };
-    }
-    if (/<source>|<stdin>|(^|\/)example\.[^/]+$/.test(norm)) return { key: mainKey, line, column };
-    return undefined;
-  };
-}
-
-// Compilers also state the mapping inside the assembly (`.file N "name"`,
-// `.loc N line col`). Compiler Explorer's per-row `source` metadata is preferred;
-// these directives are the fallback when a row has none.
-const FILE_DIRECTIVE = /^\.file\s+(\d+)\s+"((?:[^"\\]|\\.)*)"(?:\s+"((?:[^"\\]|\\.)*)")?/;
-const LOC_DIRECTIVE = /^\.loc\s+(\d+)\s+(\d+)(?:\s+(\d+))?/;
-
-function parseFunctions(rows, resolveRef) {
-  const functions = [];
-  const fileTable = new Map();
-  for (const row of rows) {
-    const t = (typeof row === 'string' ? row : row.text || '').trim();
-    const m = t.match(FILE_DIRECTIVE);
-    if (m) fileTable.set(Number(m[1]), m[3] !== undefined && !/^[/<]|^[A-Za-z]:[\\/]/.test(m[3]) ? `${m[2]}/${m[3]}` : (m[3] !== undefined ? m[3] : m[2]));
-  }
-  let current = null;
-  let loc;
-  for (const row of rows) {
-    const text = (typeof row === 'string' ? row : row.text || '').replace(/\r/g, '');
-    const trimmed = text.trim();
-    const lm = resolveRef ? trimmed.match(LOC_DIRECTIVE) : null;
-    if (lm) {
-      const name = fileTable.get(Number(lm[1]));
-      loc = name === undefined ? undefined : resolveRef({ source: { file: name, line: Number(lm[2]), column: lm[3] && Number(lm[3]) > 0 ? Number(lm[3]) : undefined } });
-    }
-    const hasMeta = row && typeof row === 'object' && row.source !== undefined && row.source !== null;
-    let ref = resolveRef ? resolveRef(row) : undefined;
-    if (!ref && !hasMeta && loc && isInstructionLine(trimmed)) ref = loc;
-    const labelMatch = trimmed.match(/^([^\s].*):(?:\s*(?:[#;].*)?)?$/);
-    if (labelMatch && !trimmed.startsWith('.L') && !trimmed.startsWith('$')) {
-      const label = labelMatch[1].trim();
-      if (looksLikeFunctionLabel(label)) {
-        if (current) functions.push(finalizeFunction(current));
-        current = { name: label, rows: [{ text, ref: undefined }], lines: [text], count: 0, instructionLines: [], instructionRows: [] };
-        continue;
-      }
-    }
-    if (current) {
-      current.rows.push({ text, ref });
-      current.lines.push(text);
-      if (isInstructionLine(trimmed)) {
-        current.count++;
-        current.instructionLines.push(text);
-        current.instructionRows.push({ text, ref });
-      }
-    }
-  }
-  if (current) functions.push(finalizeFunction(current));
-  return functions;
-}
-function looksLikeFunctionLabel(label) {
-  if (!label || label.startsWith('.') || label.startsWith('$')) return false;
-  if (/^(?:LBB|LBE|Ltmp|LCFI|Lfunc_begin|Lfunc_end|\.L)/.test(label)) return false;
-  return /[A-Za-z_?@]/.test(label) && label.length < 500;
-}
-function isInstructionLine(line) {
-  if (!line || line.startsWith('.') || line.startsWith('#') || line.startsWith(';') || line.endsWith(':')) return false;
-  if (/^(?:[A-Za-z_.$?@][\w.$?@]*):/.test(line)) return false;
-  const token = line.split(/\s+/)[0];
-  if (!token || token.startsWith('.')) return false;
-  if (/^(?:section|global|type|size|align|p2align|file|loc|cfi_\w*|intel_syntax|att_syntax|ident|weak|hidden|globl|end|proc|endp|public|extern|assume|segment|ends|equ|db|dw|dd|dq|dt|org|include|includelib|macro|endm|title|subttl|model|code|data|const|byte|word|dword|qword|zero|string|ascii|asciz|long|quad|short|value|text|bss|comm|lcomm|set|option|ALIGN|PUBLIC|EXTRN)$/i.test(token)) return false;
-  return /^[A-Za-z][A-Za-z0-9_.]*$/.test(token);
-}
-function finalizeFunction(fn) {
-  const fileKeys = new Set();
-  for (const r of fn.instructionRows) if (r.ref) fileKeys.add(r.ref.key);
-  return { ...fn, fileKeys, assembly: fn.lines.join('\n') };
-}
-function cleanInstruction(text) { return text.trim().replace(/\s+#.*$/, '').trim(); }
-
-// key -> line -> [{ fnName, text }]: every emitted instruction by source line.
-function buildLineIndex(functions) {
-  const index = new Map();
-  for (const fn of functions) {
-    for (const r of fn.instructionRows) {
-      if (!r.ref) continue;
-      let lines = index.get(r.ref.key);
-      if (!lines) index.set(r.ref.key, lines = new Map());
-      let list = lines.get(r.ref.line);
-      if (!list) lines.set(r.ref.line, list = []);
-      list.push({ fnName: fn.sourceName || fn.name, text: cleanInstruction(r.text) });
-    }
-  }
-  return index;
-}
-
-// Drops <...> template arguments (nesting-aware).
-function stripTemplateArgs(s) {
-  let out = '', depth = 0;
-  for (const c of s) {
-    if (c === '<') { depth++; continue; }
-    if (c === '>') { if (depth) depth--; continue; }
-    if (!depth) out += c;
-  }
-  return out;
-}
-// "ns::Foo<int>::bar<std::string>(std::vector<int> const&) const" -> "bar"
-function normalizeName(name) {
-  let s = String(name || '').replace(/\s*\[clone.*\]$/, '');
-  if (!/\boperator\b/.test(s)) {
-    let depth = 0, cut = s.length;
-    for (let i = 0; i < s.length; i++) {
-      const c = s[i];
-      if (c === '<') depth++;
-      else if (c === '>' && depth) depth--;
-      else if (c === '(' && !depth) { cut = i; break; }
-    }
-    s = stripTemplateArgs(s.slice(0, cut));
-  } else {
-    s = s.replace(/\(.*$/, '');
-  }
-  return s.replace(/^.*::/, '').replace(/\s+/g, '').replace(/[&*]/g, '');
-}
-
-// Source function for an emitted function: by location first (overloads, template
-// instantiations), then by name.
-function matchSourceSymbol(asmName, symbols, fn, docKey) {
-  if (fn && docKey) {
-    const mapped = fn.instructionRows.filter(r => r.ref);
-    const lines = mapped.filter(r => r.ref.key === docKey).map(r => r.ref.line);
-    if (lines.length) {
-      let best, bestHits = 0;
-      for (const s of symbols) {
-        if (!s.range) continue;
-        const hits = lines.filter(l => l >= s.range.start.line && l <= s.range.end.line).length;
-        if (hits > bestHits || (hits && hits === bestHits && best &&
-            (s.range.end.line - s.range.start.line) < (best.range.end.line - best.range.start.line))) {
-          best = s; bestHits = hits;
-        }
-      }
-      if (best) return best;
-    }
-    // All of its code comes from other files (e.g. a header template): not a function of this file.
-    if (mapped.length && !lines.length) return undefined;
-  }
-  const norm = normalizeName(asmName);
-  return symbols.find(s => normalizeName(s.name) === norm);
-}
-
-// The analyzed function for a source symbol: by position first, then by name.
-function findFunctionResult(symbol, functions, docKey, rootKey) {
-  if (!symbol) return undefined;
-  const usable = f => !docKey || !f.fileKeys || f.fileKeys.size === 0 || f.fileKeys.has(docKey);
-  if (symbol.range && (!rootKey || docKey === rootKey)) {
-    const line = symbol.range.start.line;
-    const byRange = functions.find(f => usable(f) && f.sourceRange && f.sourceRange.start.line === line);
-    if (byRange) return byRange;
-    // Another overload with this name was matched by position: don't reuse its assembly.
-    const norm = normalizeName(symbol.name);
-    if (functions.some(f => f.sourceRange && normalizeName(f.sourceName) === norm)) return undefined;
-  }
-  const exact = functions.find(f => usable(f) && (f.sourceName === symbol.name || f.name === symbol.name));
-  if (exact) return exact;
-  const normalized = normalizeName(symbol.name);
-  return functions.find(f => usable(f) && (normalizeName(f.sourceName) === normalized || normalizeName(f.name) === normalized))
-    || functions.find(f => usable(f) && (normalizeName(f.sourceName).startsWith(normalized) || normalizeName(f.name).startsWith(normalized)));
-}
-
-// Every emitted function for a source symbol (all template instantiations).
-function findAllFunctionResults(symbol, functions, docKey, rootKey) {
-  if (!symbol) return [];
-  const usable = f => !docKey || !f.fileKeys || f.fileKeys.size === 0 || f.fileKeys.has(docKey);
-  if (symbol.range && docKey === rootKey) {
-    const all = functions.filter(f => usable(f) && f.sourceRange && f.sourceRange.start.line === symbol.range.start.line);
-    if (all.length) return all;
-  }
-  if (docKey !== rootKey) {
-    const norm = normalizeName(symbol.name);
-    const all = functions.filter(f => f.fileKeys && f.fileKeys.has(docKey) && !f.sourceRange && normalizeName(f.name) === norm);
-    if (all.length) return all;
-  }
-  const one = findFunctionResult(symbol, functions, docKey, rootKey);
-  return one ? [one] : [];
-}
 
 // ---------------------------------------------------------------------------
 // Assembly panel and highlighting
@@ -1395,33 +1462,6 @@ function syncAsmHighlight(analysis, key, line) {
   outputPanel.webview.postMessage(hasRows ? { type: 'highlightAsm', file, line } : { type: 'clearAsm' });
 }
 
-function cleanAssemblyRowsForDisplay(result) {
-  const rows = result.rows || String(result.assembly || '').split(/\r?\n/).map(text => ({ text }));
-  const referencedLocalLabels = new Set();
-  for (const row of rows) {
-    const text = (typeof row === 'string' ? row : row.text || '').trim();
-    if (!isInstructionLine(text)) continue;
-    const withoutComment = text.replace(/\s+#.*$/, '');
-    const refs = withoutComment.matchAll(/(?:^|[\s,])((?:\.L|\$L)[\w.$]*)\b/g);
-    for (const match of refs) referencedLocalLabels.add(match[1]);
-  }
-  const cleaned = [];
-  for (const row of rows) {
-    const rawText = typeof row === 'string' ? row : row.text || '';
-    const text = rawText.trim();
-    if (!text) continue;
-    if (isInstructionLine(text)) {
-      cleaned.push({ text: cleanInstruction(text), ref: typeof row === 'object' ? row.ref : undefined });
-      continue;
-    }
-    const label = text.match(/^((?:\.L|\$L)[\w.$]*):$/);
-    if (label && referencedLocalLabels.has(label[1])) cleaned.push({ text, ref: undefined });
-  }
-  return cleaned;
-}
-function cleanAssemblyForDisplay(result) {
-  return cleanAssemblyRowsForDisplay(result).map(row => row.text).join('\n');
-}
 function truncateLines(text, max) {
   const lines = text.split('\n');
   return lines.length <= max ? text : lines.slice(0, max).join('\n') + `\n; … ${lines.length - max} more`;
@@ -1648,9 +1688,8 @@ module.exports = {
   activate, deactivate,
   // exported for tests
   _internals: {
-    resolveSettings, showAssembly, handleWebviewMessage, syncAsmHighlight, _state: () => ({ panelState }),
-    blankEnclosingDeclaration, missingIncludesFrom, preprocessorErrorFilesFrom, errorLocationsFrom, compileWithRecovery,
-    collectLocalIncludes, parseFunctions, makeRefResolver, isInstructionLine, cleanAssemblyRowsForDisplay, buildLineIndex,
-    maskCode, classifyFunctionSegment, guessFunctionSymbols, isSystemHeader, globToRegExp
+    resolveSettings, showAssembly, handleWebviewMessage, syncAsmHighlight, _state: () => ({ panelState, lastAnalysis }),
+    compileWithRecovery, collectLocalIncludes, guessFunctionSymbols, sourceFunctionsOf, analysisFor, analyzeDocument,
+    instantiationsFor, prepareCSource, isSystemHeader, globToRegExp, splitArgs
   }
 };

@@ -1,0 +1,4 @@
+# Keep LF everywhere (the recorded Compiler Explorer responses are keyed by exact file contents).
+* text=auto eol=lf
+*.png binary
+*.gz binary

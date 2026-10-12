@@ -1,48 +1,156 @@
 {
   "name": "asm-lens",
   "displayName": "Asm Lens",
-  "description": "Show compiler-generated assembly counts for C/C++ functions, upload local includes recursively, and highlight source and assembly in both directions on hover.",
-  "version": "0.5.0",
+  "description": "See the assembly of every function right in the editor: instruction counts as CodeLens, two-way source/assembly highlighting, headers and templates. Uses Compiler Explorer or your local compiler. C, C++, Rust, Go, Python, Zig, Swift, D and Fortran.",
+  "version": "0.6.0",
   "publisher": "local-dev",
   "license": "MIT",
+  "icon": "images/icon.png",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/IdanShalom/asm-lens.git"
+  },
+  "bugs": {
+    "url": "https://github.com/IdanShalom/asm-lens/issues"
+  },
+  "homepage": "https://github.com/IdanShalom/asm-lens#readme",
+  "keywords": [
+    "assembly",
+    "asm",
+    "disassembly",
+    "compiler explorer",
+    "godbolt",
+    "codelens",
+    "c++",
+    "rust",
+    "performance",
+    "templates"
+  ],
+  "galleryBanner": {
+    "color": "#1e2433",
+    "theme": "dark"
+  },
   "engines": {
     "vscode": "^1.85.0"
   },
   "categories": [
     "Programming Languages",
+    "Visualization",
     "Other"
   ],
   "main": "./src/extension.js",
   "activationEvents": [
     "onLanguage:c",
     "onLanguage:cpp",
-    "onCommand:asmLens.analyzeFile",
-    "onCommand:asmLens.selectCompiler",
-    "onCommand:asmLens.openConfig",
-    "workspaceContains:.asm-lens.json"
+    "onLanguage:objective-c",
+    "onLanguage:objective-cpp",
+    "onLanguage:rust",
+    "onLanguage:go",
+    "onLanguage:python",
+    "onLanguage:zig",
+    "onLanguage:swift",
+    "onLanguage:d",
+    "onLanguage:fortran",
+    "onLanguage:FortranFreeForm",
+    "onLanguage:fortran-modern",
+    "onLanguage:fortran_free-form",
+    "onLanguage:fortran_fixed-form",
+    "onLanguage:fortran90",
+    "workspaceContains:.asm-lens.json",
+    "workspaceContains:.vscode/asm-lens.json"
   ],
   "contributes": {
     "commands": [
       {
         "command": "asmLens.analyzeFile",
-        "title": "Asm Lens: Analyze Current C/C++ File"
+        "title": "Analyze Current File",
+        "category": "Asm Lens",
+        "icon": "$(play)"
       },
       {
         "command": "asmLens.selectCompiler",
-        "title": "Asm Lens: Select Compiler"
+        "title": "Select Compiler",
+        "category": "Asm Lens"
       },
       {
         "command": "asmLens.showAssembly",
-        "title": "Asm Lens: Show Function Assembly"
+        "title": "Show Function Assembly",
+        "category": "Asm Lens"
+      },
+      {
+        "command": "asmLens.instantiateTemplate",
+        "title": "Instantiate Template at Cursor…",
+        "category": "Asm Lens"
+      },
+      {
+        "command": "asmLens.manageInstantiations",
+        "title": "Remove Template Instantiations…",
+        "category": "Asm Lens"
       },
       {
         "command": "asmLens.openConfig",
-        "title": "Asm Lens: Open or Create Project Config (.asm-lens.json)"
+        "title": "Open or Create Project Config (.asm-lens.json)",
+        "category": "Asm Lens"
+      },
+      {
+        "command": "asmLens.showOutput",
+        "title": "Show Output",
+        "category": "Asm Lens"
       }
     ],
+    "menus": {
+      "commandPalette": [
+        {
+          "command": "asmLens.analyzeFile",
+          "when": "editorLangId =~ /^(c|cpp|objective-c|objective-cpp|rust|go|python|zig|swift|d|fortran.*|FortranFreeForm)$/"
+        },
+        {
+          "command": "asmLens.showAssembly",
+          "when": "false"
+        },
+        {
+          "command": "asmLens.instantiateTemplate",
+          "when": "editorLangId == cpp || editorLangId == objective-cpp"
+        },
+        {
+          "command": "asmLens.manageInstantiations",
+          "when": "editorLangId == cpp || editorLangId == objective-cpp"
+        }
+      ],
+      "editor/context": [
+        {
+          "command": "asmLens.analyzeFile",
+          "when": "editorLangId =~ /^(c|cpp|objective-c|objective-cpp|rust|go|python|zig|swift|d|fortran.*|FortranFreeForm)$/",
+          "group": "navigation@90"
+        },
+        {
+          "command": "asmLens.instantiateTemplate",
+          "when": "editorLangId == cpp || editorLangId == objective-cpp",
+          "group": "navigation@91"
+        }
+      ]
+    },
     "configuration": {
       "title": "Asm Lens",
       "properties": {
+        "asmLens.mode": {
+          "type": "string",
+          "enum": [
+            "remote",
+            "local"
+          ],
+          "default": "remote",
+          "enumDescriptions": [
+            "Compile on Compiler Explorer (asmLens.baseUrl). Your file and the local headers it includes are sent there.",
+            "Compile on this machine with your own compiler. Nothing leaves the machine."
+          ],
+          "description": "Where code is compiled. A project's .asm-lens.json \"mode\" overrides this."
+        },
+        "asmLens.localCompiler": {
+          "type": "string",
+          "default": "",
+          "description": "C/C++ compiler for local mode (a GCC- or Clang-compatible command or path, e.g. g++, clang++, /usr/bin/g++-14). Empty means g++. Other languages use their own compiler (rustc, go, python3, swiftc, zig, gfortran)."
+        },
         "asmLens.baseUrl": {
           "type": "string",
           "default": "https://godbolt.org",
@@ -51,7 +159,7 @@
         "asmLens.compilerId": {
           "type": "string",
           "default": "g152",
-          "description": "Compiler Explorer compiler ID, for example g152 or clang."
+          "description": "Compiler Explorer compiler ID for C/C++, for example g152 or clang1910. Use \"Asm Lens: Select Compiler\" to browse."
         },
         "asmLens.compilerName": {
           "type": "string",
@@ -70,7 +178,7 @@
             "c"
           ],
           "default": "c++",
-          "description": "Language passed to Compiler Explorer."
+          "description": "Language sent to Compiler Explorer for C-family files when there is no .asm-lens.json."
         },
         "asmLens.requestTimeoutMs": {
           "type": "number",
@@ -120,6 +228,16 @@
           "minimum": 1,
           "maximum": 30,
           "description": "Maximum number of compile requests per analysis while recovering from missing headers and failing functions."
+        },
+        "asmLens.followCursor": {
+          "type": "boolean",
+          "default": true,
+          "description": "When the assembly view is open, switch it to the function under the cursor."
+        },
+        "asmLens.stubFailingHeaders": {
+          "type": "boolean",
+          "default": false,
+          "description": "Remote mode: replace an uploaded header that fails in the preprocessor (#error, malformed #if) by an empty file and keep going. Off by default because it can hide a missing define."
         }
       }
     },
@@ -132,5 +250,10 @@
         "url": "./schemas/asm-lens.schema.json"
       }
     ]
+  },
+  "scripts": {
+    "test": "node test/run.js",
+    "test:remote": "node test/run.js --remote",
+    "package": "npx --yes @vscode/vsce@3 package"
   }
 }

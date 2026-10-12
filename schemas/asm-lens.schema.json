@@ -1,12 +1,23 @@
 {
   "$schema": "http://json-schema.org/draft-07/schema#",
   "title": "Asm Lens project configuration",
+  "description": "Project settings for the Asm Lens extension. Overrides the asmLens.* VS Code settings for files in this folder and below.",
   "type": "object",
   "additionalProperties": false,
   "properties": {
+    "$schema": { "type": "string" },
+    "mode": {
+      "enum": ["remote", "local"],
+      "default": "remote",
+      "description": "\"remote\": compile on Compiler Explorer (baseUrl); the file and its local headers are uploaded. \"local\": run \"compiler\" on this machine; nothing is uploaded."
+    },
+    "compiler": {
+      "type": "string",
+      "description": "Local mode: the C/C++ compiler command or path (GCC or Clang compatible), for example g++, clang++, C:/msys64/ucrt64/bin/g++.exe or ./tools/gcc/bin/g++ (relative to this file). Default g++."
+    },
     "compilers": {
       "type": "array",
-      "description": "Compilers to use, in order of preference. The first one is the default; the others can be chosen with 'Asm Lens: Select Compiler' or the status bar.",
+      "description": "Compilers in order of preference. The first one for a language is the default; switch with 'Asm Lens: Select Compiler' or the status bar.",
       "items": {
         "oneOf": [
           { "type": "string", "description": "Compiler Explorer compiler id, e.g. g152." },
@@ -15,20 +26,27 @@
             "required": ["id"],
             "additionalProperties": false,
             "properties": {
-              "id": { "type": "string", "description": "Compiler Explorer compiler id, e.g. g152. Use 'Asm Lens: Select Compiler' > Browse to look ids up." },
+              "id": { "type": "string", "description": "Compiler Explorer compiler id, e.g. g152, clang1910, r1990. Use 'Asm Lens: Select Compiler' > Browse to look ids up. In local mode any name works." },
               "name": { "type": "string", "description": "Label shown in the status bar and CodeLens." },
-              "flags": { "type": "string", "description": "Flags for this compiler (overrides the top-level flags)." },
-              "language": { "enum": ["c", "c++"], "description": "Only offer this compiler for C or C++ files. Omit for both." }
+              "flags": { "type": "string", "description": "Flags for this compiler (replaces the top-level flags)." },
+              "language": {
+                "enum": ["c", "c++", "cpp", "rust", "go", "python", "zig", "swift", "d", "fortran"],
+                "description": "Use this compiler only for files of this language. Omit for C and C++. Compilers for other languages must say which one."
+              },
+              "mode": { "enum": ["remote", "local"], "description": "Overrides the top-level mode for this compiler." },
+              "compiler": { "type": "string", "description": "Local mode: command or path of the compiler (e.g. clang++-18, rustc, python3.12)." },
+              "defines": { "type": "array", "items": { "type": "string" }, "description": "Extra -D defines for this compiler (C/C++)." },
+              "extraFlags": { "type": ["string", "array"], "items": { "type": "string" }, "description": "Flags added after the others." }
             }
           }
         ]
       }
     },
-    "flags": { "type": "string", "description": "Default compiler flags, used by compilers without their own flags." },
-    "language": { "enum": ["c", "c++"], "description": "Force the language sent to Compiler Explorer. By default C files use C and everything else C++." },
+    "flags": { "type": "string", "description": "Default C/C++ compiler flags, used by compilers without their own flags. Default -O2 -masm=intel." },
+    "language": { "enum": ["c", "c++"], "description": "Force the language of C-family files. By default .c files are C and everything else C++." },
     "includePaths": {
       "type": "array",
-      "description": "Folders searched for #include files, in order of priority: the first entry is searched first, then the second, and so on. Relative paths are relative to the folder holding this file.",
+      "description": "Folders searched for #include files, in order of priority. Relative paths are relative to the folder holding this file.",
       "items": {
         "oneOf": [
           { "type": "string" },
@@ -47,9 +65,17 @@
     "buildFolders": {
       "type": "array",
       "items": { "type": "string" },
-      "description": "Folder names searched last for headers that are found nowhere else (for generated headers). Wildcards such as cmake-build-* work."
+      "description": "Folder names searched last for headers found nowhere else (generated headers). Wildcards such as cmake-build-* work. Default: build, out, bin, cmake-build-*, generated, ..."
     },
-    "baseUrl": { "type": "string", "description": "Compiler Explorer instance URL (default https://godbolt.org)." },
-    "maxIncludeFiles": { "type": "number", "minimum": 1, "description": "Maximum number of header files uploaded per analysis." }
+    "excludePaths": {
+      "type": "array",
+      "items": { "type": "string" },
+      "description": "Glob patterns of folders whose headers are never uploaded (added to the built-in list: libcxx, llvm-project, sysroot, node_modules, ...). A bare name like \"vendor\" means any folder with that name."
+    },
+    "defines": { "type": "array", "items": { "type": "string" }, "description": "Preprocessor defines passed as -D<name> (C/C++)." },
+    "extraFlags": { "type": ["string", "array"], "items": { "type": "string" }, "description": "C/C++ flags added after the others." },
+    "uploadSystemHeaders": { "type": "boolean", "default": false, "description": "Remote mode: also upload workspace copies of standard headers (string, vector, stdio.h, ...). Off by default: the compiler's own headers are used." },
+    "baseUrl": { "type": "string", "description": "Compiler Explorer instance URL (default https://godbolt.org). Point it at a self-hosted instance to keep code in-house." },
+    "maxIncludeFiles": { "type": "number", "minimum": 1, "description": "Maximum number of header files uploaded per analysis (default 80)." }
   }
 }

@@ -1,18 +1,20 @@
 name: Build VSIX
 
 on:
-  workflow_dispatch:
   push:
-    paths:
-      - 'asm-lens-0.4.0 - Copy/extension/**'
-      - '.github/workflows/build-vsix.yml'
+    branches: ['**']
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
 
 jobs:
-  build:
-    runs-on: ubuntu-latest
-    defaults:
-      run:
-        working-directory: 'asm-lens-0.4.0 - Copy/extension'
+  test:
+    name: Test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
     steps:
       - uses: actions/checkout@v4
 
@@ -20,16 +22,46 @@ jobs:
         with:
           node-version: '20'
 
-      - name: Check JavaScript syntax
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+          cache: false
+
+      - name: Compilers on this runner (tests skip the missing ones)
+        shell: bash
         run: |
-          node --check extension.js
-          node --check projectConfig.js
-          node -e "JSON.parse(require('fs').readFileSync('package.json','utf8'))"
+          for c in g++ clang++ gcc clang c++filt python3 python rustc go swiftc zig gfortran; do
+            printf '%-9s ' "$c"; { $c --version 2>/dev/null || $c version 2>/dev/null || echo '-'; } | head -1
+          done
+
+      - name: Test
+        run: npm test
+
+  package:
+    needs: test
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
 
       - name: Package VSIX
-        run: npx --yes @vscode/vsce package --allow-missing-repository --out asm-lens.vsix
+        run: |
+          VERSION=$(node -p "require('./package.json').version")
+          npx --yes @vscode/vsce@3 package --out "asm-lens-$VERSION.vsix"
+          npx --yes @vscode/vsce@3 ls
 
       - uses: actions/upload-artifact@v4
         with:
           name: asm-lens-vsix
-          path: 'asm-lens-0.4.0 - Copy/extension/asm-lens.vsix'
+          path: asm-lens-*.vsix
+
+      - name: Release (tags v*)
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$GITHUB_REF_NAME" asm-lens-*.vsix --title "Asm Lens $GITHUB_REF_NAME" --notes "See CHANGELOG.md."
