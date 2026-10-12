@@ -59,7 +59,7 @@ async function headerScenario(t, config) {
 
   // 4. Back in the header: it shows what user.cpp used (inlined at -O2).
   for (const line of [L.square, L.clamp, L.cube, L.twice]) {
-    assert.match(await x.lensAt('mathx.hxx', line), /^\$\(symbol-numeric\) \d+ (inlined )?instructions.* · via user\.cpp$/, `line ${line}`);
+    assert.match(await x.lensAt('mathx.hxx', line), /^\$\(symbol-numeric\) \d+ (inlined )?instructions.* · via user\.cpp$/, `line ${line}\n${x.describe('mathx.hxx')}`);
   }
   for (const line of [L.addInts, L.mulInts, L.push, L.get]) assert.match(await x.lensAt('mathx.hxx', line), /No code emitted/, `line ${line}`);
   // The panel opens on a header template's code.

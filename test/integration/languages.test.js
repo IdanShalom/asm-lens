@@ -24,7 +24,7 @@ async function analyzeFixture(file, config) {
   const x = start(dir);
   const msg = await x.analyze(file);
   assert.deepEqual(msg.error, [], `${file}: ${msg.error[0]}`);
-  for (const line of CASES[file].lines) assert.match(await x.lensAt(file, line) || '(no lens)', COUNT, `${file} line ${line}`);
+  for (const line of CASES[file].lines) assert.match(await x.lensAt(file, line) || '(no lens)', COUNT, `${file} line ${line}\n${x.describe(file)}`);
   return x;
 }
 
@@ -34,10 +34,12 @@ for (const [file, c] of Object.entries(CASES)) {
     const lang = file.split('.').pop();
     const language = { py: 'python', go: 'go', rs: 'rust', zig: 'zig', swift: 'swift', f90: 'fortran' }[lang];
     const x = await analyzeFixture(file, { mode: 'local', compilers: [{ id: `local-${language}`, language, compiler: cmd }] });
-    // Hover shows the instructions of a body line.
-    const first = CASES[file].lines[0];
-    const hover = x.state.hoverProviders[0].provider.provideHover(x.open(file), new x.vscode.Position(first, 6));
-    assert.ok(hover, `${file}: hover on line ${first + 1}`);
+    // Hovering a line that produced instructions shows them.
+    const lines = x.analysis(file).lineIndex.get(x.analysis(file).rootPathKey);
+    const line = [...lines.keys()][0];
+    const hover = x.state.hoverProviders[0].provider.provideHover(x.open(file), new x.vscode.Position(line, 0));
+    assert.ok(hover, `${file}: hover on line ${line + 1}`);
+    assert.match(hover.contents.value, /instruction/);
   });
   test(`remote ${file} (Compiler Explorer)`, async () => {
     const ce = installFetch();

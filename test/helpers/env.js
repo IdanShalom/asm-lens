@@ -74,7 +74,19 @@ function start(dir, options = {}) {
       const all = await this.lenses(rel);
       return all.find(l => l.line === line && l.command !== 'asmLens.instantiateTemplate')?.title;
     },
-    analysis(rel) { return ctx.ext._internals.analysisFor(ctx.vscode._openDocument(at(rel))); }
+    analysis(rel) { return ctx.ext._internals.analysisFor(ctx.vscode._openDocument(at(rel))); },
+    // A readable dump of the analysis covering `rel`, for assertion messages.
+    describe(rel) {
+      const a = this.analysis(rel);
+      if (!a) return `no analysis covers ${rel}`;
+      const short = k => path.basename(String(k));
+      const fns = a.functions.map(f => {
+        const refs = [...new Set(f.instructionRows.map(r => r.ref ? `${short(r.ref.key)}:${r.ref.line + 1}` : '-'))].join(' ');
+        return `  ${f.name} [${f.count}] source=${f.sourceRange ? f.sourceRange.start.line + 1 : '-'} rows=${refs}`;
+      });
+      const raw = (a.asmRows || []).slice(0, 80).map(r => `    ${r.text}${r.source ? `   @${short(r.source.file || '')}:${r.source.line}` : ''}`);
+      return [`analysis of ${short(a.rootPath)} (${a.compilerLabel} ${a.flags}); deps: ${[...a.deps].map(short).join(', ')}`, ...fns, '  rows:', ...raw].join('\n');
+    }
   };
 }
 

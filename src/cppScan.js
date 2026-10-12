@@ -375,8 +375,11 @@ function keepHeaderFunctions(text) {
     at.add(pos);
   }
   const touched = new Set([...at].map(lineOf));
-  let out = text;
-  for (const pos of [...at].sort((a, b) => b - a)) out = out.slice(0, pos) + KEEP + out.slice(pos);
+  const parts = [];
+  let prev = 0;
+  for (const pos of [...at].sort((a, b) => a - b)) { parts.push(text.slice(prev, pos), KEEP); prev = pos; }
+  parts.push(text.slice(prev));
+  const out = parts.join('');
   // Lines the scanner did not handle keep the earlier line-start rule.
   const outLineOf = lineLocator(out);
   return out.replace(LEGACY_KEEP_RE, (all, indent, words, offset) => touched.has(outLineOf(offset)) ? all : `${indent}${KEEP}${words}`);

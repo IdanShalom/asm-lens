@@ -490,8 +490,18 @@ function findBodyEndLine(maskedLines, startLine) {
 
 // Function definitions found in the source text: the C/C++ scanner (one-line
 // bodies, multi-line signatures, in-class methods, templates) plus the line
-// patterns below; for other languages their own finder.
+// patterns below; for other languages their own finder. Cached per version,
+// since hover and CodeLens ask often.
+const guessCache = new WeakMap();
 function guessFunctionSymbols(document) {
+  const hit = guessCache.get(document);
+  if (hit && hit.version === document.version && hit.text === document.getText()) return hit.symbols;
+  const symbols = scanFunctionSymbols(document);
+  guessCache.set(document, { version: document.version, text: document.getText(), symbols });
+  return symbols;
+}
+
+function scanFunctionSymbols(document) {
   const text = document.getText();
   const lines = text.split(/\r?\n/);
   const toSymbol = g => ({
@@ -627,11 +637,14 @@ function templateTargetsOf(document, functions) {
   let cached = templateCache.get(document);
   if (!cached || cached.version !== document.version) {
     const text = document.getText();
-    cached = { version: document.version, text, defs: scan.scanDefinitions(text) };
+    const defs = scan.scanDefinitions(text);
+    cached = { version: document.version, text, defs, templated: defs.filter(d => d.kind === 'function' && d.templated) };
     templateCache.set(document, cached);
   }
+  if (!cached.templated.length) return out;
   for (const sym of functions) {
     const line = (sym.selectionRange || sym.range).start.line;
+    if (!cached.templated.some(d => d.startLine <= line && line <= d.endLine)) continue;
     const target = scan.templateTargetAt(cached.text, line, cached.defs);
     if (target && !target.unsupported) out.set(sym, target);
   }
