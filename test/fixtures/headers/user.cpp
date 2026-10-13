@@ -1,6 +1,6 @@
 #include "mathx.hxx"
 
-__attribute__((noinline)) int sq_int(int x) { return square(x); }
+int sq_int(int x) { return square(x); }
 
 double sq_double(double x) { return square(x); }
 

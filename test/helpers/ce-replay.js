@@ -25,7 +25,10 @@ function installFetch() {
     const file = path.join(DIR, `${key}.json.gz`);
     if (LIVE && !RECORD) return realFetch(url, init);
     if (RECORD) {
+      // Spaced out, to stay within Compiler Explorer's rate limit.
+      await new Promise(r => setTimeout(r, 1500));
       const res = await realFetch(url, init);
+      if (res.status === 429) throw new Error('Compiler Explorer rate limit (HTTP 429) while recording; wait a few minutes and record again.');
       const text = await res.text();
       fs.mkdirSync(DIR, { recursive: true });
       fs.writeFileSync(file, zlib.gzipSync(JSON.stringify({ url: String(url).replace(/^https?:\/\/[^/]+/, ''), status: res.status, body: text })));

@@ -25,6 +25,8 @@ const TEMPLATE = `{
   // Passed as -D<name>.
   "defines": [],
   "extraFlags": ""
+  // Local mode: take each file's compiler and flags from your build, e.g.
+  // "compileCommands": "build/compile_commands.json"
 }
 `;
 
@@ -137,6 +139,11 @@ function normalizeConfig(raw, baseDir) {
   const mode = normalizeMode(raw.mode, '"mode"', warnings);
   if (mode) out.mode = mode;
   if (typeof raw.compiler === 'string' && raw.compiler.trim()) out.compiler = raw.compiler.trim();
+  if (raw.compileCommands !== undefined) {
+    const list = typeof raw.compileCommands === 'string' ? [raw.compileCommands] : raw.compileCommands;
+    if (!Array.isArray(list) || list.some(x => typeof x !== 'string' || !x.trim())) warnings.push('"compileCommands" must be a path or an array of paths to compile_commands.json files.');
+    else out.compileCommands = list.map(x => x.trim()).map(x => path.isAbsolute(x) ? path.resolve(x) : path.resolve(baseDir, x));
+  }
   return out;
 }
 

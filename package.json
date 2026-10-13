@@ -2,7 +2,7 @@
   "name": "asm-lens",
   "displayName": "Asm Lens",
   "description": "See the assembly of every function right in the editor: instruction counts as CodeLens, two-way source/assembly highlighting, headers and templates. Uses Compiler Explorer or your local compiler. C, C++, Rust, Go, Python, Zig, Swift, D and Fortran.",
-  "version": "0.6.0",
+  "version": "0.7.0",
   "publisher": "local-dev",
   "license": "MIT",
   "icon": "images/icon.png",
@@ -93,6 +93,11 @@
         "category": "Asm Lens"
       },
       {
+        "command": "asmLens.reloadCompileCommands",
+        "title": "Reload Compile Commands",
+        "category": "Asm Lens"
+      },
+      {
         "command": "asmLens.showOutput",
         "title": "Show Output",
         "category": "Asm Lens"
@@ -150,6 +155,17 @@
           "type": "string",
           "default": "",
           "description": "C/C++ compiler for local mode (a GCC- or Clang-compatible command or path, e.g. g++, clang++, /usr/bin/g++-14). Empty means g++. Other languages use their own compiler (rustc, go, python3, swiftc, zig, gfortran)."
+        },
+        "asmLens.compileCommands": {
+          "type": [
+            "string",
+            "array"
+          ],
+          "items": {
+            "type": "string"
+          },
+          "default": "",
+          "description": "Local mode: compile_commands.json database(s) of your build, relative to the workspace folder (e.g. build/compile_commands.json). Used when .asm-lens.json has no \"compileCommands\"."
         },
         "asmLens.reanalyzeOn": {
           "type": "string",
@@ -231,6 +247,11 @@
           "type": "boolean",
           "default": true,
           "description": "Color each source line and its assembly instructions with the same color, like Compiler Explorer."
+        },
+        "asmLens.dimOtherLines": {
+          "type": "boolean",
+          "default": true,
+          "description": "While an instruction is hovered, dim the other lines of its function in the editor, and the other instructions in the assembly view, so the matching part stands out."
         },
         "asmLens.maxIncludeFiles": {
           "type": "number",

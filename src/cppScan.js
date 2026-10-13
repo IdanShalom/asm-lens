@@ -385,6 +385,28 @@ function keepHeaderFunctions(text) {
   return out.replace(LEGACY_KEEP_RE, (all, indent, words, offset) => touched.has(outLineOf(offset)) ? all : `${indent}${KEEP}${words}`);
 }
 
+// For compilers without __attribute__((used)) (MSVC): one line per non-template
+// function that takes its address, which makes the compiler emit it. Appended
+// after the file's last line like instantiation requests; a line that does not
+// compile (an overloaded name, ...) is dropped by the caller. `c` selects C syntax.
+function keepByAddress(text, { c = false, defs = scanDefinitions(text) } = {}) {
+  const lines = [];
+  for (const d of defs) {
+    if (d.kind !== 'function' || d.templated || d.macroLike || d.consteval) continue;
+    const comps = splitQualified(d.name);
+    const last = comps[comps.length - 1] || '';
+    const owner = [...d.scopes].reverse().find(s => s.kind === 'class');
+    const ownerName = comps.length > 1 ? comps[comps.length - 2].replace(/<[\s\S]*$/, '') : owner && owner.name;
+    if (last.startsWith('~') || last === ownerName) continue;                       // constructors and destructors
+    const scope = d.scopes.filter(s => s.kind === 'namespace' || s.kind === 'class').flatMap(s => s.name.split('::')).filter(Boolean);
+    const qualified = [...scope, ...comps].join('::');
+    lines.push(c
+      ? `void (*__asm_lens_keep_${lines.length})(void) = (void (*)(void))&${qualified};`
+      : `auto __asm_lens_keep_${lines.length} = &${qualified};`);
+  }
+  return lines;
+}
+
 // ---------------------------------------------------------------------------
 // Template instantiation requests
 
@@ -486,6 +508,6 @@ function appendInstantiations(text, list) {
 
 module.exports = {
   maskCode, classifyFunctionSegment, blankEnclosingDeclaration,
-  scanDefinitions, guessCFunctions, keepHeaderFunctions, templateTargetAt, appendInstantiations,
+  scanDefinitions, guessCFunctions, keepHeaderFunctions, keepByAddress, templateTargetAt, appendInstantiations,
   defaultTemplateArgs, splitQualified, splitTemplatePrefixes, lineLocator
 };

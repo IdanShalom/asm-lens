@@ -71,14 +71,15 @@ async function headerScenario(t, config) {
     const mapped = analysis.functions.some(f => f.instructionRows.some(r => r.ref && r.ref.key === headerKey && r.ref.line >= line - 1 && r.ref.line <= last - 1));
     const lens = await x.lensAt('mathx.hxx', line);
     if (mapped) withCode++;
-    assert.match(lens, mapped ? /^\$\(symbol-numeric\) \d+ (inlined )?instructions.* · via user\.cpp$/ : /No code emitted.* · via user\.cpp$/, `line ${line}\n${x.describe('mathx.hxx')}`);
+    // Inlined into the .cpp's functions (GCC, Clang), or kept as functions of their own too (MSVC: "2 instantiations").
+    assert.match(lens, mapped ? /^\$\(symbol-numeric\) (?:\d+ instantiations · [\d /]+ |\d+ (?:inlined )?)instructions.* · via user\.cpp$/ : /No code emitted.* · via user\.cpp$/, `line ${line}\n${x.describe('mathx.hxx')}`);
   }
   assert.ok(withCode >= 2, `inlined template code should show in the header\n${x.describe('mathx.hxx')}`);
   for (const line of [L.addInts, L.mulInts, L.push, L.get]) assert.match(await x.lensAt('mathx.hxx', line), /No code emitted/, `line ${line}`);
   // The panel opens on a header template's code.
   const lens = (await x.lenses('mathx.hxx')).find(l => l.line === L.clamp && l.command === 'asmLens.showAssembly');
   await x.state.commands.get('asmLens.showAssembly')(...lens.args);
-  assert.match(x.state.webviewHtml, /clamp_to/);
+  assert.match(x.state.lastRender().title, /clamp_to/);
   return x;
 }
 
@@ -130,13 +131,15 @@ for (const cc of localCompilers()) {
   });
 }
 
-for (const id of ['g152', 'clang1910']) {
+// GCC, Clang and MSVC (the default flags include -masm=intel, which MSVC does not know).
+for (const id of ['g152', 'clang1910', 'vcpp_v19_latest_x64']) {
+  const msvc = /^vcpp/.test(id);
   test(`remote ${id} (Compiler Explorer): header alone, live instantiation, then the .cpp that uses it`, async t => {
     const ce = installFetch();
     try { await headerScenario(t, { compilers: [{ id, flags: '-O2 -masm=intel' }] }); } finally { ce.restore(); }
   });
-  test(`remote ${id} (Compiler Explorer): at -O0 template instantiations in the header are matched`, async t => {
+  test(`remote ${id} (Compiler Explorer): unoptimized, template instantiations in the header are matched`, async t => {
     const ce = installFetch();
-    try { await unoptimizedScenario(t, { compilers: [{ id, flags: '-O0' }] }); } finally { ce.restore(); }
+    try { await unoptimizedScenario(t, { compilers: [{ id, flags: msvc ? '-Od' : '-O0' }] }); } finally { ce.restore(); }
   });
 }

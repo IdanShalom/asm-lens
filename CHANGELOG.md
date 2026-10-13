@@ -1,5 +1,43 @@
 # Changelog
 
+## 0.7.0
+
+### New
+- **compile_commands.json in local mode** (`"compileCommands"` in `.asm-lens.json`, or the
+  `asmLens.compileCommands` setting): each file is compiled with its entry's compiler and flags, in the
+  entry's directory, without `-c`, `-o`, `-M*`, `-Werror*` and the source path; headers use the entry of a
+  file that includes them, else the nearest one. Reloaded when the database changes; **Reload Compile
+  Commands** command. The output shows the final command and the entry used.
+- The highlighted line and instructions stand out: the rest of the function fades (`asmLens.dimOtherLines`).
+
+### Fixes
+- **MSVC** on Compiler Explorer (x64, x86, ARM64, ARM32): its functions (`PROC`/`ENDP`) were not found, so
+  nothing was shown; its error messages (written to stdout) were not read, so recovery from missing headers
+  and failing functions did not work; headers analyzed on their own now emit their functions too.
+- **`-masm=intel`** ("ignoring unknown option", or a failing compile on ARM and other targets): Asm Lens now
+  chooses the syntax flag itself, per compiler and target; `-masm=att` still selects AT&T syntax.
+- A flag a compiler rejects (`-O2` for cc65, Norcroft, ORCA/C, ...) is left out and the file compiled again.
+- **Selecting a compiler** from Compiler Explorer now always takes effect: it was ignored when the project file
+  said `"mode": "local"`, when the assembly view had the focus, and when a workspace setting overrode the
+  user setting it was written to. A compiler picked for C++ is no longer used for C files.
+- A function that inlines another function of the same file is no longer counted as that function's
+  "instantiation" (`square` showed "2 instantiations").
+- Compilers that prefix C names with `_` (SDCC, SH, Z80, 32-bit Windows), label comments with `@` (TI Arm
+  Clang), write labels without a colon (Norcroft) or functions as blocks (cc65 `.proc`, ORCA/C `start`) are
+  understood. One compiler of every compiler family on Compiler Explorer was checked (`test/tools/survey-ce.js`):
+  47 of 49 C++ families and 51 of 56 C families work. The others cannot: EDG and c2rust produce no assembly,
+  GCC for 6502 and z88dk need target flags, ORCA/C has no include paths, and TinyCC and cproc fail on the
+  server itself.
+- **Highlighting is faster**: the assembly view is built once and switching functions only sends the rows
+  (no page reload, no fixed delays); the line lookups are indexed.
+- The assembly view stays in the column you put it in; clicking an instruction opens the source in the column
+  it is shown in, with the exact path casing (Windows).
+- Compiler Explorer rate limits (HTTP 429) and replies that are not JSON get clear messages, and automatic
+  re-analysis pauses for 30 seconds after a 429.
+- A language server that lists only a function's declaration no longer hides its definition's CodeLens.
+- Changing a display setting (highlighting, colors) no longer discards the results.
+- Problems in `.asm-lens.json` are logged once instead of on every editor switch.
+
 ## 0.6.0
 
 ### Headers and templates

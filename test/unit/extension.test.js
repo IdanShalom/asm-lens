@@ -100,17 +100,17 @@ test('remote: analysis stores functions matched to source; CodeLens titles; pane
     assert.deepEqual(msg.info, ['Asm Lens: found 2 emitted function bodies.']);
     const lenses = await x.lenses('a.cpp');
     assert.deepEqual(lenses.map(l => [l.line, l.title]), [
-      [1, '$(symbol-numeric) 2 instructions · GCC (selected ID) · -O2 -masm=intel'],
-      [2, '$(symbol-numeric) 2 instructions · GCC (selected ID) · -O2 -masm=intel']
+      [1, '$(symbol-numeric) 2 instructions · GCC (selected ID) · -O2'],
+      [2, '$(symbol-numeric) 2 instructions · GCC (selected ID) · -O2']
     ]);
     await x.state.commands.get('asmLens.showAssembly')(x.vscode.Uri.file(x.at('a.cpp')), 'two', 1);
-    assert.match(x.state.webviewHtml, /two — 2 instructions/);
-    assert.match(x.state.webviewHtml, /mov eax, 1/);
+    assert.equal(x.state.lastRender().title, 'two — 2 instructions');
+    assert.ok(x.state.lastRender().rows.some(r => r.t === 'mov eax, 1'));
     const hover = x.state.hoverProviders[0].provider.provideHover(x.open('a.cpp'), new x.vscode.Position(0, 5));
     assert.match(hover.contents.value, /\*\*one\*\* — 2 instructions/);
     const body = ce.requests.at(-1).body;
     assert.equal(body.lang, 'c++');
-    assert.equal(body.options.userArguments, '-O2 -masm=intel');
+    assert.equal(body.options.userArguments, '-O2', 'the syntax flag is left to Compiler Explorer (filters.intel)');
     assert.equal(body.options.filters.intel, true);
   } finally { ce.restore(); }
 });
@@ -129,7 +129,7 @@ test('remote: missing headers become empty files and failing functions are skipp
     assert.match(msg.info[0], /found 1 emitted function bodies \(1 quoted include\(s\) not found; 1 header\(s\) replaced by empty files; 1 function\/declaration\(s\) skipped/);
     assert.equal(ce.requests.length, 3);
     assert.match(ce.requests[1].body.options.userArguments, /-I\./);
-    assert.equal(await x.lensAt('a.cpp', 2), '$(symbol-numeric) 2 instructions · GCC (selected ID) · -O2 -masm=intel -I.');
+    assert.equal(await x.lensAt('a.cpp', 2), '$(symbol-numeric) 2 instructions · GCC (selected ID) · -O2 -I.');
     assert.match(await x.lensAt('a.cpp', 3), /Not compiled/);
   } finally { ce.restore(); }
 });
@@ -235,8 +235,8 @@ test('instantiate: requests are appended, remembered per file, deduplicated, fai
     assert.equal(src[34], 'auto __asm_lens_inst_0 = &square<int>;');
     assert.equal(src[35], 'template struct mx::Box<long>;');
     assert.equal(src.length, fixture('headers', 'mathx.hxx').split('\n').length + 3);
-    assert.equal(await x.lensAt('m.hxx', 4), '$(symbol-numeric) 2 instructions · GCC (selected ID) · -O2 -masm=intel');
-    assert.equal(await x.lensAt('m.hxx', 32), '$(symbol-numeric) 2 instructions · GCC (selected ID) · -O2 -masm=intel');
+    assert.equal(await x.lensAt('m.hxx', 4), '$(symbol-numeric) 2 instructions · GCC (selected ID) · -O2');
+    assert.equal(await x.lensAt('m.hxx', 32), '$(symbol-numeric) 2 instructions · GCC (selected ID) · -O2');
     const top = (await x.lenses('m.hxx')).find(l => l.command === 'asmLens.manageInstantiations');
     assert.equal(top.title, '$(symbol-type-parameter) Instantiated: square<int>, template struct mx::Box<long> · edit');
     // The input box suggests the arguments used last time.
@@ -373,10 +373,10 @@ test('the open assembly view follows the new code after a re-analysis', async ()
     const x = start(dir, { settings: { 'asmLens.reanalyzeDelayMs': 200 } });
     await x.analyze('a.cpp');
     await x.state.commands.get('asmLens.showAssembly')(x.vscode.Uri.file(x.at('a.cpp')), 'a', 0);
-    assert.match(x.state.webviewHtml, /a — 1 instructions/);
+    assert.equal(x.state.lastRender().title, 'a — 1 instructions');
     x.edit('a.cpp', 0, 18, 0, 19, '2');
     await new Promise(r => setTimeout(r, 400));
-    assert.match(x.state.webviewHtml, /a — 2 instructions/);
+    assert.equal(x.state.lastRender().title, 'a — 2 instructions');
   } finally { ce.restore(); }
 });
 
@@ -435,14 +435,14 @@ test('collectLocalIncludes: search order, recursion, system headers, excludes, l
   assert.equal(limited.pathMap.length, 1);
 });
 
-test('header with an MSVC compiler on Compiler Explorer: no __attribute__((used)) is added', async () => {
+test('header with an MSVC compiler on Compiler Explorer: no __attribute__((used)) (MSVC does not know it)', async () => {
   const dir = makeProject({ 'h.hpp': 'inline int a() { return 1; }\n' }, { compilers: [{ id: 'vcpp_v19_latest_x64', name: 'x64 msvc v19.latest' }] });
   const ce = fakeCompilerExplorer(() => ({ code: 0, asm: [] }));
   try {
     const x = start(dir);
     await x.analyze('h.hpp');
     assert.equal(ce.requests.length, 1);
-    assert.equal(ce.requests[0].body.source, 'inline int a() { return 1; }\n');
+    assert.equal(ce.requests[0].body.source, 'inline int a() { return 1; }\nauto __asm_lens_keep_0 = &a;\n');
   } finally { ce.restore(); }
 });
 
@@ -533,5 +533,218 @@ test('saving a header analyzes again the .cpp whose results it shows (unless tur
     x.state.settings['asmLens.reanalyzeOn'] = 'never';
     await x.state.saveListener(x.open('u.cpp'));
     assert.equal(ce.requests.length, 2);
+  } finally { ce.restore(); }
+});
+
+// ---------------------------------------------------------------------------
+// 0.7.0: MSVC, syntax flags, rejected flags, rate limits, compiler selection, highlighting
+
+const msvcRows = [
+  { text: 'x$ = 8' },
+  { text: 'int one(void) PROC                                    ; one, COMDAT' },
+  { text: '        mov     eax, 1', source: { file: null, line: 1 } },
+  { text: '        ret     0', source: { file: null, line: 1 } },
+  { text: 'int one(void) ENDP                                    ; one' },
+  { text: 'int two(void) PROC                                    ; two, COMDAT' },
+  { text: '        mov     eax, 2', source: { file: null, line: 2 } },
+  { text: '        ret     0', source: { file: null, line: 2 } },
+  { text: 'int two(void) ENDP                                    ; two' }
+];
+
+test('MSVC on Compiler Explorer: functions are found, and no -masm flag is sent (it warns D9002)', async () => {
+  const dir = makeProject({ 'a.cpp': 'int one() { return 1; }\nint two() { return 2; }\n' }, { compilers: [{ id: 'vcpp_v19_latest_x64', name: 'x64 msvc' }] });
+  const ce = fakeCompilerExplorer(body => /-masm/.test(body.options.userArguments)
+    ? { code: 0, stderr: err("cl : Command line warning D9002 : ignoring unknown option '-masm=intel'"), asm: [] }
+    : { code: 0, asm: msvcRows });
+  try {
+    const x = start(dir);
+    const msg = await x.analyze('a.cpp');
+    assert.match(msg.info[0], /found 2 emitted function bodies/);
+    assert.equal(ce.requests[0].body.options.userArguments, '-O2');
+    assert.equal(ce.requests[0].body.options.filters.intel, true);
+    assert.equal(await x.lensAt('a.cpp', 1), '$(symbol-numeric) 2 instructions · x64 msvc · -O2');
+    assert.equal(await x.lensAt('a.cpp', 2), '$(symbol-numeric) 2 instructions · x64 msvc · -O2');
+  } finally { ce.restore(); }
+});
+
+test('syntax: -masm=att in the flags asks Compiler Explorer for AT&T syntax; -masm is never sent', async () => {
+  const dir = makeProject({ 'a.cpp': 'int one() { return 1; }\n' }, { flags: '-O1 -masm=att', compilers: ['g152'] });
+  const ce = fakeCompilerExplorer(() => ({ code: 0, asm: asmFor(['one()', 1]) }));
+  try {
+    const x = start(dir);
+    await x.analyze('a.cpp');
+    assert.equal(ce.requests[0].body.options.userArguments, '-O1');
+    assert.equal(ce.requests[0].body.options.filters.intel, false);
+  } finally { ce.restore(); }
+});
+
+test('a flag the compiler rejects is left out and the file compiled again', async () => {
+  const dir = makeProject({ 'a.c': 'int one(void) { return 1; }\n' }, { compilers: [{ id: 'cc65_219', flags: '-O2 -DX' }] });
+  const ce = fakeCompilerExplorer(body => /-O2/.test(body.options.userArguments)
+    ? { code: 1, stderr: err('cc65: Unknown option: -O2') }
+    : { code: 0, asm: asmFor(['_one', 1]) });
+  try {
+    const x = start(dir);
+    x.vscode._openDocument(x.at('a.c'), 'c');
+    const msg = await x.analyze('a.c');
+    assert.equal(ce.requests.length, 2);
+    assert.equal(ce.requests[1].body.options.userArguments, '-DX');
+    assert.match(msg.info[0], /flags the compiler does not accept were left out: -O2/);
+    assert.equal(await x.lensAt('a.c', 1), '$(symbol-numeric) 2 instructions · cc65_219 · -DX', '"_one" is the C symbol of one()');
+  } finally { ce.restore(); }
+});
+
+test('Compiler Explorer rate limit (HTTP 429) and non-JSON replies give clear messages; automatic re-analysis waits', async () => {
+  const dir = makeProject({ 'a.cpp': 'int one() { return 1; }\n' });
+  const real = global.fetch;
+  let mode = 'ok';
+  let calls = 0;
+  global.fetch = async () => {
+    calls++;
+    if (mode === '429') return { ok: false, status: 429, text: async () => 'Your request has hit our rate limit.' };
+    if (mode === 'html') return { ok: true, status: 200, text: async () => '<html>maintenance</html>' };
+    return { ok: true, status: 200, text: async () => JSON.stringify({ code: 0, asm: asmFor(['one()', 1]) }) };
+  };
+  try {
+    const x = start(dir, { settings: { 'asmLens.reanalyzeDelayMs': 200 } });
+    await x.analyze('a.cpp');
+    mode = 'html';
+    x.edit('a.cpp', 0, 18, 0, 19, '2');
+    assert.match((await x.analyze('a.cpp')).error[0], /not JSON: <html>maintenance/);
+    mode = '429';
+    x.edit('a.cpp', 0, 18, 0, 19, '3');
+    assert.match((await x.analyze('a.cpp')).error[0], /limiting how often it compiles \(HTTP 429\)/);
+    const before = calls;
+    x.edit('a.cpp', 0, 18, 0, 19, '4');
+    await new Promise(r => setTimeout(r, 400));
+    assert.equal(calls, before, 'no automatic request while rate-limited');
+  } finally { global.fetch = real; }
+});
+
+test('select compiler: a Compiler Explorer compiler is used even when the project file says local mode', async () => {
+  const dir = makeProject({ 'a.cpp': '', 'b.c': '' }, { mode: 'local', compilers: [{ id: 'local-gcc', compiler: 'g++' }, { id: 'local-cc', compiler: 'gcc', language: 'c' }] });
+  const ce = fakeCompilerExplorer(() => ({ code: 0, asm: [] }));
+  try {
+    const x = start(dir);
+    x.vscode._showDocument(x.at('a.cpp'));
+    x.state.quickPickAnswers.push(items => items.find(i => i.browse), items => items.find(i => i.compiler.id === 'g2'));
+    await x.state.commands.get('asmLens.selectCompiler')();
+    const r = await x.ext._internals.resolveSettings(x.open('a.cpp'));
+    assert.deepEqual([r.active.id, r.mode], ['g2', 'remote']);
+    assert.match(x.state.messages.info.at(-1), /set to GCC 2 \(Compiler Explorer\)/);
+    // The C++ pick is not used for C files (the project's first compiler is, as before).
+    const c = await x.ext._internals.resolveSettings(x.vscode._openDocument(x.at('b.c'), 'c'));
+    assert.deepEqual([c.active.id, c.mode], ['local-gcc', 'local']);
+    // Picking a project compiler again goes back to it.
+    x.state.quickPickAnswers.push(items => items.find(i => i.compiler && i.compiler.id === 'local-gcc'));
+    await x.state.commands.get('asmLens.selectCompiler')();
+    const back = await x.ext._internals.resolveSettings(x.open('a.cpp'));
+    assert.deepEqual([back.active.id, back.mode], ['local-gcc', 'local']);
+  } finally { ce.restore(); }
+});
+
+test('select compiler: works while the assembly view has the focus (no active editor)', async () => {
+  const dir = makeProject({ 'a.cpp': '' }, { compilers: ['g152', 'g132'] });
+  const x = start(dir);
+  x.vscode._showDocument(x.at('a.cpp'));
+  x.vscode._focusPanel();
+  x.state.quickPickAnswers.push(items => items.find(i => i.compiler && i.compiler.id === 'g132'));
+  await x.state.commands.get('asmLens.selectCompiler')();
+  assert.equal((await x.ext._internals.resolveSettings(x.open('a.cpp'))).active.id, 'g132');
+  assert.equal(x.state.settings['asmLens.compilerId'], undefined, 'the project choice is not written to the VS Code settings');
+});
+
+test('select compiler without a project file: the setting is changed where it is in effect; local mode switches to remote', async () => {
+  const dir = makeProject({ 'a.cpp': '' });
+  const ce = fakeCompilerExplorer(() => ({ code: 0, asm: [] }));
+  try {
+    const x = start(dir, { workspaceSettings: { 'asmLens.compilerId': 'g132', 'asmLens.mode': 'local' } });
+    x.vscode._showDocument(x.at('a.cpp'));
+    x.state.quickPickAnswers.push(items => items.find(i => i.compiler.id === 'g2'));
+    await x.state.commands.get('asmLens.selectCompiler')();
+    assert.equal(x.state.workspaceSettings['asmLens.compilerId'], 'g2', 'the workspace value, which hides the user value');
+    assert.equal(x.state.workspaceSettings['asmLens.mode'], 'remote');
+    const r = await x.ext._internals.resolveSettings(x.open('a.cpp'));
+    assert.deepEqual([r.active.id, r.mode], ['g2', 'remote']);
+  } finally { ce.restore(); }
+});
+
+test('select compiler: a choice saved by 0.6 (browsed, without mode) compiles on Compiler Explorer', async () => {
+  const dir = makeProject({ 'a.cpp': '' }, { mode: 'local', compilers: [{ id: 'local-gcc', compiler: 'g++' }] });
+  const x = start(dir);
+  x.state.workspaceState.set('asmLens.activeCompiler', { id: 'clang1910', name: 'Clang', browsed: true });
+  const r = await x.ext._internals.resolveSettings(x.open('a.cpp'));
+  assert.deepEqual([r.active.id, r.mode], ['clang1910', 'remote']);
+});
+
+test('highlighting: the view is built once; switching functions and highlighting are messages without delays', async () => {
+  const dir = makeProject({ 'a.cpp': 'int one() { return 1; }\nint two() { return 2; }\n' });
+  const ce = fakeCompilerExplorer(() => ({ code: 0, asm: asmFor(['one()', 1], ['two()', 2]) }));
+  try {
+    const x = start(dir);
+    await x.analyze('a.cpp');
+    await x.state.commands.get('asmLens.showAssembly')(x.vscode.Uri.file(x.at('a.cpp')), 'one', 0);
+    const html = x.state.webviewHtml;
+    const editor = x.state.activeEditor;
+    const select = line => x.state.selectionListeners.forEach(fn => fn({ textEditor: editor, selections: [{ active: { line } }], kind: x.vscode.TextEditorSelectionChangeKind.Keyboard }));
+    x.state.webviewMessages.length = 0;
+    select(0);
+    assert.deepEqual(x.state.webviewMessages, [{ type: 'highlightAsm', file: 0, line: 0 }], 'same function: highlighted at once');
+    x.state.webviewMessages.length = 0;
+    select(1);
+    await new Promise(r => setTimeout(r, 60));
+    assert.deepEqual(x.state.webviewMessages.map(m => m.type), ['render', 'highlightAsm'], 'other function: rendered, then highlighted');
+    assert.equal(x.state.webviewMessages[0].title, 'two — 2 instructions');
+    assert.equal(x.state.webviewHtml, html, 'the page itself was not rebuilt');
+    // A reloaded webview gets the current function again.
+    x.state.webviewMessages.length = 0;
+    x.state.webviewHandler({ type: 'ready' });
+    assert.equal(x.state.webviewMessages[0].title, 'two — 2 instructions');
+  } finally { ce.restore(); }
+});
+
+test('highlighting: hovering an instruction highlights its line and dims the rest of the function (unless turned off)', async () => {
+  const dir = makeProject({ 'a.cpp': 'int f(int x) {\n  int y = x * 2;\n  y += 3;\n  return y;\n}\n' });
+  const ce = fakeCompilerExplorer(() => ({ code: 0, asm: [
+    { text: 'f(int):' },
+    { text: '        lea eax, [rdi+rdi]', source: { file: null, line: 2, column: 13 } },
+    { text: '        add eax, 3', source: { file: null, line: 3 } },
+    { text: '        ret', source: { file: null, line: 5 } }
+  ] }));
+  try {
+    const x = start(dir);
+    await x.analyze('a.cpp');
+    await x.state.commands.get('asmLens.showAssembly')(x.vscode.Uri.file(x.at('a.cpp')), 'f', 0);
+    const editor = x.state.activeEditor;
+    const byType = () => [...editor.decorations.entries()].map(([type, ranges]) => [type.options, ranges.map(r => (r.range || r).start.line + '-' + (r.range || r).end.line)]);
+    x.state.webviewHandler({ type: 'highlight', file: 0, line: 2 });
+    const decos = byType();
+    const line = decos.find(([o]) => o.isWholeLine && o.borderColor);
+    const dim = decos.find(([o]) => o.opacity);
+    assert.deepEqual(line[1], ['2-2']);
+    assert.deepEqual(dim[1], ['0-1', '3-4'], 'the other lines of f() are dimmed');
+    x.state.webviewHandler({ type: 'clearHighlight' });
+    assert.ok(byType().filter(([o]) => o.opacity || o.borderColor).every(([, r]) => r.length === 0), 'line, token and dim highlights are cleared');
+    x.state.settings['asmLens.dimOtherLines'] = false;
+    x.state.webviewHandler({ type: 'highlight', file: 0, line: 1 });
+    assert.deepEqual(byType().find(([o]) => o.opacity)[1], []);
+  } finally { ce.restore(); }
+});
+
+test('header with MSVC: functions are kept by taking their address; lines that do not compile are dropped quietly', async () => {
+  const dir = makeProject({ 'h.hpp': 'inline int a() { return 1; }\ninline int b(int) { return 2; }\ninline int b(double) { return 3; }\n' }, { compilers: [{ id: 'vcpp_v19_latest_x64', name: 'x64 msvc' }] });
+  const ce = fakeCompilerExplorer(body => {
+    const lines = body.source.split('\n');
+    const bad = lines.findIndex(l => /= &b;/.test(l));
+    if (bad >= 0) return { code: 2, stderr: err(`<source>(${bad + 1}): error C3535: cannot deduce type for 'auto' from 'overloaded-function'`) };
+    return { code: 0, asm: [{ text: 'int a(void) PROC' }, { text: '        mov eax, 1', source: { file: null, line: 1 } }, { text: '        ret 0', source: { file: null, line: 1 } }, { text: 'int a(void) ENDP' }] };
+  });
+  try {
+    const x = start(dir);
+    const msg = await x.analyze('h.hpp');
+    assert.equal(ce.requests[0].body.source.split('\n').slice(3).join('|'), 'auto __asm_lens_keep_0 = &a;|auto __asm_lens_keep_1 = &b;|auto __asm_lens_keep_2 = &b;|');
+    assert.ok(!/__attribute__/.test(ce.requests[0].body.source));
+    assert.deepEqual(msg.warning, [], 'no "could not instantiate" for our own lines');
+    assert.equal(await x.lensAt('h.hpp', 1), '$(symbol-numeric) 2 instructions · x64 msvc · -O2');
   } finally { ce.restore(); }
 });

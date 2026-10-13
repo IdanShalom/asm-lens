@@ -48,7 +48,11 @@ function makeLocalRefResolver(mainKey, cwd, mainAliases = [], realDirs = []) {
   const aliases = new Set(mainAliases.map(normPath));
   const prefixes = realDirs.filter(([real, given]) => real && given && normPath(real) !== normPath(given))
     .map(([real, given]) => [normPath(real) + path.sep, path.resolve(given) + path.sep]);
-  return function resolveRef(row) {
+  // key -> the path as the compiler wrote it (keys are lowercase on Windows).
+  const pathOf = new Map();
+  resolveRef.pathOf = pathOf;
+  return resolveRef;
+  function resolveRef(row) {
     const s = row && typeof row === 'object' ? row.source : undefined;
     if (!s || !Number.isInteger(s.line) || s.line <= 0) return undefined;
     const line = s.line - 1;
@@ -63,8 +67,9 @@ function makeLocalRefResolver(mainKey, cwd, mainAliases = [], realDirs = []) {
     const key = normPath(abs);
     if (aliases.has(key)) return { key: mainKey, line, column };
     if (isSystemPath(abs)) return undefined;
+    if (!pathOf.has(key)) pathOf.set(key, path.resolve(abs));
     return { key, line, column };
-  };
+  }
 }
 
 // `.file` strings use C escapes: "C:\\src\\a.h" -> C:\src\a.h
@@ -172,6 +177,14 @@ function finishMachO(asm) {
 const FILE_DIRECTIVE = /^\.file\s+(\d+)\s+"((?:[^"\\]|\\.)*)"(?:\s+"((?:[^"\\]|\\.)*)")?/;
 const LOC_DIRECTIVE = /^\.loc\s+(\d+)\s+(\d+)(?:\s+(\d+))?/;
 
+const BARE_KEYWORDS = new Set(['END', 'ENDP', 'ENDS', 'ENDM', 'ENDIF', 'ELSE', 'ALIGN', 'CODE', 'DATA', 'PUBLIC', 'EXTERN', 'EXPORT', 'IMPORT', 'INCLUDE', 'PRESERVE8', 'THUMB', 'ARM', 'LTORG', 'NOP', 'RET', 'RETURN']);
+const MASM_PROC = /^(\S.*?)\s+PROC\b(?:\s+(?:NEAR|FAR|FRAME(?::\s*\S+)?))*\s*(?:;.*)?$/;
+const MASM_ENDP = /^(?:\S.*?\s+)?ENDP\b\s*(?:;.*)?$/;
+const CA65_PROC = /^\.proc\s+([^\s:]+)(?:\s*:\s*\w+)?\s*(?:;.*)?$/i;
+const CA65_ENDPROC = /^\.endproc\b/i;
+const ORCA_START = /^([A-Za-z_~][\w~]*)\s+start(?:\s+\w+)?\s*(?:;.*)?$/i;
+const ORCA_END = /^end\s*(?:;.*)?$/i;
+
 function parseFunctions(rows, resolveRef) {
   const functions = [];
   const fileTable = new Map();
@@ -193,8 +206,27 @@ function parseFunctions(rows, resolveRef) {
     const hasMeta = row && typeof row === 'object' && row.source !== undefined && row.source !== null;
     let ref = resolveRef ? resolveRef(row) : undefined;
     if (!ref && !hasMeta && loc && isInstructionLine(trimmed)) ref = loc;
-    const labelMatch = trimmed.match(/^([^\s].*):(?:\s*(?:[#;].*)?)?$/);
-    if (labelMatch && !trimmed.startsWith('.L') && !isLocalDollarLabel(trimmed)) {
+    // Functions written as blocks: MASM (MSVC) "int square(int) PROC" ... "ENDP",
+    // ca65 (cc65) ".proc _square: near" ... ".endproc", ORCA/M "square  start" ... "end".
+    const block = MASM_PROC.exec(trimmed) || CA65_PROC.exec(trimmed) || (/^\S/.test(text) ? ORCA_START.exec(trimmed) : null);
+    if (block) {
+      if (current) functions.push(finalizeFunction(current));
+      // ARM listings put the name in pipes: |int square(int)| PROC
+      current = { name: block[1].trim().replace(/^\|([\s\S]*)\|$/, '$1'), block: true, rows: [{ text, ref: undefined }], lines: [text], count: 0, instructionLines: [], instructionRows: [] };
+      continue;
+    }
+    if (current && current.block && (MASM_ENDP.test(trimmed) || CA65_ENDPROC.test(trimmed) || ORCA_END.test(trimmed))) {
+      current.rows.push({ text, ref: undefined });
+      current.lines.push(text);
+      functions.push(finalizeFunction(current));
+      current = null;
+      continue;
+    }
+    // ARM assembler style (Norcroft, armasm): a label is a bare name at column 0, without a colon.
+    const bare = /^[A-Za-z_][\w$.@]*$/.test(text) && !BARE_KEYWORDS.has(text.toUpperCase()) ? text : undefined;
+    const labelMatch = bare ? [text, bare] : trimmed.match(/^([^\s].*?):(?:\s*(?:[#;].*|\/\/.*)|\s+@.*)?$/);
+    // Inside a function block, labels are jump targets, not functions.
+    if (labelMatch && !(current && current.block) && !trimmed.startsWith('.L') && !isLocalDollarLabel(trimmed)) {
       const label = labelMatch[1].trim();
       if (looksLikeFunctionLabel(label)) {
         if (current) functions.push(finalizeFunction(current));
@@ -205,7 +237,9 @@ function parseFunctions(rows, resolveRef) {
     if (current) {
       current.rows.push({ text, ref });
       current.lines.push(text);
-      if (isInstructionLine(trimmed)) {
+      // "L0001:  jsr incsp2": a label and an instruction on one line.
+      const afterLabel = trimmed.replace(/^[A-Za-z_.$@?][\w.$@?]*:\s+(?=\S)/, '');
+      if (isInstructionLine(trimmed) || (afterLabel !== trimmed && isInstructionLine(afterLabel))) {
         current.count++;
         current.instructionLines.push(text);
         current.instructionRows.push({ text, ref });
@@ -249,7 +283,7 @@ function buildLineIndex(functions) {
       if (!lines) index.set(r.ref.key, lines = new Map());
       let list = lines.get(r.ref.line);
       if (!list) lines.set(r.ref.line, list = []);
-      list.push({ fnName: fn.sourceName || fn.name, text: cleanInstruction(r.text) });
+      list.push({ fnName: fn.sourceName || fn.name, text: cleanInstruction(r.text), fn });
     }
   }
   return index;
@@ -361,31 +395,47 @@ function normalizeName(name) {
 // ---------------------------------------------------------------------------
 // Matching emitted functions with source symbols ({ name, range })
 
-// Source function for an emitted function: by location first (overloads, template
-// instantiations), then by name. With `requireName`, only symbols of the same
-// name are considered (languages whose emitted names are exact, such as Python).
+// Names the same function could have in the assembly and in the source:
+// C symbols carry a leading underscore on several targets (SDCC, Z80, SH,
+// 32-bit Windows, Mach-O): "_square" is "square".
+function sameName(asmNorm, symNorm) {
+  return asmNorm === symNorm || (asmNorm.startsWith('_') && !symNorm.startsWith('_') && asmNorm.slice(1) === symNorm);
+}
+
+// Source function for an emitted function. By location: the source function
+// of the same name that contains some of its instructions; otherwise the one
+// that contains most of them (template instantiations, lambdas, names the
+// source spells differently). A function that inlines another function of the
+// file has instructions on that function's lines too, so the name decides
+// first. With `requireName`, only symbols of the same name are considered.
 function matchSourceSymbol(asmName, symbols, fn, docKey, opts = {}) {
   const norm = normalizeName(asmName);
-  const candidates = opts.requireName ? symbols.filter(s => normalizeName(s.name) === norm) : symbols;
+  const named = symbols.filter(s => sameName(norm, normalizeName(s.name)));
+  const candidates = opts.requireName ? named : symbols;
   if (fn && docKey) {
     const mapped = fn.instructionRows.filter(r => r.ref);
     const lines = mapped.filter(r => r.ref.key === docKey).map(r => r.ref.line);
     if (lines.length) {
-      let best, bestHits = 0;
-      for (const s of candidates) {
-        if (!s.range) continue;
-        const hits = lines.filter(l => l >= s.range.start.line && l <= s.range.end.line).length;
-        if (hits > bestHits || (hits && hits === bestHits && best &&
-            (s.range.end.line - s.range.start.line) < (best.range.end.line - best.range.start.line))) {
-          best = s; bestHits = hits;
-        }
-      }
+      const best = mostHits(named, lines) || mostHits(candidates, lines);
       if (best) return best;
     }
     // All of its code comes from other files (e.g. a header template): not a function of this file.
     if (mapped.length && !lines.length) return undefined;
   }
-  return candidates.find(s => normalizeName(s.name) === norm);
+  return named[0];
+}
+
+function mostHits(symbols, lines) {
+  let best, bestHits = 0;
+  for (const s of symbols) {
+    if (!s.range) continue;
+    const hits = lines.filter(l => l >= s.range.start.line && l <= s.range.end.line).length;
+    if (hits > bestHits || (hits && hits === bestHits && best &&
+        (s.range.end.line - s.range.start.line) < (best.range.end.line - best.range.start.line))) {
+      best = s; bestHits = hits;
+    }
+  }
+  return best;
 }
 
 // Whether `f` has instructions from lines `range` of file `docKey`.
@@ -408,10 +458,11 @@ function findFunctionResult(symbol, functions, docKey, rootKey) {
   const exact = functions.find(f => usable(f) && (f.sourceName === symbol.name || f.name === symbol.name));
   if (exact) return exact;
   const normalized = normalizeName(symbol.name);
+  const named = f => sameName(normalizeName(f.sourceName), normalized) || sameName(normalizeName(f.name), normalized);
   // A prefix match only for compiler-made variants ("foo.constprop.0", "foo$1"),
   // never for other functions ("cube" is not "cube_int").
   const variant = n => n.startsWith(normalized) && /^[^\w]/.test(n.slice(normalized.length));
-  return functions.find(f => usable(f) && (normalizeName(f.sourceName) === normalized || normalizeName(f.name) === normalized))
+  return functions.find(f => usable(f) && named(f))
     || functions.find(f => usable(f) && (variant(normalizeName(f.sourceName)) || variant(normalizeName(f.name))));
 }
 
@@ -428,7 +479,7 @@ function findAllFunctionResults(symbol, functions, docKey, rootKey) {
   }
   if (docKey !== rootKey) {
     const norm = normalizeName(symbol.name);
-    const all = functions.filter(f => f.fileKeys && f.fileKeys.has(docKey) && !f.sourceRange && normalizeName(f.name) === norm);
+    const all = functions.filter(f => f.fileKeys && f.fileKeys.has(docKey) && !f.sourceRange && sameName(normalizeName(f.name), norm));
     if (all.length) {
       if (!symbol.range || symbol.range.start.line === symbol.range.end.line) return all;
       return all.filter(f => hasRowsIn(f, docKey, symbol.range));
@@ -486,7 +537,7 @@ function cleanAssemblyRowsForDisplay(result) {
     const text = (typeof row === 'string' ? row : row.text || '').trim();
     if (!isInstructionLine(text)) continue;
     const withoutComment = text.replace(/\s+#.*$/, '');
-    const refs = withoutComment.matchAll(/(?:^|[\s,])((?:\.L|\$L)[\w.$]*)\b/g);
+    const refs = withoutComment.matchAll(/(?:^|[\s,])\|?((?:\.L|\$L)[\w.$@]*)/g);
     for (const match of refs) referencedLocalLabels.add(match[1]);
   }
   const cleaned = [];
@@ -498,7 +549,7 @@ function cleanAssemblyRowsForDisplay(result) {
       cleaned.push({ text: cleanInstruction(text), ref: typeof row === 'object' ? row.ref : undefined });
       continue;
     }
-    const label = text.match(/^((?:\.L|\$L)[\w.$]*):$/);
+    const label = text.match(/^\|?((?:\.L|\$L)[\w.$@]*)\|?:?$/);
     if (label && referencedLocalLabels.has(label[1])) cleaned.push({ text, ref: undefined });
   }
   return cleaned;
@@ -511,7 +562,7 @@ module.exports = {
   IS_WIN, normPath, isSystemPath,
   makeRefResolver, makeLocalRefResolver, localAsmToRows, sectionKind, unescapeAsmString, isMachO, prepareMachO, finishMachO,
   parseFunctions, looksLikeFunctionLabel, isInstructionLine, cleanInstruction, buildLineIndex,
-  stripTemplateArgs, normalizeName, msvcName, matchSourceSymbol, findFunctionResult, findAllFunctionResults,
+  stripTemplateArgs, normalizeName, msvcName, sameName, matchSourceSymbol, findFunctionResult, findAllFunctionResults,
   ANSI_RE, missingIncludesFrom, preprocessorErrorFilesFrom, errorLocationsFrom, stubFilename,
   cleanAssemblyRowsForDisplay, cleanAssemblyForDisplay
 };

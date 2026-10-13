@@ -87,6 +87,8 @@ class TextDocument {
 function createVscode(options = {}) {
   const state = {
     settings: { ...(options.settings || {}) },
+    workspaceSettings: { ...(options.workspaceSettings || {}) },
+    settingUpdates: [],
     documents: new Map(),           // fsPath -> TextDocument
     workspaceFolders: (options.workspaceFolders || []).map((p, index) => ({ uri: Uri.file(p), name: path.basename(p), index })),
     messages: { info: [], warning: [], error: [] },
@@ -104,22 +106,32 @@ function createVscode(options = {}) {
     workspaceState: new Map(),
     globalState: new Map(),
     shownDocuments: [],
-    progress: []
+    progress: [],
+    activeEditorListeners: []
   };
 
   // Like VS Code: a setting that is not set returns the default declared in package.json.
   const declared = require(path.resolve(__dirname, '..', '..', 'package.json')).contributes.configuration.properties;
+  // User settings (state.settings) and workspace settings (state.workspaceSettings); the workspace wins.
   function getConfiguration(section) {
     return {
       get(key, def) {
-        const v = state.settings[`${section}.${key}`];
-        if (v !== undefined) return v;
-        const d = declared[`${section}.${key}`];
+        const k = `${section}.${key}`;
+        if (state.workspaceSettings[k] !== undefined) return state.workspaceSettings[k];
+        if (state.settings[k] !== undefined) return state.settings[k];
+        const d = declared[k];
         return d && d.default !== undefined ? d.default : def;
       },
-      has(key) { return state.settings[`${section}.${key}`] !== undefined; },
-      inspect(key) { return { defaultValue: undefined, globalValue: state.settings[`${section}.${key}`] }; },
-      async update(key, value) { state.settings[`${section}.${key}`] = value; }
+      has(key) { return this.get(key) !== undefined; },
+      inspect(key) {
+        const k = `${section}.${key}`;
+        return { key: k, defaultValue: declared[k]?.default, globalValue: state.settings[k], workspaceValue: state.workspaceSettings[k], workspaceFolderValue: undefined };
+      },
+      async update(key, value, target) {
+        const k = `${section}.${key}`;
+        if (target === 2 || target === 3) state.workspaceSettings[k] = value; else state.settings[k] = value;
+        state.settingUpdates.push({ key: k, value, target });
+      }
     };
   }
 
@@ -173,7 +185,8 @@ function createVscode(options = {}) {
         const panel = {
           visible: true, title: '',
           webview: {
-            set html(h) { state.webviewHtml = h; }, get html() { return state.webviewHtml; },
+            // Like a real webview, the page reports 'ready' once loaded.
+            set html(h) { state.webviewHtml = h; if (state.webviewHandler) state.webviewHandler({ type: 'ready' }); }, get html() { return state.webviewHtml; },
             postMessage(m) { state.webviewMessages.push(m); return Promise.resolve(true); },
             onDidReceiveMessage(fn) { state.webviewHandler = fn; return { dispose() {} }; },
             asWebviewUri: (u) => u, cspSource: 'mock'
@@ -201,6 +214,7 @@ function createVscode(options = {}) {
       async showTextDocument(arg) {
         const doc = arg instanceof TextDocument ? arg : openDocumentSync(arg.fsPath);
         state.activeEditor = makeEditor(doc);
+        for (const fn of state.activeEditorListeners) fn(state.activeEditor);
         state.shownDocuments.push(doc.fileName);
         return state.activeEditor;
       },
@@ -214,7 +228,7 @@ function createVscode(options = {}) {
         return task({ report(p) { if (p && p.message) entry.messages.push(p.message); } }, token);
       },
       onDidChangeVisibleTextEditors() { return { dispose() {} }; },
-      onDidChangeActiveTextEditor() { return { dispose() {} }; },
+      onDidChangeActiveTextEditor(fn) { state.activeEditorListeners.push(fn); return { dispose() {} }; },
       onDidChangeTextEditorSelection(fn) { state.selectionListeners.push(fn); return { dispose() {} }; }
     },
     languages: {
@@ -234,8 +248,17 @@ function createVscode(options = {}) {
 
   // Test helpers (not part of the real API).
   vscode._state = state;
+  // The last function the assembly view was asked to show.
+  state.lastRender = () => state.webviewMessages.filter(m => m.type === 'render').at(-1);
   vscode._openDocument = openDocumentSync;
-  vscode._showDocument = (p) => { const d = openDocumentSync(p); state.activeEditor = makeEditor(d); return d; };
+  vscode._showDocument = (p) => {
+    const d = openDocumentSync(p);
+    state.activeEditor = makeEditor(d);
+    for (const fn of state.activeEditorListeners) fn(state.activeEditor);
+    return d;
+  };
+  // Focus moves to a panel (the assembly view): no active text editor.
+  vscode._focusPanel = () => { state.activeEditor = undefined; for (const fn of state.activeEditorListeners) fn(undefined); };
   vscode._context = () => ({
     subscriptions: [],
     extensionPath: path.resolve(__dirname, '..', '..'),

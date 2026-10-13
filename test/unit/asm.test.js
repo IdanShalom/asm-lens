@@ -349,3 +349,76 @@ test('parseFunctions: Swift on Linux without a demangler (mangled $s labels are 
     ['main', 2, 'main'], ['$s4geom6squareyS2iF', 4, 'square'], ['$s4geom3AccV4pushyySiF', 3, 'push']
   ]);
 });
+
+test('parseFunctions: MSVC (MASM) functions from PROC to ENDP, as Compiler Explorer returns them', () => {
+  const rows = [
+    { text: '# License: MSVC Proprietary' },
+    { text: 'x$ = 8' },
+    { text: 'int square(int) PROC                                    ; square, COMDAT' },
+    { text: '        imul    ecx, ecx', source: { file: null, line: 1 } },
+    { text: '        mov     eax, ecx', source: { file: null, line: 1 } },
+    { text: '$LN3@square:' },
+    { text: '        ret     0', source: { file: null, line: 1 } },
+    { text: 'int square(int) ENDP                                    ; square' },
+    { text: '' },
+    { text: 'this$ = 8' },
+    { text: 'void Acc::push(int) PROC                                ; Acc::push, COMDAT' },
+    { text: '        add     DWORD PTR [rcx], edx', source: { file: null, line: 2 } },
+    { text: '        ret     0', source: { file: null, line: 2 } },
+    { text: 'void Acc::push(int) ENDP                                ; Acc::push' },
+    { text: '|int use(Acc &)| PROC                                   ; use' },
+    { text: '        ldr         w8,[x0]', source: { file: null, line: 3 } },
+    { text: '        ret', source: { file: null, line: 3 } },
+    { text: '        ENDP  ; |int use(Acc &)|' },
+    { text: 'stray   PROC NEAR' },
+    { text: '        nop' },
+    { text: 'stray   ENDP' }
+  ];
+  const fns = asm.parseFunctions(rows, asm.makeRefResolver('M', []));
+  assert.deepEqual(fns.map(f => [f.name, f.count]), [['int square(int)', 3], ['void Acc::push(int)', 2], ['int use(Acc &)', 2], ['stray', 1]]);
+  assert.equal(asm.normalizeName('int square(int)'), 'square');
+  assert.equal(asm.normalizeName('void Acc::push(int)'), 'push');
+  assert.equal(asm.cleanAssemblyRowsForDisplay({ rows: [{ text: '        jmp SHORT $LN3@square' }, { text: '$LN3@square:' }, { text: '        ret 0' }] }).map(r => r.text).join('|'), 'jmp SHORT $LN3@square|$LN3@square:|ret 0');
+  // ARM: |name| PROC, a bare ENDP, |$LN1@use| labels without a colon.
+  const arm = asm.parseFunctions(['|int use(int)| PROC ; use', '        cmp         w0,#3', '        bgt         |$LN1@use|', '|$LN1@use|', '|$M4|', '        ret', '', '        ENDP  ; |int use(int)|, use', '|int z(int)| PROC', '        ret', '        ENDP'].map(text => ({ text })), () => undefined);
+  assert.deepEqual(arm.map(f => [f.name, f.count]), [['int use(int)', 3], ['int z(int)', 1]]);
+  assert.deepEqual(asm.cleanAssemblyRowsForDisplay(arm[0]).map(r => r.text), ['cmp         w0,#3', 'bgt         |$LN1@use|', '|$LN1@use|', 'ret']);
+});
+
+test('parseFunctions: labels followed by an ARM-style @ comment (TI Arm Clang)', () => {
+  const rows = ['square(int):                             @ @square(int)', '        muls    r0, r0, r0', 'use(int):  @ @use(int)', '        bx      lr', '?f@@YAXXZ:', '        ret'].map(text => ({ text }));
+  assert.deepEqual(asm.parseFunctions(rows, () => undefined).map(f => [f.name, f.count]), [['square(int)', 1], ['use(int)', 1], ['?f@@YAXXZ', 1]]);
+});
+
+test('matchSourceSymbol: a function that inlines another one of the file keeps its own name', () => {
+  // use() inlines square(): most of its instructions are on square's line.
+  const fn = (name, lines) => ({ name, instructionRows: lines.map(line => ({ ref: { key: 'D', line } })) });
+  const symbols = [sym('square', 1, 1), sym('use', 2, 2)];
+  assert.equal(asm.matchSourceSymbol('use(int)', symbols, fn('use(int)', [1, 1, 1, 2]), 'D').name, 'use');
+  assert.equal(asm.matchSourceSymbol('square(int)', symbols, fn('square(int)', [1, 1]), 'D').name, 'square');
+  // The same-named function has none of the code: the lines decide (a lambda in use()).
+  assert.equal(asm.matchSourceSymbol('use()::{lambda()#1}::operator()() const', symbols, fn('lambda', [2]), 'D').name, 'use');
+  // Overloads of the same name: the one containing the code.
+  const over = [sym('f', 0, 0), sym('f', 4, 4)];
+  assert.equal(asm.matchSourceSymbol('f(double)', over, fn('f(double)', [4, 4]), 'D'), over[1]);
+});
+
+test('matching: C symbols with a leading underscore (SDCC, Z80, SH, 32-bit Windows)', () => {
+  const symbols = [sym('square', 1, 1), sym('_private', 3, 3)];
+  assert.equal(asm.matchSourceSymbol('_square', symbols, { instructionRows: [] }, 'D').name, 'square');
+  assert.equal(asm.matchSourceSymbol('_private', symbols, { instructionRows: [] }, 'D').name, '_private');
+  assert.equal(asm.sameName('_square', 'square'), true);
+  assert.equal(asm.sameName('square', '_square'), false);
+  assert.equal(asm.sameName('__square', 'square'), false);
+  const functions = [{ name: '_square', sourceName: '_square', fileKeys: new Set() }];
+  assert.equal(asm.findFunctionResult({ name: 'square' }, functions).name, '_square');
+});
+
+test('parseFunctions: cc65 (.proc/.endproc, label and instruction on one line) and ORCA/C (start/end)', () => {
+  const cc65 = ['.proc   _square: near', '', '        jsr     pushax', '        jmp     L0001', 'L0001:  jsr     incsp2', '        rts', '', '.endproc', '.proc   _use: near', 'L0003:', '        rts', '.endproc'].map(text => ({ text }));
+  assert.deepEqual(asm.parseFunctions(cc65, () => undefined).map(f => [f.name, f.count]), [['_square', 4], ['_use', 1]]);
+  const orca = ['square              start', '', '                    pha', '                    rtl', '', '                    end', 'use                 start', '                    rtl', '                    end'].map(text => ({ text }));
+  assert.deepEqual(asm.parseFunctions(orca, () => undefined).map(f => [f.name, f.count]), [['square', 2], ['use', 1]]);
+  // GAS instructions are indented, so "foo start" at column 0 is the only form taken as a block.
+  assert.deepEqual(asm.parseFunctions([{ text: 'f:' }, { text: '        start' }, { text: '        ret' }], () => undefined).map(f => [f.name, f.count]), [['f', 2]]);
+});

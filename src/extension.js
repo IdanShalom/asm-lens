@@ -8,9 +8,11 @@ const { AsyncLocalStorage } = require('async_hooks');
 const projectConfig = require('./projectConfig');
 const scan = require('./cppScan');
 const languages = require('./languages');
+const flagsLib = require('./flags');
+const compileCommands = require('./compileCommands');
 const {
   IS_WIN, normPath, makeRefResolver, makeLocalRefResolver, localAsmToRows, isMachO, prepareMachO, finishMachO,
-  parseFunctions, buildLineIndex, normalizeName,
+  parseFunctions, buildLineIndex,
   matchSourceSymbol, findFunctionResult, findAllFunctionResults,
   ANSI_RE, missingIncludesFrom, preprocessorErrorFilesFrom, errorLocationsFrom, stubFilename,
   cleanAssemblyRowsForDisplay, cleanAssemblyForDisplay
@@ -44,11 +46,35 @@ let codeLensEmitter;
 let extContext;
 let statusItem;
 let lineDecoration;
+let dimDecoration;
 let tokenDecoration;
 let paletteDecorations = [];
 let syncTimer;
+let panelRefreshTimer;
 
 function config() { return vscode.workspace.getConfiguration('asmLens'); }
+
+// Writes a setting where it is in effect: a workspace-folder or workspace
+// value if one is set (a user-level change would be hidden by it), else user settings.
+async function updateSetting(key, value, document) {
+  const cfg = vscode.workspace.getConfiguration('asmLens', document?.uri);
+  const info = cfg.inspect(key) || {};
+  const target = info.workspaceFolderValue !== undefined ? vscode.ConfigurationTarget.WorkspaceFolder
+    : info.workspaceValue !== undefined ? vscode.ConfigurationTarget.Workspace
+      : vscode.ConfigurationTarget.Global;
+  await cfg.update(key, value, target);
+}
+
+// The source file commands act on: the active editor's, else a visible one,
+// else the last one that was active (the assembly view may have the focus).
+let lastSourceDocument;
+function currentSourceDocument() {
+  const active = vscode.window.activeTextEditor?.document;
+  if (active && LANGS.includes(active.languageId)) return active;
+  const visible = (vscode.window.visibleTextEditors || []).find(e => LANGS.includes(e.document.languageId));
+  if (visible) return visible.document;
+  return lastSourceDocument && !lastSourceDocument.isClosed ? lastSourceDocument : undefined;
+}
 function fileKey(document) { return document.uri.toString(); }
 function docPathKey(document) { return document.uri.scheme === 'file' ? normPath(document.uri.fsPath) : document.uri.toString(); }
 
@@ -101,6 +127,8 @@ const PALETTE = [
   'rgba(255, 105, 180, 0.20)', 'rgba(100, 149, 237, 0.24)'
 ];
 
+const loggedConfigProblems = new Set();
+
 function readConfigText(file) {
   const open = (vscode.workspace.textDocuments || []).find(d => d.uri.scheme === 'file' && normPath(d.uri.fsPath) === normPath(file));
   if (open) return Promise.resolve(open.getText());
@@ -111,8 +139,10 @@ async function loadProject(document) {
   if (!document || document.uri.scheme !== 'file') return undefined;
   const root = vscode.workspace.getWorkspaceFolder?.(document.uri)?.uri.fsPath;
   const project = await projectConfig.loadProjectConfig(path.dirname(document.uri.fsPath), root, readConfigText);
-  if (project?.error) outputChannel?.appendLine(project.error);
-  for (const w of project?.warnings || []) outputChannel?.appendLine(`${project.file}: ${w}`);
+  // Logged once each: this runs on every status-bar refresh.
+  for (const line of [project?.error, ...(project?.warnings || []).map(w => `${project.file}: ${w}`)]) {
+    if (line && !loggedConfigProblems.has(line)) { loggedConfigProblems.add(line); outputChannel?.appendLine(line); }
+  }
   return project;
 }
 
@@ -137,7 +167,10 @@ async function resolveSettings(document) {
   const matching = all.filter(x => !x.language || x.language === docLang);
   const compilers = matching.length ? matching : all;
   const chosen = extContext?.workspaceState.get('asmLens.activeCompiler');
-  const active = (chosen && (compilers.find(x => x.id === chosen.id) || (chosen.browsed ? { id: chosen.id, name: chosen.name || chosen.id } : undefined))) || compilers[0];
+  // A compiler picked from Compiler Explorer's list compiles there, for the language it was picked for.
+  const browsed = chosen && chosen.browsed && (!chosen.language || chosen.language === docLang)
+    ? { id: chosen.id, name: chosen.name || chosen.id, mode: 'remote' } : undefined;
+  const active = (chosen && !chosen.browsed && compilers.find(x => x.id === chosen.id)) || browsed || compilers[0];
   const settingsPaths = (s.get('includePaths', []) || []).filter(x => typeof x === 'string' && x.trim());
   return {
     configFile: project?.file,
@@ -156,8 +189,19 @@ async function resolveSettings(document) {
     extraFlags: [c?.extraFlags, active.extraFlags].filter(Boolean).join(' '),
     uploadSystemHeaders: c?.uploadSystemHeaders === true,
     mode: active.mode || c?.mode || s.get('mode', 'remote'),
-    localCompiler: resolveCompilerPath(active.compiler || c?.compiler || s.get('localCompiler', '') || 'g++', project)
+    localCompiler: resolveCompilerPath(active.compiler || c?.compiler || s.get('localCompiler', '') || 'g++', project),
+    // Local mode: compile_commands.json databases (absolute paths), and the flags added to an entry's.
+    compileCommands: c?.compileCommands ?? settingsCompileCommands(document, s),
+    activeExtraFlags: active.extraFlags || ''
   };
+}
+
+// asmLens.compileCommands: a path or paths, relative to the workspace folder.
+function settingsCompileCommands(document, s) {
+  const value = s.get('compileCommands', '');
+  const list = (Array.isArray(value) ? value : [value]).filter(x => typeof x === 'string' && x.trim()).map(x => x.trim());
+  const base = vscode.workspace.getWorkspaceFolder?.(document.uri)?.uri.fsPath || (document.uri.scheme === 'file' ? path.dirname(document.uri.fsPath) : process.cwd());
+  return list.map(x => path.isAbsolute(x) ? path.resolve(x) : path.resolve(base, x));
 }
 
 // Settings for Rust, Go, Python, ...: compilers from .asm-lens.json entries with
@@ -167,7 +211,8 @@ function resolveOtherSettings(lang, project, s) {
   const c = project?.config;
   const compilers = (c?.compilers || []).filter(x => x.language === lang.id);
   const chosen = extContext?.workspaceState.get(`asmLens.activeCompiler.${lang.id}`);
-  const active = (chosen && (compilers.find(x => x.id === chosen.id) || (chosen.browsed ? { id: chosen.id, name: chosen.name || chosen.id } : undefined)))
+  const active = (chosen && !chosen.browsed && compilers.find(x => x.id === chosen.id))
+    || (chosen && chosen.browsed ? { id: chosen.id, name: chosen.name || chosen.id, mode: 'remote' } : undefined)
     || compilers[0]
     || { id: lang.compiler, name: `${lang.label} (Compiler Explorer default)`, isDefault: true };
   const mode = active.mode || c?.mode || s.get('mode', 'remote');
@@ -204,13 +249,14 @@ async function ceDefaultCompiler(baseUrl, lang) {
 
 async function refreshStatusBar() {
   if (!statusItem || analysisBusy.size) return;
-  const document = vscode.window.activeTextEditor?.document;
+  const document = currentSourceDocument();
   if (!document || !LANGS.includes(document.languageId)) return statusItem.hide();
   try {
     const r = await resolveSettings(document);
     const local = r.mode === 'local';
-    statusItem.text = `$(chip) ${local ? `${path.basename(r.localCompiler || '')} (local)` : r.active.name || r.active.id}`;
-    statusItem.tooltip = `Asm Lens compiler: ${local ? `${r.localCompiler} on this machine` : `${r.active.id} on ${r.baseUrl}`}\n${r.configFile ? `Config: ${r.configFile}` : 'No .asm-lens.json (using VS Code settings)'}\nClick to change`;
+    const database = local && r.compileCommands && r.compileCommands.length;
+    statusItem.text = `$(chip) ${database ? 'compile_commands (local)' : local ? `${path.basename(r.localCompiler || '')} (local)` : r.active.name || r.active.id}`;
+    statusItem.tooltip = `Asm Lens compiler: ${database ? `from ${r.compileCommands.join(', ')}` : local ? `${r.localCompiler} on this machine` : `${r.active.id} on ${r.baseUrl}`}\n${r.configFile ? `Config: ${r.configFile}` : 'No .asm-lens.json (using VS Code settings)'}\nClick to change`;
     statusItem.show();
   } catch (_) { statusItem.hide(); }
 }
@@ -221,11 +267,14 @@ function activate(context) {
   context.subscriptions.push(outputChannel);
 
   lineDecoration = vscode.window.createTextEditorDecorationType({
-    backgroundColor: new vscode.ThemeColor('editor.findMatchHighlightBackground'),
+    backgroundColor: new vscode.ThemeColor('editor.wordHighlightStrongBackground'),
     isWholeLine: true,
+    borderWidth: '0 0 0 3px', borderStyle: 'solid', borderColor: new vscode.ThemeColor('focusBorder'),
     overviewRulerColor: new vscode.ThemeColor('editor.findMatchHighlightBackground'),
     overviewRulerLane: vscode.OverviewRulerLane.Center
   });
+  dimDecoration = vscode.window.createTextEditorDecorationType({ opacity: '0.45' });
+  context.subscriptions.push(dimDecoration);
   tokenDecoration = vscode.window.createTextEditorDecorationType({
     backgroundColor: new vscode.ThemeColor('editor.findMatchBackground'),
     border: '1px solid', borderColor: new vscode.ThemeColor('editor.findMatchBorder')
@@ -335,23 +384,18 @@ function activate(context) {
     const key = docPathKey(document);
     const byUser = event.kind === vscode.TextEditorSelectionChangeKind.Mouse || event.kind === vscode.TextEditorSelectionChangeKind.Keyboard;
     clearTimeout(syncTimer);
-    syncTimer = setTimeout(() => {
-      if (byUser && config().get('followCursor', true)) {
-        const fn = functionForLine(analysis, key, line);
-        if (fn && (!panelState || panelState.result !== fn || panelState.stale)) {
-          showAssembly(fn, analysis);
-          setTimeout(() => syncAsmHighlight(analysis, key, line), 200);
-          return;
-        }
-      }
-      syncAsmHighlight(analysis, key, line);
-    }, 50);
+    const fn = byUser && outputPanel && config().get('followCursor', true) ? functionForLine(analysis, key, line) : undefined;
+    if (fn && (!panelState || panelState.result !== fn || panelState.stale)) {
+      // Switching function: coalesce fast cursor moves, then render and highlight (messages keep their order).
+      syncTimer = setTimeout(() => { showAssembly(fn, analysis); syncAsmHighlight(analysis, key, line); }, 30);
+      return;
+    }
+    syncAsmHighlight(analysis, key, line);
   }));
 
   context.subscriptions.push(vscode.commands.registerCommand('asmLens.analyzeFile', async (uri) => {
-    const editor = vscode.window.activeTextEditor;
-    const document = uri ? await vscode.workspace.openTextDocument(uri) : editor && editor.document;
-    if (!document) return vscode.window.showWarningMessage('Open a C/C++ file first.');
+    const document = uri ? await vscode.workspace.openTextDocument(uri) : currentSourceDocument();
+    if (!document) return vscode.window.showWarningMessage('Asm Lens: open a source file first.');
     await analyzeDocument(document);
   }));
 
@@ -362,27 +406,41 @@ function activate(context) {
   statusItem = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Right, 100);
   statusItem.command = 'asmLens.selectCompiler';
   context.subscriptions.push(statusItem);
-  context.subscriptions.push(vscode.window.onDidChangeActiveTextEditor(() => refreshStatusBar()));
+  context.subscriptions.push(vscode.window.onDidChangeActiveTextEditor(editor => {
+    if (editor && LANGS.includes(editor.document.languageId)) lastSourceDocument = editor.document;
+    refreshStatusBar();
+  }));
   refreshStatusBar();
 
-  const onConfigChanged = () => { lastAnalysis.clear(); codeLensEmitter?.fire(); refreshStatusBar(); };
+  const onConfigChanged = () => { lastAnalysis.clear(); loggedConfigProblems.clear(); codeLensEmitter?.fire(); refreshStatusBar(); };
   if (vscode.workspace.createFileSystemWatcher) {
     const watcher = vscode.workspace.createFileSystemWatcher('**/{.asm-lens.json,.vscode/asm-lens.json}');
     watcher.onDidChange(onConfigChanged); watcher.onDidCreate(onConfigChanged); watcher.onDidDelete(onConfigChanged);
     context.subscriptions.push(watcher);
   }
-  context.subscriptions.push(vscode.workspace.onDidChangeConfiguration(e => { if (e.affectsConfiguration('asmLens')) onConfigChanged(); }));
+  // Settings that change what is compiled discard the results; display settings only redraw.
+  const COMPILE_SETTINGS = ['baseUrl', 'compilerId', 'compilerName', 'flags', 'language', 'includePaths', 'maxIncludeFiles', 'skipFailingFunctions', 'maxRecoveryAttempts', 'stubFailingHeaders', 'mode', 'localCompiler', 'compileCommands'];
+  context.subscriptions.push(vscode.workspace.onDidChangeConfiguration(e => {
+    if (!e.affectsConfiguration('asmLens')) return;
+    if (COMPILE_SETTINGS.some(k => e.affectsConfiguration(`asmLens.${k}`))) return onConfigChanged();
+    codeLensEmitter?.fire();
+    if (panelState && outputPanel) showAssembly(panelState.result, panelState.analysis, { reveal: false });
+  }));
 
   context.subscriptions.push(vscode.commands.registerCommand('asmLens.selectCompiler', async () => {
-    const editor = vscode.window.activeTextEditor;
-    const document = editor && LANGS.includes(editor.document.languageId) ? editor.document : undefined;
-    const settings = document ? await resolveSettings(document) : undefined;
+    // The file the choice is for: the active editor, or the last source file
+    // when the assembly view (or another panel) has the focus.
+    const document = currentSourceDocument();
+    if (!document) return vscode.window.showInformationMessage('Asm Lens: open a source file first; compilers are chosen per language.');
+    const settings = await resolveSettings(document);
+    const other = settings.lang && settings.lang.family !== 'c' ? settings.lang : undefined;
+    const docLang = other ? other.id : (document.languageId === 'c' ? 'c' : 'c++');
     const BROWSE = { label: '$(search) Browse all Compiler Explorer compilers…', browse: true };
     let picked;
-    if (settings?.configFile && settings.compilers.length) {
+    if (settings.configFile && settings.compilers.length) {
       const items = settings.compilers.map((c, i) => ({
         label: c.name || c.id,
-        description: `${c.id}${i === 0 ? ' · first in config' : ''}${c.id === settings.active.id ? ' · active' : ''}`,
+        description: `${c.id}${i === 0 ? ' · first in config' : ''}${c.id === settings.active.id ? ' · active' : ''}${(c.mode || settings.mode) === 'local' ? ' · local' : ''}`,
         detail: c.flags,
         compiler: c
       }));
@@ -390,12 +448,10 @@ function activate(context) {
       if (!picked) return;
     } else picked = BROWSE;
     try {
-      let chosen = picked.compiler;
-      let browsed = false;
+      let chosen;
       if (picked.browse) {
-        const baseUrl = settings?.baseUrl || config().get('baseUrl', 'https://godbolt.org').replace(/\/$/, '');
-        const lang = settings?.language || config().get('language', 'c++');
-        const response = await fetch(`${baseUrl}/api/compilers/${encodeURIComponent(lang)}`, { headers: { Accept: 'application/json' } });
+        const baseUrl = settings.baseUrl || config().get('baseUrl', 'https://godbolt.org').replace(/\/$/, '');
+        const response = await fetch(`${baseUrl}/api/compilers/${encodeURIComponent(settings.language)}`, { headers: { Accept: 'application/json' } });
         if (!response.ok) throw new Error(`Compiler list request failed: HTTP ${response.status}`);
         const compilers = await response.json();
         const selected = await vscode.window.showQuickPick(compilers.map(c => ({
@@ -405,27 +461,43 @@ function activate(context) {
           compiler: c
         })), { placeHolder: 'Choose a Compiler Explorer compiler (the id can be copied into .asm-lens.json)', matchOnDescription: true });
         if (!selected) return;
-        chosen = { id: selected.compiler.id, name: selected.compiler.name || selected.compiler.id };
-        browsed = true;
-      }
-      const other = settings?.lang && settings.lang.family !== 'c' ? settings.lang : undefined;
-      if (other) {
-        await extContext.workspaceState.update(`asmLens.activeCompiler.${other.id}`, { id: chosen.id, name: chosen.name, browsed });
-      } else if (settings?.configFile) {
-        await extContext.workspaceState.update('asmLens.activeCompiler', { id: chosen.id, name: chosen.name, browsed });
+        // A compiler from Compiler Explorer compiles there, even when the project is in local mode.
+        chosen = { id: selected.compiler.id, name: selected.compiler.name || selected.compiler.id, browsed: true, mode: 'remote', language: docLang };
       } else {
-        await config().update('compilerId', chosen.id, vscode.ConfigurationTarget.Global);
-        await config().update('compilerName', chosen.name || chosen.id, vscode.ConfigurationTarget.Global);
+        chosen = { id: picked.compiler.id, name: picked.compiler.name || picked.compiler.id, browsed: false };
       }
-      const hadAnalysis = document && analysisFor(document);
+      if (other) {
+        await extContext.workspaceState.update(`asmLens.activeCompiler.${other.id}`, chosen);
+      } else if (settings.configFile) {
+        await extContext.workspaceState.update('asmLens.activeCompiler', chosen);
+      } else {
+        await updateSetting('compilerId', chosen.id, document);
+        await updateSetting('compilerName', chosen.name, document);
+        if (chosen.mode === 'remote' && settings.mode === 'local') await updateSetting('mode', 'remote', document);
+      }
+      const hadAnalysis = analysisFor(document);
       lastAnalysis.clear();
       codeLensEmitter?.fire();
       await refreshStatusBar();
-      vscode.window.showInformationMessage(`Asm Lens compiler set to ${chosen.name || chosen.id}.`);
+      const now = await resolveSettings(document);
+      vscode.window.showInformationMessage(`Asm Lens compiler set to ${chosen.name}${now.mode === 'local' ? ' (local)' : ' (Compiler Explorer)'}.`);
       if (hadAnalysis) await analyzeDocument(document);
     } catch (e) {
       vscode.window.showErrorMessage(`Asm Lens could not load compilers: ${e.message}`);
     }
+  }));
+
+  context.subscriptions.push(vscode.commands.registerCommand('asmLens.reloadCompileCommands', async () => {
+    compileCommands.reload();
+    const document = currentSourceDocument();
+    const resolved = document ? await resolveSettings(document) : undefined;
+    if (!resolved || !resolved.compileCommands || !resolved.compileCommands.length) {
+      return vscode.window.showInformationMessage('Asm Lens: no compile_commands.json is configured ("compileCommands" in .asm-lens.json, or the asmLens.compileCommands setting).');
+    }
+    const db = await compileCommands.loadDatabases(resolved.compileCommands);
+    for (const e of db.errors) outputChannel.appendLine(`compile_commands: ${e}`);
+    vscode.window.showInformationMessage(`Asm Lens: loaded ${db.entries.length} entries from ${resolved.compileCommands.map(f => path.basename(path.dirname(f)) + '/' + path.basename(f)).join(', ')}${db.errors.length ? ' (with errors; see the Asm Lens output)' : ''}.`);
+    if (document && analysisFor(document) && resolved.mode === 'local') await analyzeDocument(document);
   }));
 
   context.subscriptions.push(vscode.commands.registerCommand('asmLens.openConfig', async () => {
@@ -482,7 +554,13 @@ function activate(context) {
     for (const analysis of lastAnalysis.values()) {
       if (analysis.rootKey === fileKey(event.document) || analysis.deps.has(key)) { applyEdits(analysis, key, event.contentChanges); changed = true; }
     }
-    if (panelState && panelState.analysis.deps.has(key)) { panelState.stale = true; clearSourceColors(); clearSourceHighlight(); }
+    if (panelState && panelState.analysis.deps.has(key)) {
+      // The panel's line numbers moved with the edit: send them again (cheap) so hovering stays correct.
+      panelState.stale = true;
+      clearSourceHighlight();
+      clearTimeout(panelRefreshTimer);
+      panelRefreshTimer = setTimeout(() => { if (panelState && outputPanel) showAssembly(panelState.result, panelState.analysis, { reveal: false }); }, 150);
+    }
     if (reanalyzeMode() === 'edit' && LANGS.includes(event.document.languageId)) {
       const target = analysisToUpdate(event.document);
       if (target) {
@@ -584,14 +662,23 @@ function flattenSymbols(symbols) {
 
 // Merge language-server symbols with a source scan. Some C/C++ providers return
 // prototypes but omit definitions (e.g. `main`), or return nothing while indexing.
+// Declarations (prototypes) are left out: they have no code. A function found
+// by the scan is added unless a language-server symbol covers it.
 function sourceFunctionsOf(document, tree) {
-  const symbolFunctions = flattenSymbols(tree || []).filter(isFunctionSymbol);
+  const symbolFunctions = flattenSymbols(tree || []).filter(isFunctionSymbol).filter(s => !isPrototype(document, s));
   const functions = [...symbolFunctions];
-  const knownNames = new Set(symbolFunctions.map(s => normalizeName(s.name)));
   for (const guessed of guessFunctionSymbols(document)) {
-    if (!knownNames.has(normalizeName(guessed.name))) functions.push(guessed);
+    const covered = symbolFunctions.some(s => s.range && s.range.start.line <= guessed.selectionRange.start.line && guessed.selectionRange.start.line <= s.range.end.line);
+    if (!covered) functions.push(guessed);
   }
   return functions;
+}
+
+function isPrototype(document, symbol) {
+  if (!symbol.range || typeof document.getText !== 'function') return false;
+  let text;
+  try { text = document.getText(symbol.range); } catch (_) { return false; }
+  return typeof text === 'string' && !text.includes('{') && /\)[^()]*;\s*$/.test(text);
 }
 
 // Line of the `}` that closes the body opened at or after `startLine` (masked text, so
@@ -614,9 +701,9 @@ function findBodyEndLine(maskedLines, startLine) {
 const guessCache = new WeakMap();
 function guessFunctionSymbols(document) {
   const hit = guessCache.get(document);
-  if (hit && hit.version === document.version && hit.text === document.getText()) return hit.symbols;
+  if (hit && hit.version === document.version) return hit.symbols;
   const symbols = scanFunctionSymbols(document);
-  guessCache.set(document, { version: document.version, text: document.getText(), symbols });
+  guessCache.set(document, { version: document.version, symbols });
   return symbols;
 }
 
@@ -677,7 +764,7 @@ function isFunctionSymbol(s) {
 
 // Which emitted function holds the instructions for `line` of file `key`.
 function functionForLine(analysis, key, line) {
-  const users = analysis.functions.filter(f => f.instructionRows.some(r => r.ref && r.ref.key === key && r.ref.line === line));
+  const users = [...new Set((analysis.lineIndex.get(key)?.get(line) || []).map(e => e.fn).filter(Boolean))];
   if (users.length) {
     const own = key === analysis.rootPathKey
       ? users.find(f => f.sourceRange && f.sourceRange.start.line <= line && line <= f.sourceRange.end.line)
@@ -808,9 +895,9 @@ function bracketsBalanced(s) {
 // Asks for template arguments for the template at `line` and compiles the file
 // with that instantiation added (after its last line, so line numbers stay).
 async function instantiateTemplate(uri, line) {
-  const editor = vscode.window.activeTextEditor;
-  const document = uri ? await vscode.workspace.openTextDocument(uri) : editor?.document;
+  const document = uri ? await vscode.workspace.openTextDocument(uri) : currentSourceDocument();
   if (!document) return;
+  const editor = (vscode.window.visibleTextEditors || []).find(e => e.document === document);
   if (!/cpp/.test(document.languageId)) return vscode.window.showInformationMessage('Asm Lens: templates can be instantiated in C++ files only.');
   const at = Number.isInteger(line) ? line : editor?.selection?.active?.line ?? 0;
   const target = scan.templateTargetAt(document.getText(), at);
@@ -840,7 +927,7 @@ async function instantiateTemplate(uri, line) {
 }
 
 async function manageInstantiations(uri) {
-  const document = uri ? await vscode.workspace.openTextDocument(uri) : vscode.window.activeTextEditor?.document;
+  const document = uri ? await vscode.workspace.openTextDocument(uri) : currentSourceDocument();
   if (!document) return;
   const list = instantiationsFor(document);
   if (!list.length) return vscode.window.showInformationMessage('Asm Lens: no template instantiations for this file. Click "Instantiate…" above a template to add one.');
@@ -954,6 +1041,7 @@ function setBusyStatus(message) {
 
 async function analyzeDocument(document, { auto = false } = {}) {
   const key = fileKey(document);
+  if (auto && Date.now() < rateLimitedUntil) return;
   if (analysisBusy.has(key)) {
     if (auto) runningJobs.get(key)?.cancel('rerun');
     return;
@@ -991,7 +1079,8 @@ async function runAnalysis(document) {
     if (resolved.lang && resolved.lang.family !== 'c') return await analyzeOtherLanguage(document, resolved, settings);
     if (resolved.mode === 'local') return await analyzeLocal(document, resolved, settings);
     const { baseUrl, language } = resolved;
-    const flags = [resolved.flags, ...resolved.defines.map(d => `-D${d}`), resolved.extraFlags].filter(Boolean).join(' ');
+    // The syntax flag is Compiler Explorer's job (filters.intel), per compiler: -masm=intel would break MSVC and non-x86 compilers.
+    const { flags, syntax } = flagsLib.stripSyntaxFlags([resolved.flags, ...resolved.defines.map(d => `-D${d}`), resolved.extraFlags].filter(Boolean).join(' '));
     const compilerId = resolved.active.id;
     const timeoutMs = settings.get('requestTimeoutMs', 30000);
     // MSVC does not know __attribute__((used)), so headers are compiled as they are.
@@ -1005,15 +1094,16 @@ async function runAnalysis(document) {
     const maxAttempts = Math.max(1, Number(settings.get('maxRecoveryAttempts', 12)));
     const recoverErrors = settings.get('skipFailingFunctions', true);
     const opts = {
-      baseUrl, compilerId, language, timeoutMs, flags, includeBundle, maxAttempts, recoverErrors, rootFile: document.fileName,
-      instFirstLine: prepared.firstLine, original: prepared.plain
+      baseUrl, compilerId, language, timeoutMs, flags, syntax, includeBundle, maxAttempts, recoverErrors, rootFile: document.fileName,
+      instFirstLine: prepared.firstLine, instCount: prepared.instCount, original: prepared.plain
     };
     let compiled;
     if (prepared.kept !== undefined) {
       try { compiled = await compileWithRecovery({ ...opts, source: prepared.kept }); }
       catch (e) {
-        if (e.name === 'AbortError') throw e;
-        outputChannel.appendLine('  header: retrying without __attribute__((used))');
+        // Cancelled, timed out or rate-limited: compiling the plain text would not help.
+        if (e.name === 'AbortError' || e.name === 'Cancelled' || Date.now() < rateLimitedUntil) throw e;
+        outputChannel.appendLine(`  header: compiling it again without ${msvc ? 'the lines that keep its functions' : '__attribute__((used))'}`);
       }
     }
     if (!compiled) compiled = await compileWithRecovery({ ...opts, source: prepared.plain });
@@ -1048,6 +1138,7 @@ async function runAnalysis(document) {
     if (includeBundle.unresolved.length) notes.push(`${includeBundle.unresolved.length} quoted include(s) not found`);
     if (compiled.stubbed.length) notes.push(`${compiled.stubbed.length} header(s) replaced by empty files`);
     if (compiled.skipped.length) notes.push(`${compiled.skipped.length} function/declaration(s) skipped because they do not compile`);
+    if (compiled.removedFlags.length) notes.push(`flags the compiler does not accept were left out: ${compiled.removedFlags.join(' ')}`);
     if (includeBundle.truncated) notes.push(`include upload limited to ${includeBundle.files.length} files`);
     outputChannel.appendLine(`Compiled ${document.fileName} with ${compilerId} ${effectiveFlags}; sent ${includeBundle.pathMap.length} local header file(s); found ${functions.length} emitted function(s).${notes.length ? ' ' + notes.join('; ') + '.' : ''}`);
     for (const d of includeBundle.autoDirs) outputChannel.appendLine(`  auto-detected include directory: ${d}`);
@@ -1080,19 +1171,25 @@ function reportHeaderWithoutCode(document) {
 }
 
 // The text to compile for a C/C++ file. A header compiled on its own gets its
-// functions marked __attribute__((used)) (`kept`, with `plain` as the fallback);
-// requested template instantiations are appended after the last line.
+// functions kept: marked __attribute__((used)) (`keep`), or, for compilers
+// without it (MSVC), referenced by lines that take their address. `kept` is
+// that text and `plain` the fallback. Requested template instantiations, then
+// those lines, come after the file's last line, from `firstLine` on (-1: none).
 function prepareCSource(document, { keep = true } = {}) {
   const original = document.getText();
   const isHeader = HEADER_RE.test(document.fileName);
   const insts = /cpp/.test(document.languageId) ? instantiationsFor(document) : [];
   const withInsts = text => scan.appendInstantiations(text, insts).text;
-  return {
-    isHeader,
-    firstLine: scan.appendInstantiations(original, insts).firstLine,
-    kept: isHeader && keep ? withInsts(keepHeaderFunctions(original)) : undefined,
-    plain: withInsts(original)
-  };
+  const plain = withInsts(original);
+  let kept;
+  if (isHeader && keep) kept = withInsts(keepHeaderFunctions(original));
+  else if (isHeader) {
+    const lines = scan.keepByAddress(original, { c: document.languageId === 'c' });
+    if (lines.length) kept = `${plain.endsWith('\n') ? plain : `${plain}\n`}${lines.join('\n')}\n`;
+  }
+  const base = original.endsWith('\n') ? original : `${original}\n`;
+  const appended = insts.length || (kept !== undefined && !keep);
+  return { isHeader, firstLine: appended ? (base.match(/\n/g) || []).length : -1, instCount: insts.length, kept, plain };
 }
 
 // Undoes __attribute__((used)) on the main-file lines the compiler complains about.
@@ -1133,7 +1230,7 @@ async function recordAnalysis(document, o) {
   let deps = o.deps;
   if (!deps) { deps = new Set([rootPathKey]); for (const f of functions) for (const k of f.fileKeys) deps.add(k); }
   let paths = o.paths;
-  if (!paths) { paths = new Map([[rootPathKey, document.uri.fsPath]]); for (const k of deps) if (k !== rootPathKey) paths.set(k, k); }
+  if (!paths) { paths = new Map([[rootPathKey, document.uri.fsPath]]); for (const k of deps) if (k !== rootPathKey) paths.set(k, o.resolveRef?.pathOf?.get(k) || k); }
   lastStamp = Math.max(Date.now(), lastStamp + 1);
   const result = {
     functions: matched,
@@ -1257,18 +1354,82 @@ function errorsOnly(err) {
   return (lines || err).slice(0, 1800);
 }
 
+// How to compile a C/C++ file locally: compiler, folder to run it in, flags
+// (without syntax flags) and where they came from. The entry of
+// compile_commands.json when one fits (the file's own, that of a file including
+// it, or one in the nearest folder), else the settings.
+async function localCompilePlan(document, resolved, baseDir) {
+  const fileDir = path.dirname(document.uri.fsPath);
+  if (resolved.compileCommands && resolved.compileCommands.length) {
+    const db = await compileCommands.loadDatabases(resolved.compileCommands);
+    for (const e of db.errors) outputChannel.appendLine(`compile_commands: ${e}`);
+    const match = await compileCommands.entryFor(db, document.uri.fsPath, { includedBy: includersOf(document) });
+    if (match) {
+      const { args, syntax } = flagsLib.stripSyntaxArgs([...flagsLib.compileFlagsOf(match.entry), ...splitArgs(resolved.activeExtraFlags)]);
+      return {
+        compiler: flagsLib.entryCompiler(match.entry),
+        cwd: match.entry.directory,
+        args, syntax, fromDatabase: true,
+        display: 'compile_commands.json',
+        description: `compile_commands.json: ${match.reason} (${match.entry.file}, from ${match.entry.database})`
+      };
+    }
+    outputChannel.appendLine(`compile_commands: no entry for ${document.fileName}; using the settings.`);
+  }
+  const incDirs = (resolved.includePaths || []).map(p => p && typeof p === 'object' ? p.dir : (path.isAbsolute(p) ? p : path.resolve(baseDir, p)));
+  const flags = [resolved.flags, ...resolved.defines.map(d => `-D${d}`), resolved.extraFlags].filter(Boolean).join(' ');
+  const { args, syntax } = flagsLib.stripSyntaxArgs([...splitArgs(flags), ...incDirs.map(d => `-I${d}`)]);
+  return {
+    compiler: resolved.localCompiler, cwd: fileDir, args, syntax, fromDatabase: false,
+    display: flagsLib.stripSyntaxFlags(flags).flags,
+    description: resolved.configFile ? `settings from ${resolved.configFile}` : 'VS Code settings'
+  };
+}
+
+// Analyzed files that include `document` (newest first): their compile_commands entries fit a header.
+function includersOf(document) {
+  const key = docPathKey(document);
+  return [...analyzedFiles.entries()]
+    .filter(([rootKey, e]) => rootKey !== fileKey(document) && e.deps.has(key) && e.uri.scheme === 'file')
+    .sort((a, b) => b[1].stamp - a[1].stamp)
+    .map(([, e]) => e.uri.fsPath);
+}
+
+// What a local compiler is (gcc, clang, msvc or unknown) and what it targets. Cached per command.
+const compilerInfoCache = new Map();
+async function compilerInfo(command, cwd, timeoutMs) {
+  const key = `${command}\n${/[\\/]/.test(command) ? '' : cwd}`;
+  if (!compilerInfoCache.has(key)) {
+    const run = args => runProcess(command, args, { cwd, timeoutMs }).then(r => `${r.stdout}\n${r.stderr}`, e => { if (e.code === 'ENOENT' || e.name === 'Cancelled') throw e; return ''; });
+    const version = await run(['--version']);
+    const kind = flagsLib.compilerKind(version, command);
+    const target = kind === 'gcc' || kind === 'clang' ? (await run(['-dumpmachine'])).trim().split(/\r?\n/)[0] : '';
+    compilerInfoCache.set(key, { kind, target, version: version.trim().split(/\r?\n/)[0] });
+  }
+  return compilerInfoCache.get(key);
+}
+
+function quoteArg(a) { return /[\s"']/.test(a) ? `"${a.replace(/"/g, '\\"')}"` : a; }
+
 async function analyzeLocal(document, resolved, settings) {
   if (document.uri.scheme !== 'file') throw new Error('Local mode needs a file that is saved on disk.');
   const rootPathKey = docPathKey(document);
-  const cwd = path.dirname(document.uri.fsPath);
-  const baseDir = vscode.workspace.getWorkspaceFolder?.(document.uri)?.uri.fsPath || cwd;
-  const compiler = resolved.localCompiler;
+  const fileDir = path.dirname(document.uri.fsPath);
+  const baseDir = vscode.workspace.getWorkspaceFolder?.(document.uri)?.uri.fsPath || fileDir;
   const timeoutMs = settings.get('requestTimeoutMs', 30000);
   const maxAttempts = Math.max(1, Number(settings.get('maxRecoveryAttempts', 12)));
   const recoverErrors = settings.get('skipFailingFunctions', true);
-  const incDirs = (resolved.includePaths || []).map(p => p && typeof p === 'object' ? p.dir : (path.isAbsolute(p) ? p : path.resolve(baseDir, p)));
-  const flags = [resolved.flags, ...resolved.defines.map(d => `-D${d}`), resolved.extraFlags].filter(Boolean).join(' ');
   const lang = resolved.language === 'c' ? 'c' : 'c++';
+  const plan = await localCompilePlan(document, resolved, baseDir);
+  const { compiler, cwd } = plan;
+  const info = await compilerInfo(compiler, cwd, timeoutMs);
+  if (info.kind === 'msvc') {
+    throw new Error(`${path.basename(compiler)} is an MSVC-style compiler, which local mode does not support (it needs a GCC- or Clang-compatible one). Use remote mode with an MSVC compiler from Compiler Explorer, or a MinGW/Clang build.`);
+  }
+  // Intel syntax for x86 targets, in the form this compiler understands; nothing for other targets.
+  let ownFlags = [...flagsLib.syntaxArgs(info.kind, flagsLib.targetOf(plan.args, info.target), plan.syntax), '-fdiagnostics-color=never'];
+  let baseArgs = plan.args;
+  const removedFlags = [];
 
   // Empty stand-ins for headers that are not found anywhere.
   const stubDir = path.join(os.tmpdir(), 'asm-lens-stubs-' + crypto.createHash('md5').update(document.uri.fsPath).digest('hex').slice(0, 10));
@@ -1284,17 +1445,30 @@ async function analyzeLocal(document, resolved, settings) {
   let asm;
   const started = Date.now();
 
+  let args;
   for (let attempt = 1; attempt <= maxAttempts; attempt++) {
-    const args = [
-      ...splitArgs(flags), ...incDirs.map(d => `-I${d}`), '-iquote', cwd,
+    // The editor text goes in through stdin, so quoted includes are looked up next to the file with -iquote.
+    args = [
+      ...baseArgs, ...ownFlags, '-iquote', fileDir,
       ...(stubbed.length ? [`-I${stubDir}`] : []),
-      '-S', '-g', '-fdiagnostics-color=never', '-x', lang, '-o', '-', '-'
+      '-S', '-g', '-o', '-', ...(plan.fromDatabase ? ['-w'] : []), '-x', lang, '-'
     ];
     report(attempt === 1 ? `compiling with ${path.basename(compiler)}…` : `compiling again (${attempt}/${maxAttempts}), working around errors…`);
     const r = await runProcess(compiler, args, { cwd, input: source, timeoutMs });
     if (r.code === 0) { asm = r.stdout; break; }
     const err = r.stderr.replace(ANSI_RE, '');
     let progressed = false;
+    // A flag the compiler does not accept -> leave it out.
+    const rejected = flagsLib.rejectedFlagsFrom(err);
+    if (rejected.length) {
+      const a = flagsLib.removeArgs(baseArgs, rejected), b = flagsLib.removeArgs(ownFlags, rejected);
+      if (a.removed.length || b.removed.length) {
+        baseArgs = a.args; ownFlags = b.args;
+        removedFlags.push(...a.removed, ...b.removed);
+        outputChannel.appendLine(`  left out flags the compiler does not accept: ${[...a.removed, ...b.removed].join(' ')}`);
+        continue;
+      }
+    }
     for (const name of missingIncludesFrom(err)) {
       const stub = stubFilename(name);
       if (!stub || stubbed.includes(name)) continue;
@@ -1311,7 +1485,7 @@ async function analyzeLocal(document, resolved, settings) {
         if (failedLines.has(l)) continue;
         failedLines.add(l);
         source = blankLine(source, l);
-        failedInstantiations.push({ index: l - prepared.firstLine, message });
+        if (l - prepared.firstLine < prepared.instCount) failedInstantiations.push({ index: l - prepared.firstLine, message });
         progressed = true;
       }
     }
@@ -1338,7 +1512,8 @@ async function analyzeLocal(document, resolved, settings) {
       continue;
     }
     if (!progressed || attempt === maxAttempts) {
-      outputChannel.appendLine(`Local compile command: ${compiler} ${args.join(' ')}  (cwd ${cwd})`);
+      outputChannel.appendLine(`Local compile command (in ${cwd}): ${[compiler, ...args].map(quoteArg).join(' ')}`);
+      outputChannel.appendLine(`  flags from: ${plan.description}`);
       outputChannel.appendLine('--- full compiler output ---\n' + err);
       throw new Error(errorsOnly(err));
     }
@@ -1355,16 +1530,19 @@ async function analyzeLocal(document, resolved, settings) {
   const rows = localAsmToRows(asm, cwd);
   const result = await recordAnalysis(document, {
     rows,
-    resolveRef: makeLocalRefResolver(rootPathKey, cwd, [], await realDirsFor([cwd, baseDir])),
+    resolveRef: makeLocalRefResolver(rootPathKey, cwd, [], await realDirsFor([cwd, fileDir, baseDir])),
     compilerId: compiler,
     compilerLabel: `${path.basename(compiler)} (local)`,
-    flags,
+    flags: plan.display,
     configFile: resolved.configFile,
     skipped: skipped.filter(k => prepared.firstLine < 0 || k.startLine < prepared.firstLine),
     stubbed
   });
   const ms = Date.now() - started;
-  outputChannel.appendLine(`Local compile of ${document.fileName} with ${compiler} ${flags} took ${ms} ms; found ${result.functions.length} emitted function(s).`);
+  outputChannel.appendLine(`Local compile of ${document.fileName} took ${ms} ms; found ${result.functions.length} emitted function(s).`);
+  outputChannel.appendLine(`  flags from: ${plan.description}`);
+  outputChannel.appendLine(`  command (in ${cwd}): ${[compiler, ...args].map(quoteArg).join(' ')}`);
+  if (removedFlags.length) outputChannel.appendLine(`  left out (the compiler does not accept them): ${removedFlags.join(' ')}`);
   for (const n of stubbed) outputChannel.appendLine(`  missing header treated as empty: ${n}`);
   for (const k of skipped) outputChannel.appendLine(`  skipped (does not compile): ${k.name || '(declaration)'} at line ${k.startLine + 1}-${k.endLine + 1}`);
   await dropFailedInstantiations(document, failedInstantiations);
@@ -1387,7 +1565,7 @@ async function analyzeOtherLanguage(document, resolved, settings) {
   const timeoutMs = settings.get('requestTimeoutMs', 30000);
   const rootPathKey = docPathKey(document);
   const required = lang.requiredFlags && !String(resolved.flags).includes(lang.requiredFlags) ? lang.requiredFlags : '';
-  const flags = [resolved.flags, resolved.extraFlags, required].filter(Boolean).join(' ');
+  let flags = [resolved.flags, resolved.extraFlags, required].filter(Boolean).join(' ');
   const started = Date.now();
   let rows, resolveRef, compilerId, compilerLabel;
   if (resolved.mode === 'local') {
@@ -1400,12 +1578,22 @@ async function analyzeOtherLanguage(document, resolved, settings) {
     compilerId = resolved.active.isDefault ? await ceDefaultCompiler(resolved.baseUrl, lang) : resolved.active.id;
     compilerLabel = resolved.active.isDefault ? `${lang.label} ${compilerId}` : resolved.active.name || compilerId;
     report(`compiling with ${compilerId} on ${hostOf(resolved.baseUrl)}…`);
-    const data = await postCompile({ baseUrl: resolved.baseUrl, compilerId, language: lang.id, timeoutMs, source: document.getText(), files: [], flags });
-    if (data.code !== undefined && data.code !== 0) {
+    let { flags: sent, syntax } = flagsLib.stripSyntaxFlags(flags);
+    let data;
+    for (let attempt = 1; ; attempt++) {
+      data = await postCompile({ baseUrl: resolved.baseUrl, compilerId, language: lang.id, timeoutMs, source: document.getText(), files: [], flags: sent, syntax });
+      if (data.code === undefined || data.code === 0) break;
       const err = stderrText(data) || `Compiler exited with code ${data.code}`;
+      const rejected = flagsLib.removeFlags(sent, flagsLib.rejectedFlagsFrom(err));
+      if (rejected.removed.length && attempt < 4) {
+        sent = rejected.flags;
+        outputChannel.appendLine(`  left out flags the compiler does not accept: ${rejected.removed.join(' ')}`);
+        continue;
+      }
       outputChannel.appendLine(`--- ${compilerId} output ---\n${err}`);
       throw new Error(err.slice(0, 1800));
     }
+    flags = sent;
     rows = languages.remoteRows(lang.key, Array.isArray(data.asm) ? data.asm : []);
     resolveRef = makeRefResolver(rootPathKey, []);
   }
@@ -1486,11 +1674,14 @@ function hostOf(url) { try { return new URL(url).host; } catch (_) { return url;
 // Replies for identical requests (same code, headers, compiler and flags), so
 // analyzing unchanged code again is instant. Kept in memory for the session.
 const replyCache = new Map();
+// After HTTP 429 (too many requests), automatic re-analyses wait until this time.
+let rateLimitedUntil = 0;
 const REPLY_CACHE_SIZE = 40;
 
-async function postCompile({ baseUrl, compilerId, language, timeoutMs, source, files, flags }) {
+async function postCompile({ baseUrl, compilerId, language, timeoutMs, source, files, flags, syntax = 'intel' }) {
   const url = `${baseUrl}/api/compiler/${encodeURIComponent(compilerId)}/compile`;
-  const body = JSON.stringify({ source, lang: language, ...(files.length ? { files } : {}), options: { userArguments: flags, filters: CE_FILTERS } });
+  const filters = { ...CE_FILTERS, intel: syntax !== 'att' };
+  const body = JSON.stringify({ source, lang: language, ...(files.length ? { files } : {}), options: { userArguments: flags, filters } });
   const cacheKey = crypto.createHash('sha1').update(`${url}\n${body}`).digest('hex');
   if (replyCache.has(cacheKey)) {
     const cached = replyCache.get(cacheKey);
@@ -1516,14 +1707,26 @@ async function postCompile({ baseUrl, compilerId, language, timeoutMs, source, f
     if (job?.cancelled) throw new Cancelled();
     throw e;
   } finally { clearTimeout(timeout); job?.aborts.delete(controller); }
-  if (!response.ok) throw new Error(`Compiler Explorer returned HTTP ${response.status}. Check the compiler ID and network connection.`);
+  if (response.status === 429) {
+    rateLimitedUntil = Date.now() + 30000;
+    throw new Error(`${hostOf(baseUrl)} is limiting how often it compiles (HTTP 429). Automatic re-analysis pauses for 30 seconds; analyze again in a moment.`);
+  }
+  if (!response.ok) {
+    throw new Error(`Compiler Explorer returned HTTP ${response.status} for compiler "${compilerId}"${response.status === 404 ? ' (unknown compiler id? Use Select Compiler → Browse)' : ''}: ${String(text || '').trim().slice(0, 200)}`);
+  }
+  let data;
+  try { data = JSON.parse(text); } catch (_) {
+    throw new Error(`Compiler Explorer sent a reply that is not JSON: ${String(text || '').trim().slice(0, 200)}`);
+  }
   replyCache.set(cacheKey, text);
   if (replyCache.size > REPLY_CACHE_SIZE) replyCache.delete(replyCache.keys().next().value);
-  return JSON.parse(text);
+  return data;
 }
 
+// The compiler's diagnostics. MSVC on Compiler Explorer writes them to stdout, the others to stderr.
 function stderrText(data) {
-  return (data.stderr || []).map(x => x.text || '').join('\n').replace(ANSI_RE, '');
+  const lines = [...(data.stderr || []), ...(data.stdout || [])].map(x => (x && x.text) || '').filter(l => l.trim() && !/^\s*(?:example|<source>)\.\w+\s*$/.test(l));
+  return lines.join('\n').replace(ANSI_RE, '');
 }
 
 const isRemoteMain = f => /^<source>$|^<stdin>$|(^|\/)example\.\w+$/.test(f.replace(/\\/g, '/'));
@@ -1536,6 +1739,7 @@ async function compileWithRecovery(opts) {
   const skipped = [];
   const failedInstantiations = [];
   const failedLines = new Set();
+  const removedFlags = [];
   let source = opts.source;
   let flags = [opts.flags, ...includeBundle.includeFlags].filter(Boolean).join(' ');
   let lastErr = '';
@@ -1544,9 +1748,18 @@ async function compileWithRecovery(opts) {
     const data = await postCompile({ ...opts, source, files, flags });
     if (data.code === undefined || data.code === 0) {
       if (attempt > 1) outputChannel.appendLine(`Compiled after ${attempt - 1} recovery step(s).`);
-      return { data, effectiveFlags: flags, skipped, stubbed, failedInstantiations };
+      return { data, effectiveFlags: flags, skipped, stubbed, failedInstantiations, removedFlags };
     }
     lastErr = stderrText(data) || `Compiler exited with code ${data.code}`;
+
+    // 0. A flag the compiler does not accept (-O2 for cc65, ...) -> leave it out.
+    const rejected = flagsLib.removeFlags(flags, flagsLib.rejectedFlagsFrom(lastErr));
+    if (rejected.removed.length) {
+      flags = rejected.flags;
+      removedFlags.push(...rejected.removed);
+      outputChannel.appendLine(`  left out flags the compiler does not accept: ${rejected.removed.join(' ')}`);
+      continue;
+    }
 
     // 1. Missing include -> empty stand-in so preprocessing can continue.
     let progressed = false;
@@ -1580,7 +1793,7 @@ async function compileWithRecovery(opts) {
       if (failedLines.has(l)) continue;
       failedLines.add(l);
       source = blankLine(source, l);
-      failedInstantiations.push({ index: l - opts.instFirstLine, message });
+      if (l - opts.instFirstLine < (opts.instCount ?? Infinity)) failedInstantiations.push({ index: l - opts.instFirstLine, message });
       progressed = true;
     }
     if (progressed) continue;
@@ -1622,18 +1835,38 @@ async function compileWithRecovery(opts) {
 // ---------------------------------------------------------------------------
 // Assembly panel and highlighting
 
-function showAssembly(result, analysis) {
-  if (!outputPanel) {
-    outputPanel = vscode.window.createWebviewPanel('asmLensAssembly', 'Asm Lens Assembly', { viewColumn: vscode.ViewColumn.Beside, preserveFocus: true }, { enableScripts: true, retainContextWhenHidden: true });
-    outputPanel.onDidDispose(() => {
-      clearSourceHighlight();
-      clearSourceColors();
-      outputPanel = undefined;
-      panelState = undefined;
-    });
-    outputPanel.onDidChangeViewState(e => { if (e.webviewPanel.visible) applySourceColors(); else { clearSourceColors(); clearSourceHighlight(); } });
-    outputPanel.webview.onDidReceiveMessage(handleWebviewMessage);
-  }
+// The assembly view: a webview built once; each function is sent to it as a
+// message and rendered in one DOM update (no page reload when switching).
+let panelReady = false;
+let panelQueue = [];
+let lastRender;
+
+function postToPanel(message) {
+  if (!outputPanel) return;
+  if (panelReady) outputPanel.webview.postMessage(message);
+  else panelQueue.push(message);
+}
+
+function ensurePanel() {
+  if (outputPanel) return;
+  panelReady = false;
+  panelQueue = [];
+  outputPanel = vscode.window.createWebviewPanel('asmLensAssembly', 'Asm Lens Assembly', { viewColumn: vscode.ViewColumn.Beside, preserveFocus: true }, { enableScripts: true, retainContextWhenHidden: true });
+  outputPanel.onDidDispose(() => {
+    clearSourceHighlight();
+    clearSourceColors();
+    outputPanel = undefined;
+    panelState = undefined;
+    lastRender = undefined;
+  });
+  outputPanel.onDidChangeViewState(e => { if (e.webviewPanel.visible) applySourceColors(); else { clearSourceColors(); clearSourceHighlight(); } });
+  outputPanel.webview.onDidReceiveMessage(handleWebviewMessage);
+  outputPanel.webview.html = panelHtml();
+}
+
+function showAssembly(result, analysis, { reveal = true } = {}) {
+  const created = !outputPanel;
+  ensurePanel();
   const displayRows = cleanAssemblyRowsForDisplay(result);
   const fileKeys = [];
   const colorOf = new Map();
@@ -1647,56 +1880,75 @@ function showAssembly(result, analysis) {
       groups.push({ key: row.ref.key, line: row.ref.line, color: colorOf.get(g) });
     }
   }
-  panelState = { analysis, result, fileKeys, groups, stale: false };
-  const colorize = config().get('colorizeLines', true);
+  // "fileIndex:line" of every mapped row, to answer "does this line have instructions here?" at once.
+  const mappedLines = new Set(groups.map(g => `${fileKeys.indexOf(g.key)}:${g.line}`));
+  panelState = { analysis, result, fileKeys, groups, mappedLines, stale: false };
   outputPanel.title = `Assembly: ${result.sourceName || result.name}`;
-  const rowsHtml = displayRows.map(row => {
-    let cls = 'asm-line';
-    let attrs = '';
-    if (row.ref) {
-      attrs = ` data-f="${fileKeys.indexOf(row.ref.key)}" data-l="${row.ref.line}"`;
-      if (row.ref.column !== undefined) attrs += ` data-c="${row.ref.column}"`;
-      if (colorize) cls += ` c${colorOf.get(`${row.ref.key}\n${row.ref.line}`)}`;
-    }
-    return `<span class="${cls}"${attrs}>${escapeHtml(row.text)}</span>`;
-  }).join('\n');
-  const title = escapeHtml(`${result.sourceName || result.name} — ${result.count} instructions`);
-  const meta = escapeHtml(`${analysis.compilerLabel} · ${analysis.compilerId} · ${analysis.flags}`);
+  lastRender = {
+    type: 'render',
+    title: `${result.sourceName || result.name} — ${result.count} instructions`,
+    meta: `${analysis.compilerLabel} · ${analysis.compilerId} · ${analysis.flags}`,
+    noMap: !displayRows.some(r => r.ref),
+    colorize: config().get('colorizeLines', true),
+    rows: displayRows.map(row => row.ref
+      ? { t: row.text, f: fileKeys.indexOf(row.ref.key), l: row.ref.line, c: row.ref.column, k: colorOf.get(`${row.ref.key}\n${row.ref.line}`) }
+      : { t: row.text })
+  };
+  postToPanel(lastRender);
+  // In the column the user put it in; a new panel opens beside the editor.
+  if (reveal && !created && !outputPanel.visible) outputPanel.reveal(undefined, true);
+  applySourceColors();
+}
+
+function panelHtml() {
   const nonce = crypto.randomBytes(16).toString('base64');
   const paletteCss = PALETTE.map((c, i) => `.c${i}{background:${c}}`).join('\n');
-  const noMap = displayRows.some(r => r.ref) ? '' : '<p class="meta">No source mapping is available for this function, so hover highlighting is disabled.</p>';
-  outputPanel.webview.html = `<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+  return `<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
 <meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; script-src 'nonce-${nonce}';">
 <style>
 body{font-family:var(--vscode-font-family);color:var(--vscode-foreground);padding:16px}
-.asm{font-family:var(--vscode-editor-font-family);font-size:var(--vscode-editor-font-size);white-space:pre;overflow:auto;background:var(--vscode-editor-background);padding:12px;border:1px solid var(--vscode-panel-border)}
-.asm-line{display:block;min-height:1em}
+.asm{font-family:var(--vscode-editor-font-family);font-size:var(--vscode-editor-font-size);white-space:pre;background:var(--vscode-editor-background);padding:12px;border:1px solid var(--vscode-panel-border)}
+.asm-line{display:block;min-height:1em;transition:opacity 80ms}
 .asm-line[data-l]{cursor:pointer}
 ${paletteCss}
-.asm-line.hl{background:var(--vscode-editor-findMatchHighlightBackground);outline:1px solid var(--vscode-editor-findMatchBorder, var(--vscode-focusBorder))}
-.asm-line.hl-self{background:var(--vscode-editor-findMatchBackground)}
+.asm.focus .asm-line:not(.hl){opacity:.38}
+.asm-line.hl{background:var(--vscode-editor-wordHighlightStrongBackground,var(--vscode-editor-findMatchHighlightBackground));box-shadow:inset 3px 0 0 var(--vscode-focusBorder)}
+.asm-line.hl-self{background:var(--vscode-editor-findMatchBackground);outline:1px solid var(--vscode-focusBorder)}
 .meta{color:var(--vscode-descriptionForeground);margin-bottom:14px}
-</style></head><body><h2>${title}</h2><div class="meta">${meta}</div>${noMap}<div class="asm">${rowsHtml}</div>
+</style></head><body><h2 id="title"></h2><div class="meta" id="meta"></div><p class="meta" id="nomap" hidden>No source mapping is available for this function, so hover highlighting is disabled.</p><div class="asm" id="asm"></div>
 <script nonce="${nonce}">
 const vscode=acquireVsCodeApi();
-const groups=new Map();
-const mapped=[...document.querySelectorAll('.asm-line[data-l]')];
-const gk=el=>el.dataset.f+':'+el.dataset.l;
-for(const el of mapped){const k=gk(el);if(!groups.has(k))groups.set(k,[]);groups.get(k).push(el);}
-let current='';let leaveTimer;
-function clearMarks(){current='';document.querySelectorAll('.hl,.hl-self').forEach(e=>e.classList.remove('hl','hl-self'));}
-function mark(k,self,scroll){clearMarks();current=k;const els=groups.get(k)||[];els.forEach(e=>e.classList.add('hl'));if(self)self.classList.add('hl-self');if(scroll&&els.length)els[0].scrollIntoView({block:'nearest'});}
-const payload=(type,el)=>({type,file:Number(el.dataset.f),line:Number(el.dataset.l),column:el.dataset.c===undefined?undefined:Number(el.dataset.c)});
-for(const el of mapped){
-  el.addEventListener('mouseenter',()=>{clearTimeout(leaveTimer);const k=gk(el);const same=k===current;mark(k,el,false);if(!same)vscode.postMessage(payload('highlight',el));});
-  el.addEventListener('click',()=>vscode.postMessage(payload('open',el)));
+const box=document.getElementById('asm');
+let groups=new Map(),current='',self=null,leaveTimer;
+const keyOf=el=>el.dataset.f+':'+el.dataset.l;
+function clearMarks(){if(current)for(const e of groups.get(current)||[])e.classList.remove('hl');if(self)self.classList.remove('hl-self');current='';self=null;box.classList.remove('focus');}
+function mark(k,el,scroll){
+  if(k!==current){clearMarks();current=k;for(const e of groups.get(k)||[])e.classList.add('hl');box.classList.add('focus');}
+  if(self!==el){if(self)self.classList.remove('hl-self');self=el;if(el)el.classList.add('hl-self');}
+  if(scroll){const els=groups.get(k)||[];if(els.length){const a=els[0].getBoundingClientRect(),b=els[els.length-1].getBoundingClientRect();if(a.top<0||b.bottom>innerHeight)els[0].scrollIntoView({block:b.bottom-a.top<innerHeight?'center':'start'});}}
 }
-const box=document.querySelector('.asm');
-if(box)box.addEventListener('mouseleave',()=>{leaveTimer=setTimeout(()=>{clearMarks();vscode.postMessage({type:'clearHighlight'});},150);});
-window.addEventListener('message',e=>{const m=e.data||{};if(m.type==='highlightAsm'){const k=m.file+':'+m.line;if(k!==current)mark(k,null,true);}else if(m.type==='clearAsm')clearMarks();});
+function render(m){
+  clearMarks();groups=new Map();
+  document.getElementById('title').textContent=m.title;
+  document.getElementById('meta').textContent=m.meta;
+  document.getElementById('nomap').hidden=!m.noMap;
+  const frag=document.createDocumentFragment();
+  for(const r of m.rows){
+    const el=document.createElement('span');
+    el.className='asm-line'+(m.colorize&&r.k!==undefined?' c'+r.k:'');
+    el.textContent=r.t;
+    if(r.f!==undefined){el.dataset.f=r.f;el.dataset.l=r.l;if(r.c!==undefined&&r.c!==null)el.dataset.c=r.c;const k=r.f+':'+r.l;if(!groups.has(k))groups.set(k,[]);groups.get(k).push(el);}
+    frag.appendChild(el);frag.appendChild(document.createTextNode('\\n'));
+  }
+  box.replaceChildren(frag);
+}
+const payload=(type,el)=>({type,file:Number(el.dataset.f),line:Number(el.dataset.l),column:el.dataset.c===undefined?undefined:Number(el.dataset.c)});
+box.addEventListener('mouseover',e=>{const el=e.target.closest&&e.target.closest('.asm-line[data-l]');if(!el)return;clearTimeout(leaveTimer);const k=keyOf(el);const same=k===current;mark(k,el,false);if(!same)vscode.postMessage(payload('highlight',el));});
+box.addEventListener('click',e=>{const el=e.target.closest&&e.target.closest('.asm-line[data-l]');if(el)vscode.postMessage(payload('open',el));});
+box.addEventListener('mouseleave',()=>{leaveTimer=setTimeout(()=>{clearMarks();vscode.postMessage({type:'clearHighlight'});},120);});
+window.addEventListener('message',e=>{const m=e.data||{};if(m.type==='render')render(m);else if(m.type==='highlightAsm'){const k=m.file+':'+m.line;if(k!==current||self)mark(k,null,true);}else if(m.type==='clearAsm')clearMarks();});
+vscode.postMessage({type:'ready'});
 </script></body></html>`;
-  outputPanel.reveal(vscode.ViewColumn.Beside, true);
-  applySourceColors();
 }
 
 // After an analysis, the open assembly view shows the new code of the same function.
@@ -1705,7 +1957,7 @@ function refreshPanel(analysis) {
   const old = panelState.result;
   const next = analysis.functions.find(f => f.name === old.name)
     || (old.sourceName && analysis.functions.find(f => f.sourceName === old.sourceName && !/\(inlined\)$/.test(old.sourceName)));
-  if (next) showAssembly(next, analysis);
+  if (next) showAssembly(next, analysis, { reveal: false });
 }
 
 // Persistent CE-style coloring: each source line gets the same color as its instructions.
@@ -1729,6 +1981,14 @@ function clearSourceColors() {
 }
 
 function handleWebviewMessage(message) {
+  if (message && message.type === 'ready') {
+    panelReady = true;
+    // A reloaded webview (moved to another window, ...) gets the current function again.
+    const queued = panelQueue.length ? panelQueue : lastRender ? [lastRender] : [];
+    panelQueue = [];
+    for (const m of queued) outputPanel?.webview.postMessage(m);
+    return;
+  }
   if (!message || !panelState) return;
   if (message.type === 'clearHighlight') return clearSourceHighlight();
   if (message.type !== 'highlight' && message.type !== 'open') return;
@@ -1736,13 +1996,17 @@ function handleWebviewMessage(message) {
   if (!key || !Number.isInteger(message.line) || message.line < 0) return;
   const column = Number.isInteger(message.column) ? message.column : undefined;
   if (message.type === 'highlight') {
-    if (config().get('highlightOnHover', true)) highlightSource(key, message.line, column);
+    // Rows of a panel that does not match the edited text yet would point at wrong lines.
+    if (config().get('highlightOnHover', true) && !panelState.stale) highlightSource(key, message.line, column);
     return;
   }
+  // The open document's own URI (exact casing on Windows), else the path the compiler named.
+  const open = (vscode.workspace.textDocuments || []).find(d => d.uri.scheme === 'file' && normPath(d.uri.fsPath) === key);
   const real = panelState.analysis.paths.get(key);
-  if (!real) return;
+  if (!open && !real) return;
   const pos = new vscode.Position(message.line, column || 0);
-  vscode.window.showTextDocument(vscode.Uri.file(real), { selection: new vscode.Range(pos, pos), viewColumn: vscode.ViewColumn.One, preserveFocus: false })
+  const shown = visibleEditorsFor(key)[0] || (lastSourceDocument && vscode.window.visibleTextEditors.find(e => e.document === lastSourceDocument));
+  vscode.window.showTextDocument(open ? open.uri : vscode.Uri.file(real), { selection: new vscode.Range(pos, pos), viewColumn: shown?.viewColumn ?? vscode.ViewColumn.One, preserveFocus: false })
     .then(() => { applySourceColors(); highlightSource(key, message.line, column); }, () => { /* file may have been deleted */ });
 }
 
@@ -1750,10 +2014,12 @@ function visibleEditorsFor(key) {
   return vscode.window.visibleTextEditors.filter(e => e.document.uri.scheme === 'file' && normPath(e.document.uri.fsPath) === key);
 }
 
-// Highlight the whole source line plus, when Compiler Explorer reports a column,
-// the token at that column.
+// Highlights the source line of a hovered instruction (and the token at its
+// column, when the compiler reports one) and dims the other lines of the
+// function, so the part that produced the instruction stands out.
 function highlightSource(key, line, column) {
   clearSourceHighlight();
+  const span = panelState && config().get('dimOtherLines', true) ? sourceSpanOf(panelState.result, panelState.analysis, key) : undefined;
   for (const editor of visibleEditorsFor(key)) {
     const document = editor.document;
     if (line >= document.lineCount) continue;
@@ -1763,13 +2029,32 @@ function highlightSource(key, line, column) {
       const token = document.getWordRangeAtPosition(new vscode.Position(line, column));
       if (token) editor.setDecorations(tokenDecoration, [{ range: token }]);
     }
+    if (span) {
+      const last = Math.min(span.end, document.lineCount - 1);
+      const dim = [];
+      if (span.start < line) dim.push(new vscode.Range(span.start, 0, line - 1, document.lineAt(line - 1).range.end.character));
+      if (line < last) dim.push(new vscode.Range(line + 1, 0, last, document.lineAt(last).range.end.character));
+      editor.setDecorations(dimDecoration, dim);
+    }
     editor.revealRange(range, vscode.TextEditorRevealType.InCenterIfOutsideViewport);
   }
 }
+
+// First and last line of file `key` that the function shown comes from.
+function sourceSpanOf(result, analysis, key) {
+  let start = Infinity, end = -1;
+  if (key === analysis.rootPathKey && result.sourceRange) { start = result.sourceRange.start.line; end = result.sourceRange.end.line; }
+  for (const r of result.instructionRows || []) {
+    if (r.ref && r.ref.key === key) { start = Math.min(start, r.ref.line); end = Math.max(end, r.ref.line); }
+  }
+  return end >= start ? { start, end } : undefined;
+}
+
 function clearSourceHighlight() {
   for (const editor of vscode.window.visibleTextEditors) {
     editor.setDecorations(lineDecoration, []);
     editor.setDecorations(tokenDecoration, []);
+    if (dimDecoration) editor.setDecorations(dimDecoration, []);
   }
 }
 
@@ -1779,8 +2064,8 @@ function syncAsmHighlight(analysis, key, line) {
   if (!outputPanel || !panelState || panelState.stale || panelState.analysis.rootKey !== analysis.rootKey) return;
   if (!config().get('highlightOnHover', true)) return;
   const file = panelState.fileKeys.indexOf(key);
-  const hasRows = file >= 0 && panelState.result.instructionRows.some(r => r.ref && r.ref.key === key && r.ref.line === line);
-  outputPanel.webview.postMessage(hasRows ? { type: 'highlightAsm', file, line } : { type: 'clearAsm' });
+  const hasRows = file >= 0 && panelState.mappedLines.has(`${file}:${line}`);
+  postToPanel(hasRows ? { type: 'highlightAsm', file, line } : { type: 'clearAsm' });
 }
 
 function truncateLines(text, max) {
@@ -2001,9 +2286,6 @@ async function collectLocalIncludes(document, configuredIncludePaths, limits = {
   return { files, includeFlags, pathMap, unresolved, unresolvedAll, autoDirs, truncated, skippedSystem: [...skippedSystem] };
 }
 
-function escapeHtml(s) {
-  return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&#39;');
-}
 function deactivate() { if (outputPanel) outputPanel.dispose(); }
 module.exports = {
   activate, deactivate,

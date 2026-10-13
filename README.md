@@ -17,8 +17,9 @@ Go, Python, Zig, Swift, D and Fortran are supported too.
 - **Assembly view** next to the editor. Click a count to open it; it follows the cursor
   from function to function.
 - **Two-way highlighting**, like Compiler Explorer: each source line and its instructions
-  share a color. Hover a source line to highlight its instructions; hover an instruction
-  to highlight its source line (and the exact token, when the compiler reports a column).
+  share a color. Hover or click a source line to highlight its instructions; hover an
+  instruction to highlight its source line (and the exact token, when the compiler reports a
+  column). The rest of the function fades meanwhile, so the matching part stands out.
   Hover a function's signature to preview its whole assembly.
 - **Headers work**: analyze a header on its own, or analyze a `.cpp` and open the headers
   it includes. Functions defined in headers get counts too, including code inlined into callers.
@@ -27,7 +28,10 @@ Go, Python, Zig, Swift, D and Fortran are supported too.
 - **Robust against real projects**: local headers are found and uploaded the way a
   compiler would find them; a missing header is replaced by an empty file; a function
   that does not compile is skipped and marked *Not compiled*, and the rest is analyzed.
-- **Remote or local**, per project or per compiler, on Windows, Linux and macOS.
+- **Remote or local**, per project or per compiler, on Windows, Linux and macOS. Local mode can take
+  each file's compiler and flags from your build's `compile_commands.json`.
+- **Any compiler on Compiler Explorer**: GCC, Clang, MSVC (x64, x86, ARM64, ARM32), ICX/ICC, and the
+  cross compilers for ARM, RISC-V, MIPS, PowerPC, AVR, MSP430, Z80, 6502 and more.
 - **Fast, and visibly working**: a progress notification shows each step (finding headers,
   compiling, retrying around errors) with a **Cancel** button; the status bar and the CodeLens
   spin while it runs. Unchanged code is answered from a cache, and Compiler Explorer is asked
@@ -62,7 +66,7 @@ You do not need to analyze again after a change:
 
 Set `asmLens.reanalyzeOn` to `save` to compile only when you save, or `never` to compile only when you ask.
 
-By default the file is compiled on godbolt.org with GCC 15.2 and `-O2 -masm=intel`.
+By default the file is compiled on godbolt.org with GCC 15.2 and `-O2`, in Intel syntax.
 Choose another compiler with the compiler name in the status bar (bottom right) or
 **Asm Lens: Select Compiler**. To change flags, include folders and so on for a
 project, run **Asm Lens: Open or Create Project Config** (see [`.asm-lens.json`](#project-configuration-asm-lensjson)).
@@ -86,9 +90,44 @@ Choose the mode in `.asm-lens.json` (`"mode": "local"`), per compiler (`{ "id": 
 or for every project with the `asmLens.mode` setting. The status bar shows which one is active
 (`clang++ (local)` or the Compiler Explorer compiler's name).
 
-Local mode for C/C++ runs `<compiler> -S -g -x c++ -iquote <file folder> -I<includePaths> <flags> -`
+Local mode for C/C++ runs `<compiler> <flags> -I<includePaths> -iquote <file folder> -S -g -o - -x c++ -`
 with your unsaved text on standard input, then `c++filt` to demangle names. Asm Lens never
 runs your program and never builds the rest of the project.
+
+**Assembly syntax.** Asm Lens shows Intel syntax and picks the flag for it itself, because the right
+flag depends on the compiler: on Compiler Explorer the server adds it per compiler; locally Asm Lens
+asks the compiler what it is (`--version`, `-dumpmachine`) and adds `-masm=intel` (GCC) or
+`-mllvm -x86-asm-syntax=intel` (Clang) for x86 targets only. A `-masm=...` in your flags is therefore
+not passed on (MSVC and non-x86 compilers reject it); write `-masm=att` to get AT&T syntax instead.
+If a compiler rejects any other flag (`cc65: Unknown option: -O2`), that flag is left out, the file is
+compiled again, and the output says so.
+
+### compile_commands.json (local mode)
+
+With `"compileCommands"` in `.asm-lens.json` (or the `asmLens.compileCommands` setting), each file is
+compiled the way your build compiles it: with the compiler and flags of its entry in the
+`compile_commands.json` database that CMake (`-DCMAKE_EXPORT_COMPILE_COMMANDS=ON`), Bear, Meson and
+others write.
+
+```jsonc
+{
+  "mode": "local",
+  "compileCommands": "build/compile_commands.json",   // or several: ["build/a.json", "build/b.json"]
+  "compilers": [{ "id": "local", "extraFlags": "-DASM_LENS" }]
+}
+```
+
+- The entry's compiler runs in the entry's `directory`, with your editor text on standard input.
+  The entry's flags are used without `-c`, `-o <file>`, `-MD/-MMD/-MF/-MT/-MQ`, `-Werror*`, `-x <lang>`
+  and the source path; Asm Lens adds `-S -g -o - -w -x c++ -` (or `-x c`) and the syntax flag, and then
+  the active compiler's `extraFlags`. Compiler launchers (`ccache`, `sccache`, `distcc`) are skipped.
+- A file without its own entry (a header, a new file) uses the entry of a source file that includes it
+  (one you analyzed, else one found by searching the nearest folders first), else an entry in the same
+  or the nearest folder. Without any database entry, the usual `flags`, `defines` and `includePaths` apply.
+- The database is read again whenever it changes; **Asm Lens: Reload Compile Commands** forces it.
+  The output shows the final command and which entry was used.
+- Local mode needs a GCC- or Clang-compatible compiler; an MSVC (`cl.exe`, `clang-cl`) database is
+  reported, and remote mode with an MSVC compiler from Compiler Explorer is the way to see its code.
 
 ## Headers and templates
 
@@ -196,8 +235,9 @@ Settings are taken in this order: the active compiler's own entry, then the top 
 |-----|------|---------|---------|
 | `mode` | `"remote"` \| `"local"` | `asmLens.mode` (`"remote"`) | Where to compile (see [Remote and local mode](#remote-and-local-mode)). |
 | `compiler` | string | `asmLens.localCompiler`, else `g++` | Local mode, C/C++: the compiler command or path. A path starting with `./` or `../` is relative to the config file. |
+| `compileCommands` | string \| string[] | `asmLens.compileCommands` | Local mode: `compile_commands.json` file(s), relative to this file. See [compile_commands.json](#compile_commandsjson-local-mode). |
 | `compilers` | array | `asmLens.compilerId` | Compilers in order of preference. The first one for a language is the default; switch with the status bar. An entry is a Compiler Explorer id (`"g152"`) or an object (below). |
-| `flags` | string | `asmLens.flags` (`-O2 -masm=intel`) | C/C++ flags for compilers without their own `flags`. |
+| `flags` | string | `asmLens.flags` (`-O2 -masm=intel`) | C/C++ flags for compilers without their own `flags`. A `-masm=...` flag only chooses the syntax (see above). |
 | `language` | `"c"` \| `"c++"` | by file type | Force the language of C-family files (for example compile `.c` files as C++). |
 | `includePaths` | array | `[]` | Folders searched for `#include`s, in priority order. A string, or `{ "path": "...", "recursive": true }` to also search every subfolder. Relative to the config file. |
 | `buildFolders` | string[] | `build`, `out`, `bin`, `cmake-build-*`, `generated`, … | Folder names searched last, for generated headers. Wildcards allowed. |
@@ -227,6 +267,7 @@ Each object in `compilers` may have:
 |---------|---------|---------|
 | `asmLens.mode` | `remote` | Where to compile when `.asm-lens.json` does not say. |
 | `asmLens.localCompiler` | `""` (= `g++`) | Local C/C++ compiler when `.asm-lens.json` does not name one. |
+| `asmLens.compileCommands` | `""` | Local mode: `compile_commands.json` file(s), relative to the workspace folder, when `.asm-lens.json` has no `compileCommands`. |
 | `asmLens.reanalyzeOn` | `edit` | When an analyzed file (or a header it uses) changes: `edit` analyzes again in the background once typing pauses (and on save), `save` only on save, `never` only when you ask. |
 | `asmLens.reanalyzeDelayMs` | `1000` | With `edit`: how long typing must pause first. |
 | `asmLens.baseUrl` | `https://godbolt.org` | Compiler Explorer server. |
@@ -243,6 +284,7 @@ Each object in `compilers` may have:
 | `asmLens.showCounts` | `true` | Show the CodeLens. |
 | `asmLens.highlightOnHover` | `true` | Two-way highlighting. |
 | `asmLens.colorizeLines` | `true` | Color source lines and their instructions alike. |
+| `asmLens.dimOtherLines` | `true` | While an instruction is hovered, fade the other lines of its function (editor) and the other instructions (assembly view). |
 | `asmLens.followCursor` | `true` | The assembly view follows the function under the cursor. |
 
 ## Commands
@@ -254,12 +296,14 @@ Each object in `compilers` may have:
 | Asm Lens: Instantiate Template at Cursor… | Same as the **Instantiate…** CodeLens. |
 | Asm Lens: Remove Template Instantiations… | Remove instantiation requests of the current file. |
 | Asm Lens: Open or Create Project Config (.asm-lens.json) | Open the project file, creating it from a template. |
+| Asm Lens: Reload Compile Commands | Read the `compile_commands.json` database(s) again and analyze the file again. |
 | Asm Lens: Show Output | The log: what was compiled, uploaded, skipped and why. |
 
 ## When code does not compile
 
 Projects rarely compile from a single file without their build system. Asm Lens recovers instead of giving up:
 
+1. **A flag the compiler does not accept**: left out (the output says which).
 1. **Missing header**: retried with that header replaced by an empty file.
 2. **A function that then fails** (it used something from that header): the function is blanked out
    (line numbers stay the same) and the rest is compiled again. Its CodeLens says *Not compiled*.
@@ -284,6 +328,11 @@ mode, where your own compiler and system headers are used.
   defaults include it; flags such as `-g0` remove it.
 - **A compiler id does not work**: ids differ between Compiler Explorer servers and change over time;
   use **Select Compiler → Browse**.
+- **"godbolt.org is limiting how often it compiles (HTTP 429)"**: the public server allows a limited number
+  of compiles per minute. Automatic re-analysis pauses for 30 seconds; set `asmLens.reanalyzeOn` to `save`
+  if you hit this often, or use local mode or your own Compiler Explorer (`baseUrl`).
+- **Some compilers need their own flags**: for example GCC for 6502 wants `--target=...`, and z88dk a
+  `+target` first argument. Give such a compiler its `flags` in `.asm-lens.json`.
 - See **Asm Lens: Show Output** for the exact command, flags and compiler messages.
 
 ## Privacy
@@ -299,6 +348,7 @@ nothing is sent anywhere.
 npm test                 # unit tests, recorded Compiler Explorer responses, and every local compiler found
 npm run test:remote      # the same against the live godbolt.org
 node test/run.js --record   # refresh the recorded responses (test/fixtures/ce)
+node test/tools/survey-ce.js c++   # one compiler of every Compiler Explorer family (c or c++; network)
 npm run package          # build asm-lens-<version>.vsix (needs network for npx)
 ```
 
