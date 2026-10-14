@@ -422,3 +422,12 @@ test('parseFunctions: cc65 (.proc/.endproc, label and instruction on one line) a
   // GAS instructions are indented, so "foo start" at column 0 is the only form taken as a block.
   assert.deepEqual(asm.parseFunctions([{ text: 'f:' }, { text: '        start' }, { text: '        ret' }], () => undefined).map(f => [f.name, f.count]), [['f', 2]]);
 });
+
+test('mergeFunctionParts: GCC cold paths and MSVC funclets belong to their function', () => {
+  const fn = (name, n) => ({ name, rows: [{ text: `${name}:` }], lines: [`${name}:`], instructionRows: Array.from({ length: n }, () => ({ text: 'nop' })), instructionLines: [], count: n, fileKeys: new Set(['K']) });
+  const merged = asm.mergeFunctionParts([fn('main', 47), fn('main$dtor$0', 2), fn('f(int)', 3), fn('f(int) [clone .cold]', 4), fn('g', 1), fn('g.cold', 2), fn('orphan.cold', 5), fn('h(int) [clone .constprop.0]', 6), fn("`main'::`1'::dtor$4", 1)]);
+  assert.deepEqual(merged.map(f => [f.name, f.count]), [['main', 50], ['f(int)', 7], ['g', 3], ['orphan.cold', 5], ['h(int) [clone .constprop.0]', 6]]);
+  assert.deepEqual(merged[0].parts, ['main$dtor$0', "`main'::`1'::dtor$4"]);
+  assert.equal(asm.partOf('main$catch$1'), 'main');
+  assert.equal(asm.partOf('main'), undefined);
+});

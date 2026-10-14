@@ -243,6 +243,7 @@ function parameterListOf(head) {
   return undefined;
 }
 
+const LEADING_MACROS = /^(?:[A-Z_][A-Z0-9_]{2,}\b(?:\s*\((?:[^()]|\([^()]*\))*\))?\s+)+(?=(?:export\s+|inline\s+)?namespace\b|(?:typedef\s+|export\s+)?(?:class|struct|union|enum)\b|template\s*<|extern\b)/;
 const ACCESS_LABEL = /^\s*(?:(?:public|private|protected|signals|Q_SIGNALS|slots|Q_SLOTS)\s*(?:(?:slots|Q_SLOTS)\s*)?:(?!:)\s*)+/;
 
 // What the declaration head in front of a `{` opens.
@@ -251,6 +252,11 @@ function classifyHead(m, segStart, segEnd, scopes) {
   const acc = ACCESS_LABEL.exec(seg);
   let start = acc ? acc[0].length : 0;
   start += /^\s*/.exec(seg.slice(start))[0].length;
+  // Macros used as statements before a declaration (no semicolon), e.g.
+  // "NLOHMANN_JSON_NAMESPACE_BEGIN namespace detail {", "MACRO template <...> struct X {".
+  const macros = LEADING_MACROS.exec(seg.slice(start));
+  if (macros) start += macros[0].length;
+  const unknownMacro = Boolean(macros);
   const decl = seg.slice(start);
   const base = { declStart: segStart + start };
   if (!decl.trim()) return { ...base, kind: 'other' };
@@ -265,13 +271,16 @@ function classifyHead(m, segStart, segEnd, scopes) {
   if (/^extern ?$/.test(clean)) return { ...base, kind: 'linkage' };
   if (/^(?:typedef )?enum\b/.test(clean)) return { ...base, kind: 'other' };
   if ((x = /^(?:typedef |export )?(class|struct|union) (?:[A-Z_][A-Z0-9_]* )?([A-Za-z_]\w*) ?(<.*>)? ?(?:final ?)?(?:(?<!:):(?!:).*)?$/.exec(clean))) {
-    return { ...base, kind: 'class', keyword: x[1], name: x[2] };
+    // A macro in front ("NLOHMANN_BASIC_JSON_TPL_DECLARATION class basic_json") may be template<...>.
+    return { ...base, kind: 'class', keyword: x[1], name: x[2], maybeTemplate: unknownMacro };
   }
   if (hasTopLevelAssignment(clean) || !classifyFunctionSegment(rest)) return { ...base, kind: 'other' };
   const params = parameterListOf(blankAttributes(rest));
   if (!params || NOT_FUNCTION_NAMES.has(params.name)) return { ...base, kind: 'other' };
   const name = params.name;
   const beforeName = blankAttributes(rest).slice(0, params.start).replace(SPECIFIERS, ' ').replace(/\[\[[\s\S]*?\]\]/g, ' ').trim();
+  // Only macro names before the function name (no type we can see): what they expand to is unknown.
+  const onlyMacros = beforeName !== '' && /^(?:[A-Z_][A-Z0-9_]{2,}\b(?:\s*\((?:[^()]|\([^()]*\))*\))?\s*)+$/.test(beforeName);
   const cls = [...scopes].reverse().find(s => s.kind === 'class');
   const last = splitQualified(name).pop() || '';
   const isCtorOrDtor = last.startsWith('~') || (cls && last === cls.name) || /^(\w+)::~?\1$/.test(name.replace(/<[^<>]*>/g, ''));
@@ -283,6 +292,7 @@ function classifyHead(m, segStart, segEnd, scopes) {
     nameIndex: base.restStart + params.start,
     // No return type and not a constructor: a macro such as TEST(a, b) { ... }.
     macroLike: !beforeName && !isCtorOrDtor && !/\boperator\b/.test(name) && !name.includes('::'),
+    onlyMacros,
     abbreviated: /(?:^|,)\s*(?:const\s+)?auto\b(?!\s*\()/.test(paramText),
     consteval: /\bconsteval\b/.test(rest.slice(0, params.start))
   };
@@ -302,6 +312,13 @@ function scanDefinitions(text) {
     if (c === '}') { scopes.pop(); boundary = i + 1; continue; }
     if (c !== '{') continue;
     const seg = m.slice(boundary, i);
+    // A brace inside unclosed parentheses is an expression: "decltype(f(priority_tag<3>{}))".
+    if ((seg.match(/\(/g) || []).length > (seg.match(/\)/g) || []).length) {
+      const close = closingBracket(m, i);
+      if (close < 0) break;
+      i = close;
+      continue;
+    }
     // `Foo() : a{1}, b{2} {`: braces of a member initializer belong to the head.
     if (/\)[^(){};]*(?<!:):(?!:)/.test(seg) && /[\w>]\s*$/.test(seg) && !/^\s*(?:template\s*<[^{]*>\s*)?(?:class|struct|union|enum)\b/.test(seg)) {
       const close = closingBracket(m, i);
@@ -314,7 +331,7 @@ function scanDefinitions(text) {
     const end = close < 0 ? m.length - 1 : close;
     if (head.kind === 'namespace' || head.kind === 'linkage' || head.kind === 'class') {
       const own = (head.templateParams || []).filter(p => p !== '');
-      const scope = { kind: head.kind, name: head.name || '', keyword: head.keyword, templated: own.length > 0, templateParams: own[own.length - 1] };
+      const scope = { kind: head.kind, name: head.name || '', keyword: head.keyword, templated: own.length > 0, maybeTemplate: Boolean(head.maybeTemplate), templateParams: own[own.length - 1] };
       if (head.kind === 'class') {
         defs.push({ ...head, ...scope, scopes: scopes.slice(), startLine: lineOf(head.declStart), endLine: lineOf(end), bodyOpen: i, bodyClose: end });
       }
@@ -362,14 +379,17 @@ function keepHeaderFunctions(text) {
   const lineOf = lineLocator(text);
   const at = new Set();
   for (const d of scanDefinitions(text)) {
-    if (d.kind !== 'function' || d.templated || d.macroLike || d.consteval) continue;
+    if (d.kind !== 'function' || d.templated || d.macroLike || d.consteval || d.onlyMacros || d.scopes.some(s => s.maybeTemplate)) continue;
     let pos = d.restStart;
-    // after leading [[attributes]], alignas(...) and extern "C"
+    // After leading [[attributes]], alignas(...), extern "C", and macros (DOCTEST_NORETURN,
+    // FMT_API, a macro for template<...>) as long as a type is still left before the name.
     for (;;) {
       const tail = text.slice(pos, pos + 400);
       const skip = /^\s*(?:\[\[[\s\S]*?\]\]|alignas\s*\((?:[^()]|\([^()]*\))*\)|extern\s*"[^"]*")/.exec(tail);
-      if (!skip) break;
-      pos += skip[0].length;
+      if (skip) { pos += skip[0].length; continue; }
+      const macro = /^\s*[A-Z_][A-Z0-9_]{2,}(?:\s*\((?:[^()]|\([^()]*\))*\))?(?=\s)/.exec(tail);
+      if (macro && /[A-Za-z_]/.test(text.slice(pos + macro[0].length, d.nameIndex).replace(/\b(?:const|volatile|static|inline|constexpr|virtual|explicit|friend)\b/g, ''))) { pos += macro[0].length; continue; }
+      break;
     }
     pos += /^\s*/.exec(text.slice(pos, pos + 200))[0].length;
     at.add(pos);
@@ -392,7 +412,7 @@ function keepHeaderFunctions(text) {
 function keepByAddress(text, { c = false, defs = scanDefinitions(text) } = {}) {
   const lines = [];
   for (const d of defs) {
-    if (d.kind !== 'function' || d.templated || d.macroLike || d.consteval) continue;
+    if (d.kind !== 'function' || d.templated || d.macroLike || d.consteval || d.onlyMacros || d.scopes.some(s => s.maybeTemplate)) continue;
     const comps = splitQualified(d.name);
     const last = comps[comps.length - 1] || '';
     const owner = [...d.scopes].reverse().find(s => s.kind === 'class');
@@ -509,5 +529,5 @@ function appendInstantiations(text, list) {
 module.exports = {
   maskCode, classifyFunctionSegment, blankEnclosingDeclaration,
   scanDefinitions, guessCFunctions, keepHeaderFunctions, keepByAddress, templateTargetAt, appendInstantiations,
-  defaultTemplateArgs, splitQualified, splitTemplatePrefixes, lineLocator
+  defaultTemplateArgs, splitQualified, splitTemplatePrefixes, lineLocator, classifyHead
 };

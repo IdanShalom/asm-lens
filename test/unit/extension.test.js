@@ -100,8 +100,8 @@ test('remote: analysis stores functions matched to source; CodeLens titles; pane
     assert.deepEqual(msg.info, ['Asm Lens: found 2 emitted function bodies.']);
     const lenses = await x.lenses('a.cpp');
     assert.deepEqual(lenses.map(l => [l.line, l.title]), [
-      [1, '$(symbol-numeric) 2 instructions · GCC (selected ID) · -O2'],
-      [2, '$(symbol-numeric) 2 instructions · GCC (selected ID) · -O2']
+      [1, '$(symbol-numeric) 2 instructions · g152 · -O2'],
+      [2, '$(symbol-numeric) 2 instructions · g152 · -O2']
     ]);
     await x.state.commands.get('asmLens.showAssembly')(x.vscode.Uri.file(x.at('a.cpp')), 'two', 1);
     assert.equal(x.state.lastRender().title, 'two — 2 instructions');
@@ -129,7 +129,7 @@ test('remote: missing headers become empty files and failing functions are skipp
     assert.match(msg.info[0], /found 1 emitted function bodies \(1 quoted include\(s\) not found; 1 header\(s\) replaced by empty files; 1 function\/declaration\(s\) skipped/);
     assert.equal(ce.requests.length, 3);
     assert.match(ce.requests[1].body.options.userArguments, /-I\./);
-    assert.equal(await x.lensAt('a.cpp', 2), '$(symbol-numeric) 2 instructions · GCC (selected ID) · -O2 -I.');
+    assert.equal(await x.lensAt('a.cpp', 2), '$(symbol-numeric) 2 instructions · g152 · -O2 -I.');
     assert.match(await x.lensAt('a.cpp', 3), /Not compiled/);
   } finally { ce.restore(); }
 });
@@ -207,7 +207,7 @@ test('header without code: a message that points at Instantiate…', async () =>
     const msg = await x.analyze('t.hpp');
     assert.match(msg.info[0], /emitted no code: its functions are templates\. Click "Instantiate…"/);
     const lenses = await x.lenses('t.hpp');
-    assert.deepEqual(lenses.map(l => l.title), ['$(info) No code emitted: template not instantiated · GCC (selected ID)', '$(symbol-type-parameter) Instantiate…']);
+    assert.deepEqual(lenses.map(l => l.title), ['$(info) No code emitted: template not instantiated · g152', '$(symbol-type-parameter) Instantiate…']);
   } finally { ce.restore(); }
 });
 
@@ -235,8 +235,8 @@ test('instantiate: requests are appended, remembered per file, deduplicated, fai
     assert.equal(src[34], 'auto __asm_lens_inst_0 = &square<int>;');
     assert.equal(src[35], 'template struct mx::Box<long>;');
     assert.equal(src.length, fixture('headers', 'mathx.hxx').split('\n').length + 3);
-    assert.equal(await x.lensAt('m.hxx', 4), '$(symbol-numeric) 2 instructions · GCC (selected ID) · -O2');
-    assert.equal(await x.lensAt('m.hxx', 32), '$(symbol-numeric) 2 instructions · GCC (selected ID) · -O2');
+    assert.equal(await x.lensAt('m.hxx', 4), '$(symbol-numeric) 2 instructions · g152 · -O2');
+    assert.equal(await x.lensAt('m.hxx', 32), '$(symbol-numeric) 2 instructions · g152 · -O2');
     const top = (await x.lenses('m.hxx')).find(l => l.command === 'asmLens.manageInstantiations');
     assert.equal(top.title, '$(symbol-type-parameter) Instantiated: square<int>, template struct mx::Box<long> · edit');
     // The input box suggests the arguments used last time.
@@ -746,5 +746,121 @@ test('header with MSVC: functions are kept by taking their address; lines that d
     assert.ok(!/__attribute__/.test(ce.requests[0].body.source));
     assert.deepEqual(msg.warning, [], 'no "could not instantiate" for our own lines');
     assert.equal(await x.lensAt('h.hpp', 1), '$(symbol-numeric) 2 instructions · x64 msvc · -O2');
+  } finally { ce.restore(); }
+});
+
+// ---------------------------------------------------------------------------
+// 0.7.1: the chosen compiler is the one used
+
+function fakeWithMsvc(respond) {
+  const real = global.fetch;
+  const requests = [];
+  global.fetch = async (url, init = {}) => {
+    const body = init.body ? JSON.parse(init.body) : undefined;
+    requests.push({ url: String(url), body });
+    const json = /\/api\/compilers\//.test(url)
+      ? [{ id: 'clang2310', name: 'x86-64 clang 23.1.0' }, { id: 'vcpp_v19_latest_x64', name: 'x64 msvc v19.latest' }]
+      : respond(body, String(url));
+    return { ok: true, status: 200, json: async () => json, text: async () => JSON.stringify(json) };
+  };
+  return { requests, restore: () => { global.fetch = real; } };
+}
+
+test('select compiler without a project file: MSVC is used, not an older stored pick (status bar, request, re-analysis)', async () => {
+  const dir = makeProject({ 'main.cpp': 'int main() { return 0; }\n' });
+  const ce = fakeWithMsvc((body, url) => /vcpp/.test(url) ? { code: 0, asm: msvcRows.slice(0, 5) } : { code: 0, asm: asmFor(['main', 1]) });
+  try {
+    const x = start(dir);
+    // Picked with Browse in an earlier session (for example while a .asm-lens.json existed).
+    x.state.workspaceState.set('asmLens.activeCompiler', { id: 'clang2310', name: 'x86-64 clang 23.1.0', browsed: true, mode: 'remote', language: 'c++' });
+    x.vscode._showDocument(x.at('main.cpp'));
+    assert.equal((await x.ext._internals.resolveSettings(x.open('main.cpp'))).active.id, 'g152', 'the settings decide without a project file');
+    await x.analyze('main.cpp');
+    x.state.quickPickAnswers.push(items => items.find(i => i.compiler.id === 'vcpp_v19_latest_x64'));
+    await x.state.commands.get('asmLens.selectCompiler')();
+    assert.equal(x.state.settings['asmLens.compilerId'], 'vcpp_v19_latest_x64');
+    assert.equal(x.state.workspaceState.get('asmLens.activeCompiler'), undefined, 'the older pick is cleared');
+    const r = await x.ext._internals.resolveSettings(x.open('main.cpp'));
+    assert.deepEqual([r.active.id, r.active.name, r.mode], ['vcpp_v19_latest_x64', 'x64 msvc v19.latest', 'remote']);
+    assert.match(x.state.statusItem.text, /x64 msvc v19\.latest/);
+    const compiles = ce.requests.filter(q => /\/compile$/.test(q.url));
+    assert.match(compiles.at(-1).url, /\/api\/compiler\/vcpp_v19_latest_x64\/compile$/, 'the file is analyzed again, with MSVC');
+    assert.match(await x.lensAt('main.cpp', 1), /x64 msvc v19\.latest/);
+  } finally { ce.restore(); }
+});
+
+test('select compiler: a pick belongs to the project file it was made in', async () => {
+  const dir = makeProject({
+    'a/.asm-lens.json': JSON.stringify({ compilers: ['g152', 'clang2310'] }),
+    'a/x.cpp': '',
+    'b/.asm-lens.json': JSON.stringify({ compilers: ['g132'] }),
+    'b/y.cpp': ''
+  });
+  const ce = fakeWithMsvc(() => ({ code: 0, asm: [] }));
+  try {
+    const x = start(dir);
+    x.vscode._showDocument(x.at('a/x.cpp'));
+    x.state.quickPickAnswers.push(items => items.find(i => i.browse), items => items.find(i => i.compiler.id === 'vcpp_v19_latest_x64'));
+    await x.state.commands.get('asmLens.selectCompiler')();
+    assert.equal((await x.ext._internals.resolveSettings(x.open('a/x.cpp'))).active.id, 'vcpp_v19_latest_x64');
+    assert.equal((await x.ext._internals.resolveSettings(x.open('b/y.cpp'))).active.id, 'g132', 'not used by another project');
+  } finally { ce.restore(); }
+});
+
+test('select compiler with a project file: the file is analyzed again with the new compiler', async () => {
+  const dir = makeProject({ 'a.cpp': 'int main() { return 0; }\n' }, { compilers: ['g152', 'vcpp_v19_latest_x64'] });
+  const ce = fakeWithMsvc((body, url) => /vcpp/.test(url) ? { code: 0, asm: msvcRows.slice(0, 5) } : { code: 0, asm: asmFor(['main', 1]) });
+  try {
+    const x = start(dir);
+    await x.analyze('a.cpp');
+    x.state.quickPickAnswers.push(items => items.find(i => i.compiler && i.compiler.id === 'vcpp_v19_latest_x64'));
+    await x.state.commands.get('asmLens.selectCompiler')();
+    assert.match(ce.requests.at(-1).url, /vcpp_v19_latest_x64\/compile$/);
+    assert.match(x.state.statusItem.text, /vcpp_v19_latest_x64/);
+  } finally { ce.restore(); }
+});
+
+test('header: when the marked text fails elsewhere, the text as written is compiled before any function is skipped', async () => {
+  const dir = makeProject({ 'h.hpp': 'inline int a() { return 1; }\nint broken_on_purpose_only_when_marked();\n' });
+  const ce = fakeCompilerExplorer(body => /__attribute__/.test(body.source)
+    ? { code: 1, stderr: err('<source>:2:5: error: something the marks caused far away') }
+    : { code: 0, asm: asmFor(['a()', 1]) });
+  try {
+    const x = start(dir);
+    await x.analyze('h.hpp');
+    assert.equal(ce.requests.length, 2);
+    assert.ok(/__attribute__/.test(ce.requests[0].body.source) && !/__attribute__/.test(ce.requests[1].body.source));
+    assert.equal(x.analysis('h.hpp').skipped.length, 0, 'nothing is blanked because of the marks');
+  } finally { ce.restore(); }
+});
+
+test('functions split by the compiler (MSVC funclets, GCC cold paths) are counted as one', async () => {
+  const dir = makeProject({ 'a.cpp': 'int main() {\n  return 0;\n}\n' });
+  const ce = fakeCompilerExplorer(() => ({ code: 0, asm: [
+    { text: 'main PROC' }, { text: '        xor eax, eax', source: { file: null, line: 2 } }, { text: '        ret 0', source: { file: null, line: 3 } }, { text: 'main ENDP' },
+    { text: 'main$dtor$0 PROC' }, { text: '        jmp foo', source: { file: null, line: 3 } }, { text: 'main$dtor$0 ENDP' }
+  ] }));
+  try {
+    const x = start(dir);
+    await x.analyze('a.cpp');
+    assert.match(await x.lensAt('a.cpp', 1), /^\$\(symbol-numeric\) 3 instructions · /);
+  } finally { ce.restore(); }
+});
+
+test('changing the compiler in the settings by hand analyzes the visible file again with it', async () => {
+  const dir = makeProject({ 'main.cpp': 'int main() { return 0; }\n' });
+  const ce = fakeWithMsvc((body, url) => /vcpp/.test(url) ? { code: 0, asm: msvcRows.slice(0, 5) } : { code: 0, asm: asmFor(['main', 1]) });
+  try {
+    const x = start(dir);
+    await x.analyze('main.cpp');
+    await x.vscode.workspace.getConfiguration('asmLens').update('compilerId', 'vcpp_v19_latest_x64', 1);
+    await new Promise(r => setTimeout(r, 700));
+    assert.match(ce.requests.at(-1).url, /vcpp_v19_latest_x64\/compile$/);
+    assert.match(await x.lensAt('main.cpp', 1), /vcpp_v19_latest_x64/, 'without a compilerName the id is shown');
+    x.state.settings['asmLens.reanalyzeOn'] = 'never';
+    const before = ce.requests.length;
+    await x.vscode.workspace.getConfiguration('asmLens').update('compilerId', 'g152', 1);
+    await new Promise(r => setTimeout(r, 700));
+    assert.equal(ce.requests.length, before);
   } finally { ce.restore(); }
 });

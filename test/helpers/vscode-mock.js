@@ -107,7 +107,8 @@ function createVscode(options = {}) {
     globalState: new Map(),
     shownDocuments: [],
     progress: [],
-    activeEditorListeners: []
+    activeEditorListeners: [],
+    configListeners: []
   };
 
   // Like VS Code: a setting that is not set returns the default declared in package.json.
@@ -131,6 +132,9 @@ function createVscode(options = {}) {
         const k = `${section}.${key}`;
         if (target === 2 || target === 3) state.workspaceSettings[k] = value; else state.settings[k] = value;
         state.settingUpdates.push({ key: k, value, target });
+        // Like VS Code: listeners hear about the change before update() resolves.
+        const event = { affectsConfiguration: s => k === s || k.startsWith(`${s}.`) };
+        for (const fn of state.configListeners) fn(event);
       }
     };
   }
@@ -170,7 +174,7 @@ function createVscode(options = {}) {
       async openTextDocument(arg) { return openDocumentSync(arg instanceof Uri ? arg.fsPath : arg); },
       async findFiles(include, exclude, max) { return findFiles(state, include, exclude, max); },
       createFileSystemWatcher() { return { onDidChange() {}, onDidCreate() {}, onDidDelete() {}, dispose() {} }; },
-      onDidChangeConfiguration() { return { dispose() {} }; },
+      onDidChangeConfiguration(fn) { state.configListeners.push(fn); return { dispose() {} }; },
       onDidChangeTextDocument(fn) { state.changeListener = fn; return { dispose() {} }; },
       onDidSaveTextDocument(fn) { state.saveListener = fn; return { dispose() {} }; },
       onDidCloseTextDocument() { return { dispose() {} }; }
@@ -180,7 +184,7 @@ function createVscode(options = {}) {
       get visibleTextEditors() { return state.activeEditor ? [state.activeEditor] : []; },
       createOutputChannel() { return { appendLine(l) { state.outputLines.push(l); }, append(l) { state.outputLines.push(l); }, show() {}, clear() {}, dispose() {} }; },
       createTextEditorDecorationType(o) { return { options: o, dispose() {} }; },
-      createStatusBarItem() { return { show() {}, hide() {}, dispose() {}, text: '', tooltip: '' }; },
+      createStatusBarItem() { state.statusItem = { visible: false, show() { this.visible = true; }, hide() { this.visible = false; }, dispose() {}, text: '', tooltip: '' }; return state.statusItem; },
       createWebviewPanel() {
         const panel = {
           visible: true, title: '',

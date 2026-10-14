@@ -283,3 +283,48 @@ test('splitQualified and splitTemplatePrefixes', () => {
   const t = scan.splitTemplatePrefixes('template <class T = std::vector<int>> template <int N = (1 > 0)> void f()');
   assert.deepEqual(t.params, ['class T = std::vector<int>', 'int N = (1 > 0)']);
 });
+
+test('scanDefinitions: namespaces and classes opened after statement macros (json.hpp style)', () => {
+  const src = [
+    'NLOHMANN_JSON_NAMESPACE_BEGIN',
+    'namespace detail {',
+    'inline int a() { return 1; }',
+    '}',
+    'NLOHMANN_JSON_NAMESPACE_END NLOHMANN_JSON_NAMESPACE_BEGIN namespace detail2 {',
+    'inline int b() { return 2; }',
+    '}',
+    'TPL_DECLARATION class basic { int get() const { return 3; } };'
+  ].join('\n');
+  const f = fns(src);
+  assert.deepEqual(f.map(x => [x.name, x.scopes.map(s => s.name).join('/')]), [['a', 'detail'], ['b', 'detail2'], ['get', 'basic']]);
+  assert.equal(f[2].scopes[0].maybeTemplate, true, 'the macro may be template<...>');
+});
+
+test('scanDefinitions: braces inside unclosed parentheses are expressions, not bodies', () => {
+  const src = 'template <typename T>\nauto f(const T& j)\n-> decltype(g(j, tag<3> {}), void())\n{\n  return g(j, tag<3> {});\n}\nint after() { return 1; }\n';
+  assert.deepEqual(fns(src).map(x => [x.name, x.startLine, x.endLine]), [['f', 0, 5], ['after', 6, 6]]);
+});
+
+test('keepHeaderFunctions: marks go after macros; functions behind unknown macros only are left alone', () => {
+  const kept = scan.keepHeaderFunctions([
+    'DOCTEST_NORETURN void a() { throw 1; }',
+    'FMT_API inline int b() { return 2; }',
+    'DOCTEST_APPROX_PREFIX operator==(const T& l, const A& r) { return true; }',
+    'TPL_DECLARATION class basic { int m() const { return 3; } };',
+    'BOOL WINAPI c() { return 0; }'
+  ].join('\n')).split('\n');
+  assert.equal(kept[0], 'DOCTEST_NORETURN __attribute__((used)) void a() { throw 1; }');
+  assert.equal(kept[1], 'FMT_API __attribute__((used)) inline int b() { return 2; }');
+  assert.equal(kept[2], 'DOCTEST_APPROX_PREFIX operator==(const T& l, const A& r) { return true; }');
+  assert.equal(kept[3], 'TPL_DECLARATION class basic { int m() const { return 3; } };');
+  assert.equal(kept[4], 'BOOL WINAPI c() { return 0; }');
+});
+
+test('scanDefinitions: long runs of macro-like words do not slow it down (no catastrophic backtracking)', () => {
+  const caps = Array.from({ length: 400 }, (_, i) => `MACRO_NUMBER_${i}_WITH_A_LONG_NAME`).join(' ');
+  const src = `${caps} x\n${'ABCDEFGHIJKLMNOPQRSTUVWXYZ'.repeat(40)} int f() { return 1; }\nDOCTEST_RELATIONAL_OP(eq, ==)\nDOCTEST_RELATIONAL_OP(ne, !=)\n${'A_B_C_D_E_F_G_H '.repeat(200)}( int g() { return 2; }\n`;
+  const t0 = Date.now();
+  scan.scanDefinitions(src);
+  scan.keepHeaderFunctions(src);
+  assert.ok(Date.now() - t0 < 1000, `took ${Date.now() - t0} ms`);
+});

@@ -12,7 +12,7 @@ const flagsLib = require('./flags');
 const compileCommands = require('./compileCommands');
 const {
   IS_WIN, normPath, makeRefResolver, makeLocalRefResolver, localAsmToRows, isMachO, prepareMachO, finishMachO,
-  parseFunctions, buildLineIndex,
+  parseFunctions, mergeFunctionParts, buildLineIndex,
   matchSourceSymbol, findFunctionResult, findAllFunctionResults,
   ANSI_RE, missingIncludesFrom, preprocessorErrorFilesFrom, errorLocationsFrom, stubFilename,
   cleanAssemblyRowsForDisplay, cleanAssemblyForDisplay
@@ -166,7 +166,10 @@ async function resolveSettings(document) {
     : [{ id: s.get('compilerId', 'g152'), name: s.get('compilerName', '') || s.get('compilerId', 'g152') }];
   const matching = all.filter(x => !x.language || x.language === docLang);
   const compilers = matching.length ? matching : all;
-  const chosen = extContext?.workspaceState.get('asmLens.activeCompiler');
+  // A pick made with Select Compiler in a project with .asm-lens.json applies to that project only;
+  // without a project file the VS Code settings decide (Select Compiler writes them).
+  const stored = extContext?.workspaceState.get('asmLens.activeCompiler');
+  const chosen = stored && project?.file && (!stored.configFile || normPath(stored.configFile) === normPath(project.file)) ? stored : undefined;
   // A compiler picked from Compiler Explorer's list compiles there, for the language it was picked for.
   const browsed = chosen && chosen.browsed && (!chosen.language || chosen.language === docLang)
     ? { id: chosen.id, name: chosen.name || chosen.id, mode: 'remote' } : undefined;
@@ -253,6 +256,7 @@ async function refreshStatusBar() {
   if (!document || !LANGS.includes(document.languageId)) return statusItem.hide();
   try {
     const r = await resolveSettings(document);
+    if (analysisBusy.size) return;            // an analysis started meanwhile: keep its spinner
     const local = r.mode === 'local';
     const database = local && r.compileCommands && r.compileCommands.length;
     statusItem.text = `$(chip) ${database ? 'compile_commands (local)' : local ? `${path.basename(r.localCompiler || '')} (local)` : r.active.name || r.active.id}`;
@@ -412,7 +416,24 @@ function activate(context) {
   }));
   refreshStatusBar();
 
-  const onConfigChanged = () => { lastAnalysis.clear(); loggedConfigProblems.clear(); codeLensEmitter?.fire(); refreshStatusBar(); };
+  // Results of the old settings are dropped; the visible files that had results are analyzed again.
+  const onConfigChanged = () => {
+    const visible = new Set((vscode.window.visibleTextEditors || []).map(e => fileKey(e.document)));
+    const again = [...lastAnalysis.keys()].filter(k => visible.has(k) && analyzedFiles.has(k));
+    lastAnalysis.clear();
+    loggedConfigProblems.clear();
+    codeLensEmitter?.fire();
+    refreshStatusBar();
+    if (reanalyzeMode() === 'never') return;
+    for (const key of again) {
+      clearTimeout(reanalysisTimers.get(key));
+      reanalysisTimers.set(key, setTimeout(() => {
+        reanalysisTimers.delete(key);
+        const entry = analyzedFiles.get(key);
+        if (entry) Promise.resolve(vscode.workspace.openTextDocument(entry.uri)).then(d => analyzeDocument(d, { auto: true }), () => {});
+      }, 400));
+    }
+  };
   if (vscode.workspace.createFileSystemWatcher) {
     const watcher = vscode.workspace.createFileSystemWatcher('**/{.asm-lens.json,.vscode/asm-lens.json}');
     watcher.onDidChange(onConfigChanged); watcher.onDidCreate(onConfigChanged); watcher.onDidDelete(onConfigChanged);
@@ -466,17 +487,23 @@ function activate(context) {
       } else {
         chosen = { id: picked.compiler.id, name: picked.compiler.name || picked.compiler.id, browsed: false };
       }
+      // Before the settings change: it discards the results.
+      const hadAnalysis = analysisFor(document);
       if (other) {
         await extContext.workspaceState.update(`asmLens.activeCompiler.${other.id}`, chosen);
       } else if (settings.configFile) {
-        await extContext.workspaceState.update('asmLens.activeCompiler', chosen);
+        await extContext.workspaceState.update('asmLens.activeCompiler', { ...chosen, configFile: settings.configFile });
       } else {
+        // No project file: the settings are the choice; an older pick must not hide them.
+        await extContext.workspaceState.update('asmLens.activeCompiler', undefined);
         await updateSetting('compilerId', chosen.id, document);
         await updateSetting('compilerName', chosen.name, document);
         if (chosen.mode === 'remote' && settings.mode === 'local') await updateSetting('mode', 'remote', document);
       }
-      const hadAnalysis = analysisFor(document);
       lastAnalysis.clear();
+      // Analyzed right below; no second, automatic run from the settings change.
+      clearTimeout(reanalysisTimers.get(fileKey(document)));
+      reanalysisTimers.delete(fileKey(document));
       codeLensEmitter?.fire();
       await refreshStatusBar();
       const now = await resolveSettings(document);
@@ -1057,7 +1084,7 @@ async function analyzeDocument(document, { auto = false } = {}) {
   } finally {
     analysisBusy.delete(key);
     codeLensEmitter?.fire();
-    refreshStatusBar();
+    await refreshStatusBar();
     if (rerunAfter.delete(key)) analyzeDocument(document, { auto: true });
   }
 }
@@ -1099,7 +1126,7 @@ async function runAnalysis(document) {
     };
     let compiled;
     if (prepared.kept !== undefined) {
-      try { compiled = await compileWithRecovery({ ...opts, source: prepared.kept }); }
+      try { compiled = await compileWithRecovery({ ...opts, source: prepared.kept, kept: true }); }
       catch (e) {
         // Cancelled, timed out or rate-limited: compiling the plain text would not help.
         if (e.name === 'AbortError' || e.name === 'Cancelled' || Date.now() < rateLimitedUntil) throw e;
@@ -1217,7 +1244,7 @@ async function recordAnalysis(document, o) {
   }
   report('matching functions with the source…');
   const rootPathKey = docPathKey(document);
-  const functions = parseFunctions(o.rows, o.resolveRef);
+  const functions = mergeFunctionParts(parseFunctions(o.rows, o.resolveRef));
   const job = jobContext.getStore();
   const symbols = (job?.symbols && job.symbolsVersion === document.version
     ? await job.symbols
@@ -1492,6 +1519,15 @@ async function analyzeLocal(document, resolved, settings) {
     if (!progressed && keptHeader) {
       const reverted = revertKeptLines(source, prepared.plain, errorLocationsFrom(err).filter(loc => isMain(loc.file)).map(loc => loc.line));
       if (reverted !== undefined) { source = reverted; progressed = true; }
+    }
+    // Other errors while the header's functions are kept: compile the text as written first,
+    // so that what Asm Lens added never makes a function count as "Not compiled".
+    if (!progressed && keptHeader) {
+      keptHeader = false;
+      source = prepared.plain;
+      for (const l of failedLines) source = blankLine(source, l);
+      outputChannel.appendLine('  header: compiling it as written (without the added marks)');
+      continue;
     }
     if (!progressed && recoverErrors) {
       for (const loc of errorLocationsFrom(err)) {
@@ -1801,6 +1837,9 @@ async function compileWithRecovery(opts) {
     // 3. __attribute__((used)) added to a header line that the compiler rejects -> remove it there.
     const reverted = revertKeptLines(source, opts.original, errorLocationsFrom(lastErr).filter(loc => isRemoteMain(loc.file)).map(loc => loc.line));
     if (reverted !== undefined && reverted !== source) { source = reverted; continue; }
+    // Other errors while the header's functions are kept: the caller compiles the text as written
+    // instead, so that what Asm Lens added never makes a function count as "Not compiled".
+    if (opts.kept) throw new Error(lastErr.slice(0, 1800));
 
     if (!recoverErrors) break;
 

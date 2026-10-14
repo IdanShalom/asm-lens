@@ -272,7 +272,7 @@ Each object in `compilers` may have:
 | `asmLens.reanalyzeDelayMs` | `1000` | With `edit`: how long typing must pause first. |
 | `asmLens.baseUrl` | `https://godbolt.org` | Compiler Explorer server. |
 | `asmLens.compilerId` | `g152` | Compiler Explorer compiler for C/C++ without a project file. **Select Compiler** sets it. |
-| `asmLens.compilerName` | `GCC (selected ID)` | Its label in the CodeLens. |
+| `asmLens.compilerName` | `""` | Its label in the status bar and CodeLens (empty: the id). Select Compiler fills it in. |
 | `asmLens.flags` | `-O2 -masm=intel` | C/C++ flags. |
 | `asmLens.language` | `c++` | Language sent for C-family files without a project file. |
 | `asmLens.includePaths` | `[]` | Extra include folders, searched after the project file's. |
@@ -349,6 +349,7 @@ npm test                 # unit tests, recorded Compiler Explorer responses, and
 npm run test:remote      # the same against the live godbolt.org
 node test/run.js --record   # refresh the recorded responses (test/fixtures/ce)
 node test/tools/survey-ce.js c++   # one compiler of every Compiler Explorer family (c or c++; network)
+node test/tools/stress-headers.js  # the C/C++ scanner on large real-world headers (network, clang)
 npm run package          # build asm-lens-<version>.vsix (needs network for npx)
 ```
 

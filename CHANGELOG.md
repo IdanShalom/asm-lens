@@ -1,5 +1,29 @@
 # Changelog
 
+## 0.7.1
+
+### Fixes
+- **Select Compiler without a project file**: a compiler picked with Browse earlier (while a
+  `.asm-lens.json` existed, or in 0.6) was stored for the workspace and kept overriding the
+  `asmLens.compilerId` setting, so choosing MSVC still compiled with Clang. Picks made in a project
+  now belong to its `.asm-lens.json`; without one, the settings decide and old picks are cleared.
+- After choosing a compiler the file is analyzed again (the settings change used to discard the results
+  first, so it was not), and editing `asmLens.compilerId` or other compile settings by hand re-analyzes
+  the visible files.
+- The status bar no longer keeps the spinner after an analysis, or shows the compiler name while one runs.
+- MSVC exception funclets (`main$dtor$0`) and GCC cold paths (`f [clone .cold]`) belong to their function:
+  `main` no longer shows "2 instantiations".
+- `asmLens.compilerName` is empty by default (was "GCC (selected ID)"), so the label shows the compiler id
+  you set.
+- C/C++ scanning of real-world headers (checked on nlohmann/json, doctest, fmt, stb_image with
+  `test/tools/stress-headers.js`): namespaces and classes opened after statement macros
+  (`NLOHMANN_JSON_NAMESPACE_BEGIN namespace detail {`) were skipped whole; braces in expressions
+  (`decltype(f(tag<3>{}))`) were taken for function bodies; a long run of macro names could make the scan
+  take minutes.
+- A header analyzed on its own: `__attribute__((used))` goes after macros such as `DOCTEST_NORETURN`, is
+  not added where a macro may hide `template<...>`, and when the marked text fails to compile the header is
+  compiled as written instead of skipping functions.
+
 ## 0.7.0
 
 ### New

@@ -252,6 +252,37 @@ function parseFunctions(rows, resolveRef) {
 // "$LN5@f" and "$L2" are local labels; "$s4geom6squareyS2iF" is a (mangled) Swift function.
 function isLocalDollarLabel(label) { return label.startsWith('$') && !/^\$[sSe]\w/.test(label); }
 
+// Pieces of a function that compilers emit separately: GCC's cold paths
+// ("f(int) [clone .cold]", "f.cold"), MSVC's exception funclets ("main$dtor$0",
+// "f$catch$1", "`f'::`1'::dtor$0"). Returns the name of the function they belong to.
+const PART_RE = /^(.*?)(?:\s*\[clone \.cold(?:\.\d+)?\]|\.cold(?:\.\d+)?|\$(?:dtor|catch|fin|filt|unwind)\$\d+)$/;
+function partOf(name) {
+  const m = PART_RE.exec(String(name || ''));
+  if (m && m[1]) return m[1];
+  const msvc = /^`(.+)'::`\d+'::(?:dtor|catch|fin|filt)\$\d+$/.exec(String(name || ''));
+  return msvc ? msvc[1] : undefined;
+}
+
+// Folds those pieces into their function, so it is counted and shown whole.
+function mergeFunctionParts(functions) {
+  const byName = new Map(functions.map(f => [f.name, f]));
+  const out = [];
+  for (const f of functions) {
+    const parentName = partOf(f.name);
+    const parent = parentName !== undefined && (byName.get(parentName) || functions.find(g => g !== f && partOf(g.name) === undefined && g.name.replace(/\(.*$/, '') === parentName.replace(/\(.*$/, '')));
+    if (!parent || parent === f) { out.push(f); continue; }
+    parent.rows = [...parent.rows, ...f.rows];
+    parent.lines = [...parent.lines, ...f.lines];
+    parent.instructionRows = [...parent.instructionRows, ...f.instructionRows];
+    parent.instructionLines = [...parent.instructionLines, ...f.instructionLines];
+    parent.count += f.count;
+    for (const k of f.fileKeys) parent.fileKeys.add(k);
+    parent.assembly = parent.lines.join('\n');
+    parent.parts = [...(parent.parts || []), f.name];
+  }
+  return out;
+}
+
 function looksLikeFunctionLabel(label) {
   if (!label || label.startsWith('.') || isLocalDollarLabel(label)) return false;
   if (/^(?:[#;]|\/\/)/.test(label)) return false;   // comment lines such as LLVM's "# %bb.0:"
@@ -561,7 +592,7 @@ function cleanAssemblyForDisplay(result) {
 module.exports = {
   IS_WIN, normPath, isSystemPath,
   makeRefResolver, makeLocalRefResolver, localAsmToRows, sectionKind, unescapeAsmString, isMachO, prepareMachO, finishMachO,
-  parseFunctions, looksLikeFunctionLabel, isInstructionLine, cleanInstruction, buildLineIndex,
+  parseFunctions, mergeFunctionParts, partOf, looksLikeFunctionLabel, isInstructionLine, cleanInstruction, buildLineIndex,
   stripTemplateArgs, normalizeName, msvcName, sameName, matchSourceSymbol, findFunctionResult, findAllFunctionResults,
   ANSI_RE, missingIncludesFrom, preprocessorErrorFilesFrom, errorLocationsFrom, stubFilename,
   cleanAssemblyRowsForDisplay, cleanAssemblyForDisplay

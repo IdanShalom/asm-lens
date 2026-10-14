@@ -2,7 +2,7 @@
   "name": "asm-lens",
   "displayName": "Asm Lens",
   "description": "See the assembly of every function right in the editor: instruction counts as CodeLens, two-way source/assembly highlighting, headers and templates. Uses Compiler Explorer or your local compiler. C, C++, Rust, Go, Python, Zig, Swift, D and Fortran.",
-  "version": "0.7.0",
+  "version": "0.7.1",
   "publisher": "local-dev",
   "license": "MIT",
   "icon": "images/icon.png",
@@ -201,8 +201,8 @@
         },
         "asmLens.compilerName": {
           "type": "string",
-          "default": "GCC (selected ID)",
-          "description": "Friendly label shown in CodeLens."
+          "default": "",
+          "description": "Label for asmLens.compilerId in the status bar and CodeLens. Empty: the compiler id. Select Compiler fills it in."
         },
         "asmLens.flags": {
           "type": "string",
