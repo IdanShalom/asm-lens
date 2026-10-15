@@ -12,7 +12,7 @@ const flagsLib = require('./flags');
 const compileCommands = require('./compileCommands');
 const {
   IS_WIN, normPath, makeRefResolver, makeLocalRefResolver, localAsmToRows, isMachO, prepareMachO, finishMachO,
-  parseFunctions, mergeFunctionParts, buildLineIndex,
+  parseFunctions, mergeFunctionParts, buildLineIndex, normalizeName, sameName,
   matchSourceSymbol, findFunctionResult, findAllFunctionResults,
   ANSI_RE, missingIncludesFrom, preprocessorErrorFilesFrom, errorLocationsFrom, stubFilename,
   cleanAssemblyRowsForDisplay, cleanAssemblyForDisplay
@@ -273,7 +273,8 @@ function activate(context) {
   lineDecoration = vscode.window.createTextEditorDecorationType({
     backgroundColor: new vscode.ThemeColor('editor.wordHighlightStrongBackground'),
     isWholeLine: true,
-    borderWidth: '0 0 0 3px', borderStyle: 'solid', borderColor: new vscode.ThemeColor('focusBorder'),
+    // A frame with a thick left edge: stands out over the line colors without fading anything else.
+    borderWidth: '1px 1px 1px 3px', borderStyle: 'solid', borderColor: new vscode.ThemeColor('focusBorder'),
     overviewRulerColor: new vscode.ThemeColor('editor.findMatchHighlightBackground'),
     overviewRulerLane: vscode.OverviewRulerLane.Center
   });
@@ -329,7 +330,7 @@ function activate(context) {
         }
         const wasSkipped = !result && !inlined && (cached.skipped || []).some(k => k.key === key && sym.range.start.line >= k.startLine && sym.range.start.line <= k.endLine);
         const title = results.length > 1
-          ? `$(symbol-numeric) ${results.length} instantiations · ${results.map(r => r.count).join(' / ')} instructions · ${cached.compilerLabel}${viaRoot}`
+          ? `$(symbol-numeric) ${results.length} ${templates.has(sym) || /</.test(results[0].name) ? 'instantiations' : 'versions'} · ${results.map(r => r.count).join(' / ')} instructions · ${cached.compilerLabel}${viaRoot}`
           : result
             ? `$(symbol-numeric) ${result.count} instructions · ${cached.compilerLabel} · ${cached.flags}${viaRoot}`
             : inlined
@@ -440,7 +441,7 @@ function activate(context) {
     context.subscriptions.push(watcher);
   }
   // Settings that change what is compiled discard the results; display settings only redraw.
-  const COMPILE_SETTINGS = ['baseUrl', 'compilerId', 'compilerName', 'flags', 'language', 'includePaths', 'maxIncludeFiles', 'skipFailingFunctions', 'maxRecoveryAttempts', 'stubFailingHeaders', 'mode', 'localCompiler', 'compileCommands'];
+  const COMPILE_SETTINGS = ['baseUrl', 'compilerId', 'compilerName', 'flags', 'language', 'includePaths', 'maxIncludeFiles', 'skipFailingFunctions', 'maxRecoveryAttempts', 'stubFailingHeaders', 'mode', 'localCompiler', 'compileCommands', 'emitUnusedFunctions'];
   context.subscriptions.push(vscode.workspace.onDidChangeConfiguration(e => {
     if (!e.affectsConfiguration('asmLens')) return;
     if (COMPILE_SETTINGS.some(k => e.affectsConfiguration(`asmLens.${k}`))) return onConfigChanged();
@@ -793,9 +794,9 @@ function isFunctionSymbol(s) {
 function functionForLine(analysis, key, line) {
   const users = [...new Set((analysis.lineIndex.get(key)?.get(line) || []).map(e => e.fn).filter(Boolean))];
   if (users.length) {
-    const own = key === analysis.rootPathKey
-      ? users.find(f => f.sourceRange && f.sourceRange.start.line <= line && line <= f.sourceRange.end.line)
-      : undefined;
+    // The function the line belongs to (by name before lambdas and inlined library code), else the smallest user.
+    const inside = key === analysis.rootPathKey ? users.filter(f => f.sourceRange && f.sourceRange.start.line <= line && line <= f.sourceRange.end.line) : [];
+    const own = inside.find(f => sameName(normalizeName(f.name), normalizeName(f.sourceName))) || inside[0];
     return own || users.slice().sort((a, b) => a.count - b.count)[0];
   }
   if (key === analysis.rootPathKey) {
@@ -837,7 +838,8 @@ function analysisFor(document) {
 
 function functionAtSignature(document, position, analysis, key) {
   if (key === analysis.rootPathKey) {
-    const hit = analysis.functions.find(f => f.sourceRange && (f.sourceSelection || f.sourceRange).contains(position));
+    const hits = analysis.functions.filter(f => f.sourceRange && (f.sourceSelection || f.sourceRange).contains(position));
+    const hit = hits.find(f => sameName(normalizeName(f.name), normalizeName(f.sourceName))) || hits[0];
     if (hit) return hit;
   }
   const guessed = guessFunctionSymbols(document).find(s => s.range.start.line <= position.line && position.line <= s.selectionRange.start.line);
@@ -1107,12 +1109,18 @@ async function runAnalysis(document) {
     if (resolved.mode === 'local') return await analyzeLocal(document, resolved, settings);
     const { baseUrl, language } = resolved;
     // The syntax flag is Compiler Explorer's job (filters.intel), per compiler: -masm=intel would break MSVC and non-x86 compilers.
-    const { flags, syntax } = flagsLib.stripSyntaxFlags([resolved.flags, ...resolved.defines.map(d => `-D${d}`), resolved.extraFlags].filter(Boolean).join(' '));
+    const stripped = flagsLib.stripSyntaxFlags([resolved.flags, ...resolved.defines.map(d => `-D${d}`), resolved.extraFlags].filter(Boolean).join(' '));
     const compilerId = resolved.active.id;
     const timeoutMs = settings.get('requestTimeoutMs', 30000);
-    // MSVC does not know __attribute__((used)), so headers are compiled as they are.
-    const msvc = /^vcpp|msvc/i.test(`${compilerId} ${resolved.active.name || ''}`);
-    const prepared = prepareCSource(document, { keep: !msvc });
+    // The same flags serve every compiler: -O2 -std=c++20 becomes /O2 /std:c++20 for MSVC (and the other way round).
+    const msvcStyle = flagsLib.isMsvcStyle(compilerId, resolved.active.name);
+    const adapted = flagsLib.adaptFlags(stripped.flags, msvcStyle, { cxx: language !== 'c' });
+    if (adapted.changes.length) outputChannel.appendLine(`Flags for ${compilerId}: ${adapted.changes.join(', ')}`);
+    const { flags } = adapted, { syntax } = stripped;
+    // MSVC does not know __attribute__((used)): functions are kept by taking their address (clang-cl knows it).
+    const marksKey = `${document.uri.toString()}\n${compilerId}\n${flags}`;
+    const marks = marksRejected.has(marksKey) ? 'none' : msvcStyle && !/clang/i.test(`${compilerId} ${resolved.active.name || ''}`) ? 'address' : 'attribute';
+    const prepared = prepareCSource(document, { marks });
     report('finding local headers…');
     const includeBundle = await collectLocalIncludes(document, resolved.includePaths, {
       maxFiles: resolved.maxIncludeFiles, buildFolders: resolved.buildFolders,
@@ -1124,16 +1132,24 @@ async function runAnalysis(document) {
       baseUrl, compilerId, language, timeoutMs, flags, syntax, includeBundle, maxAttempts, recoverErrors, rootFile: document.fileName,
       instFirstLine: prepared.firstLine, instCount: prepared.instCount, original: prepared.plain
     };
-    let compiled;
+    let compiled, keptFailed = false;
     if (prepared.kept !== undefined) {
       try { compiled = await compileWithRecovery({ ...opts, source: prepared.kept, kept: true }); }
       catch (e) {
         // Cancelled, timed out or rate-limited: compiling the plain text would not help.
         if (e.name === 'AbortError' || e.name === 'Cancelled' || Date.now() < rateLimitedUntil) throw e;
-        outputChannel.appendLine(`  header: compiling it again without ${msvc ? 'the lines that keep its functions' : '__attribute__((used))'}`);
+        keptFailed = true;
+        outputChannel.appendLine(`  compiling it again without ${marks === 'address' ? 'the lines that keep its functions' : '__attribute__((used))'}`);
       }
     }
-    if (!compiled) compiled = await compileWithRecovery({ ...opts, source: prepared.plain });
+    if (!compiled) {
+      compiled = await compileWithRecovery({ ...opts, source: prepared.plain });
+      // The text as written compiled at once, so the marks were the problem: not tried again for this file and compiler.
+      if (keptFailed && !compiled.skipped.length && !compiled.stubbed.length && !compiled.removedFlags.length) {
+        if (marksRejected.size > 200) marksRejected.clear();
+        marksRejected.add(marksKey);
+      }
+    }
     const { data, effectiveFlags } = compiled;
     const asmRows = Array.isArray(data.asm) ? data.asm : [];
     const rootPathKey = docPathKey(document);
@@ -1197,27 +1213,36 @@ function reportHeaderWithoutCode(document) {
     : 'Asm Lens: this header emitted no code (it only has declarations). Analyze a .cpp file that uses it, then come back to this file.');
 }
 
-// The text to compile for a C/C++ file. A header compiled on its own gets its
-// functions kept: marked __attribute__((used)) (`keep`), or, for compilers
-// without it (MSVC), referenced by lines that take their address. `kept` is
-// that text and `plain` the fallback. Requested template instantiations, then
+// The text to compile for a C/C++ file. Functions a compiler leaves out when
+// nothing calls them are kept: in a header compiled on its own all of them,
+// elsewhere the in-class, inline, static and constexpr ones (with
+// asmLens.emitUnusedFunctions). `marks` says how: 'attribute' marks them
+// __attribute__((used)), 'address' (MSVC) appends lines that take their
+// address, 'none' keeps nothing. `kept` is that text (undefined when nothing
+// is kept) and `plain` the fallback. Requested template instantiations, then
 // those lines, come after the file's last line, from `firstLine` on (-1: none).
-function prepareCSource(document, { keep = true } = {}) {
+function prepareCSource(document, { marks = 'attribute' } = {}) {
   const original = document.getText();
   const isHeader = HEADER_RE.test(document.fileName);
   const insts = /cpp/.test(document.languageId) ? instantiationsFor(document) : [];
   const withInsts = text => scan.appendInstantiations(text, insts).text;
   const plain = withInsts(original);
+  const keep = marks !== 'none' && (isHeader || config().get('emitUnusedFunctions', true));
   let kept;
-  if (isHeader && keep) kept = withInsts(keepHeaderFunctions(original));
-  else if (isHeader) {
-    const lines = scan.keepByAddress(original, { c: document.languageId === 'c' });
+  if (keep && marks === 'attribute') {
+    const marked = keepHeaderFunctions(original, { all: isHeader });
+    if (marked !== original) kept = withInsts(marked);
+  } else if (keep) {
+    const lines = scan.keepByAddress(original, { c: document.languageId === 'c', all: isHeader });
     if (lines.length) kept = `${plain.endsWith('\n') ? plain : `${plain}\n`}${lines.join('\n')}\n`;
   }
   const base = original.endsWith('\n') ? original : `${original}\n`;
-  const appended = insts.length || (kept !== undefined && !keep);
+  const appended = insts.length || (kept !== undefined && marks === 'address');
   return { isHeader, firstLine: appended ? (base.match(/\n/g) || []).length : -1, instCount: insts.length, kept, plain };
 }
+
+// "file \n compiler \n flags" for which the kept text failed and the plain text compiled.
+const marksRejected = new Set();
 
 // Undoes __attribute__((used)) on the main-file lines the compiler complains about.
 function revertKeptLines(source, original, lines) {
@@ -1404,7 +1429,10 @@ async function localCompilePlan(document, resolved, baseDir) {
     outputChannel.appendLine(`compile_commands: no entry for ${document.fileName}; using the settings.`);
   }
   const incDirs = (resolved.includePaths || []).map(p => p && typeof p === 'object' ? p.dir : (path.isAbsolute(p) ? p : path.resolve(baseDir, p)));
-  const flags = [resolved.flags, ...resolved.defines.map(d => `-D${d}`), resolved.extraFlags].filter(Boolean).join(' ');
+  // Flags written for MSVC (/O2 /std:c++20) are given in the GCC/Clang form.
+  const adapted = flagsLib.adaptFlags([resolved.flags, ...resolved.defines.map(d => `-D${d}`), resolved.extraFlags].filter(Boolean).join(' '), false);
+  if (adapted.changes.length) outputChannel.appendLine(`Flags for ${path.basename(resolved.localCompiler || '')}: ${adapted.changes.join(', ')}`);
+  const { flags } = adapted;
   const { args, syntax } = flagsLib.stripSyntaxArgs([...splitArgs(flags), ...incDirs.map(d => `-I${d}`)]);
   return {
     compiler: resolved.localCompiler, cwd: fileDir, args, syntax, fromDatabase: false,
@@ -1457,6 +1485,7 @@ async function analyzeLocal(document, resolved, settings) {
   let ownFlags = [...flagsLib.syntaxArgs(info.kind, flagsLib.targetOf(plan.args, info.target), plan.syntax), '-fdiagnostics-color=never'];
   let baseArgs = plan.args;
   const removedFlags = [];
+  let addedStd = '';
 
   // Empty stand-ins for headers that are not found anywhere.
   const stubDir = path.join(os.tmpdir(), 'asm-lens-stubs-' + crypto.createHash('md5').update(document.uri.fsPath).digest('hex').slice(0, 10));
@@ -1485,6 +1514,13 @@ async function analyzeLocal(document, resolved, settings) {
     if (r.code === 0) { asm = r.stdout; break; }
     const err = r.stderr.replace(ANSI_RE, '');
     let progressed = false;
+    // A compiler whose default is C++98 (Apple clang 14, GCC 5) and no -std given -> C++17, the default of current ones.
+    if (lang === 'c++' && !addedStd && !baseArgs.some(a => /^-std=/.test(a)) && flagsLib.needsNewerStd(err)) {
+      addedStd = '-std=gnu++17';
+      ownFlags = [...ownFlags, addedStd];
+      outputChannel.appendLine(`  ${path.basename(compiler)} defaults to an older C++ standard: added ${addedStd} (put a -std flag in the flags to choose another)`);
+      continue;
+    }
     // A flag the compiler does not accept -> leave it out.
     const rejected = flagsLib.rejectedFlagsFrom(err);
     if (rejected.length) {
@@ -1526,7 +1562,7 @@ async function analyzeLocal(document, resolved, settings) {
       keptHeader = false;
       source = prepared.plain;
       for (const l of failedLines) source = blankLine(source, l);
-      outputChannel.appendLine('  header: compiling it as written (without the added marks)');
+      outputChannel.appendLine('  compiling it as written (without the added marks)');
       continue;
     }
     if (!progressed && recoverErrors) {
@@ -1544,7 +1580,7 @@ async function analyzeLocal(document, resolved, settings) {
       source = prepared.plain;
       for (const l of failedLines) source = blankLine(source, l);
       skipped.length = 0;
-      outputChannel.appendLine('  header: retrying without __attribute__((used))');
+      outputChannel.appendLine('  retrying without __attribute__((used))');
       continue;
     }
     if (!progressed || attempt === maxAttempts) {
@@ -1569,7 +1605,7 @@ async function analyzeLocal(document, resolved, settings) {
     resolveRef: makeLocalRefResolver(rootPathKey, cwd, [], await realDirsFor([cwd, fileDir, baseDir])),
     compilerId: compiler,
     compilerLabel: `${path.basename(compiler)} (local)`,
-    flags: plan.display,
+    flags: [plan.display, addedStd].filter(Boolean).join(' '),
     configFile: resolved.configFile,
     skipped: skipped.filter(k => prepared.firstLine < 0 || k.startLine < prepared.firstLine),
     stubbed
@@ -1929,6 +1965,7 @@ function showAssembly(result, analysis, { reveal = true } = {}) {
     meta: `${analysis.compilerLabel} · ${analysis.compilerId} · ${analysis.flags}`,
     noMap: !displayRows.some(r => r.ref),
     colorize: config().get('colorizeLines', true),
+    dim: config().get('dimOtherLines', false),
     rows: displayRows.map(row => row.ref
       ? { t: row.text, f: fileKeys.indexOf(row.ref.key), l: row.ref.line, c: row.ref.column, k: colorOf.get(`${row.ref.key}\n${row.ref.line}`) }
       : { t: row.text })
@@ -1950,7 +1987,7 @@ body{font-family:var(--vscode-font-family);color:var(--vscode-foreground);paddin
 .asm-line{display:block;min-height:1em;transition:opacity 80ms}
 .asm-line[data-l]{cursor:pointer}
 ${paletteCss}
-.asm.focus .asm-line:not(.hl){opacity:.38}
+.asm.dim.focus .asm-line:not(.hl){opacity:.38}
 .asm-line.hl{background:var(--vscode-editor-wordHighlightStrongBackground,var(--vscode-editor-findMatchHighlightBackground));box-shadow:inset 3px 0 0 var(--vscode-focusBorder)}
 .asm-line.hl-self{background:var(--vscode-editor-findMatchBackground);outline:1px solid var(--vscode-focusBorder)}
 .meta{color:var(--vscode-descriptionForeground);margin-bottom:14px}
@@ -1968,6 +2005,7 @@ function mark(k,el,scroll){
 }
 function render(m){
   clearMarks();groups=new Map();
+  box.classList.toggle('dim',!!m.dim);
   document.getElementById('title').textContent=m.title;
   document.getElementById('meta').textContent=m.meta;
   document.getElementById('nomap').hidden=!m.noMap;
@@ -2054,11 +2092,11 @@ function visibleEditorsFor(key) {
 }
 
 // Highlights the source line of a hovered instruction (and the token at its
-// column, when the compiler reports one) and dims the other lines of the
-// function, so the part that produced the instruction stands out.
+// column, when the compiler reports one). With asmLens.dimOtherLines the other
+// lines of the function fade too.
 function highlightSource(key, line, column) {
   clearSourceHighlight();
-  const span = panelState && config().get('dimOtherLines', true) ? sourceSpanOf(panelState.result, panelState.analysis, key) : undefined;
+  const span = panelState && config().get('dimOtherLines', false) ? sourceSpanOf(panelState.result, panelState.analysis, key) : undefined;
   for (const editor of visibleEditorsFor(key)) {
     const document = editor.document;
     if (line >= document.lineCount) continue;
@@ -2332,6 +2370,6 @@ module.exports = {
   _internals: {
     resolveSettings, showAssembly, handleWebviewMessage, syncAsmHighlight, _state: () => ({ panelState, lastAnalysis }),
     compileWithRecovery, collectLocalIncludes, guessFunctionSymbols, sourceFunctionsOf, analysisFor, analyzeDocument,
-    instantiationsFor, prepareCSource, isSystemHeader, globToRegExp, splitArgs
+    instantiationsFor, prepareCSource, isSystemHeader, globToRegExp, splitArgs, functionForLine
   }
 };

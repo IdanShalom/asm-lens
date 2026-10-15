@@ -431,3 +431,37 @@ test('mergeFunctionParts: GCC cold paths and MSVC funclets belong to their funct
   assert.equal(asm.partOf('main$catch$1'), 'main');
   assert.equal(asm.partOf('main'), undefined);
 });
+
+test('mergeFunctionParts: RTTI, vtables, guard variables and labels without instructions are not functions', () => {
+  const rows = [
+    'Sq::Sq(double) [base object constructor]:', '        movsd   QWORD PTR [rdi+8], xmm0', '        ret',
+    'typeinfo name for Sq:', '        .string "2Sq"',
+    'typeinfo for Sq:', '        .quad   vtable for __cxxabiv1::__si_class_type_info+16', '        .quad   typeinfo name for Sq',
+    'vtable for Sq:', '        .quad   0', '        .quad   typeinfo for Sq',
+    'guard variable for get()::x:', '        .zero   8',
+    '.LC0:', '        .string "hi"',
+    'some_table:', '        .long   1',
+    "const Sq::`vftable'", '        DQ      FLAT:?area@Sq@@UEBANXZ',
+    'main:', '        xor     eax, eax', '        ret'
+  ].map(text => ({ text }));
+  const fns = asm.mergeFunctionParts(asm.parseFunctions(rows, () => undefined));
+  assert.deepEqual(fns.map(f => f.name), ['Sq::Sq(double) [base object constructor]', 'main']);
+  for (const n of ['typeinfo for Sq', 'typeinfo name for Sq', 'vtable for Sq', 'VTT for Sq', 'guard variable for f()::x', "const Sq::`vftable'", "const Sq::`RTTI Complete Object Locator'"]) assert.equal(asm.isDataSymbol(n), true, n);
+  for (const n of ['Sq::Sq(double)', 'non-virtual thunk to Sq::area() const', 'main', 'vtable_builder()']) assert.equal(asm.isDataSymbol(n), false, n);
+});
+
+test('findAllFunctionResults: copies with the same name and code are shown once; lambdas in main are not main', () => {
+  const f = (name, line, code, extra = {}) => ({ name, sourceName: name, fileKeys: new Set(['R']), sourceRange: range(line, line + 2), instructionRows: code.map(text => ({ text, ref: { key: 'R', line } })), count: code.length, ...extra });
+  const functions = [
+    f('Sq::Sq(double)', 6, ['mov QWORD PTR [rdi], 1', 'ret']),
+    f('Sq::Sq(double)', 6, ['mov QWORD PTR [rdi], 1', 'ret']),
+    f('Sq::~Sq()', 6, ['ret']),
+    f('main', 10, ['push rbx', 'call .LBB0_1', 'ret']),
+    f('main::{lambda(int)#1}::operator()(int) const', 10, ['lea eax, [rdi+1]', 'ret']),
+    f('void std::__insertion_sort<int*, main::{lambda(int, int)#1}>(int*, int*, main::{lambda(int, int)#1})', 10, ['cmp edi, esi', 'ret'])
+  ];
+  assert.deepEqual(asm.findAllFunctionResults(sym('Sq', 6, 6), functions, 'R', 'R').map(x => x.count), [2], 'one constructor; the destructor is not it');
+  assert.deepEqual(asm.findAllFunctionResults(sym('main', 10, 12), functions, 'R', 'R').map(x => x.name), ['main']);
+  const differs = [f('P::P()', 1, ['mov eax, 1', 'ret']), f('P::P()', 1, ['jmp P::P()'])];
+  assert.equal(asm.findAllFunctionResults(sym('P', 1, 1), differs, 'R', 'R').length, 2, 'different code: both shown');
+});

@@ -551,7 +551,7 @@ const msvcRows = [
   { text: 'int two(void) ENDP                                    ; two' }
 ];
 
-test('MSVC on Compiler Explorer: functions are found, and no -masm flag is sent (it warns D9002)', async () => {
+test('MSVC on Compiler Explorer: functions are found, no -masm flag is sent (it warns D9002), -O2 is sent as /O2 /EHsc', async () => {
   const dir = makeProject({ 'a.cpp': 'int one() { return 1; }\nint two() { return 2; }\n' }, { compilers: [{ id: 'vcpp_v19_latest_x64', name: 'x64 msvc' }] });
   const ce = fakeCompilerExplorer(body => /-masm/.test(body.options.userArguments)
     ? { code: 0, stderr: err("cl : Command line warning D9002 : ignoring unknown option '-masm=intel'"), asm: [] }
@@ -560,10 +560,11 @@ test('MSVC on Compiler Explorer: functions are found, and no -masm flag is sent 
     const x = start(dir);
     const msg = await x.analyze('a.cpp');
     assert.match(msg.info[0], /found 2 emitted function bodies/);
-    assert.equal(ce.requests[0].body.options.userArguments, '-O2');
+    assert.equal(ce.requests[0].body.options.userArguments, '/O2 /EHsc');
     assert.equal(ce.requests[0].body.options.filters.intel, true);
-    assert.equal(await x.lensAt('a.cpp', 1), '$(symbol-numeric) 2 instructions · x64 msvc · -O2');
-    assert.equal(await x.lensAt('a.cpp', 2), '$(symbol-numeric) 2 instructions · x64 msvc · -O2');
+    assert.equal(await x.lensAt('a.cpp', 1), '$(symbol-numeric) 2 instructions · x64 msvc · /O2 /EHsc');
+    assert.equal(await x.lensAt('a.cpp', 2), '$(symbol-numeric) 2 instructions · x64 msvc · /O2 /EHsc');
+    assert.ok(x.state.outputLines.some(l => /Flags for vcpp_v19_latest_x64: -O2 -> \/O2, added \/EHsc/.test(l)), 'the translation is logged');
   } finally { ce.restore(); }
 });
 
@@ -703,7 +704,7 @@ test('highlighting: the view is built once; switching functions and highlighting
   } finally { ce.restore(); }
 });
 
-test('highlighting: hovering an instruction highlights its line and dims the rest of the function (unless turned off)', async () => {
+test('highlighting: hovering an instruction highlights its line; the rest stays as it is unless dimOtherLines is on', async () => {
   const dir = makeProject({ 'a.cpp': 'int f(int x) {\n  int y = x * 2;\n  y += 3;\n  return y;\n}\n' });
   const ce = fakeCompilerExplorer(() => ({ code: 0, asm: [
     { text: 'f(int):' },
@@ -717,17 +718,20 @@ test('highlighting: hovering an instruction highlights its line and dims the res
     await x.state.commands.get('asmLens.showAssembly')(x.vscode.Uri.file(x.at('a.cpp')), 'f', 0);
     const editor = x.state.activeEditor;
     const byType = () => [...editor.decorations.entries()].map(([type, ranges]) => [type.options, ranges.map(r => (r.range || r).start.line + '-' + (r.range || r).end.line)]);
+    assert.equal(x.state.lastRender().dim, false, 'the assembly view does not fade the other instructions');
     x.state.webviewHandler({ type: 'highlight', file: 0, line: 2 });
-    const decos = byType();
-    const line = decos.find(([o]) => o.isWholeLine && o.borderColor);
-    const dim = decos.find(([o]) => o.opacity);
-    assert.deepEqual(line[1], ['2-2']);
-    assert.deepEqual(dim[1], ['0-1', '3-4'], 'the other lines of f() are dimmed');
+    let decos = byType();
+    assert.deepEqual(decos.find(([o]) => o.isWholeLine && o.borderColor)[1], ['2-2']);
+    assert.ok(decos.filter(([o]) => o.opacity).every(([, r]) => r.length === 0), 'nothing is dimmed by default');
+    x.state.webviewHandler({ type: 'clearHighlight' });
+    await x.vscode.workspace.getConfiguration('asmLens').update('dimOtherLines', true);
+    assert.equal(x.state.lastRender().dim, true, 'the assembly view is redrawn with fading');
+    x.state.webviewHandler({ type: 'highlight', file: 0, line: 2 });
+    decos = byType();
+    assert.deepEqual(decos.find(([o]) => o.isWholeLine && o.borderColor)[1], ['2-2']);
+    assert.deepEqual(decos.find(([o]) => o.opacity)[1], ['0-1', '3-4'], 'the other lines of f() are dimmed');
     x.state.webviewHandler({ type: 'clearHighlight' });
     assert.ok(byType().filter(([o]) => o.opacity || o.borderColor).every(([, r]) => r.length === 0), 'line, token and dim highlights are cleared');
-    x.state.settings['asmLens.dimOtherLines'] = false;
-    x.state.webviewHandler({ type: 'highlight', file: 0, line: 1 });
-    assert.deepEqual(byType().find(([o]) => o.opacity)[1], []);
   } finally { ce.restore(); }
 });
 
@@ -745,7 +749,7 @@ test('header with MSVC: functions are kept by taking their address; lines that d
     assert.equal(ce.requests[0].body.source.split('\n').slice(3).join('|'), 'auto __asm_lens_keep_0 = &a;|auto __asm_lens_keep_1 = &b;|auto __asm_lens_keep_2 = &b;|');
     assert.ok(!/__attribute__/.test(ce.requests[0].body.source));
     assert.deepEqual(msg.warning, [], 'no "could not instantiate" for our own lines');
-    assert.equal(await x.lensAt('h.hpp', 1), '$(symbol-numeric) 2 instructions · x64 msvc · -O2');
+    assert.equal(await x.lensAt('h.hpp', 1), '$(symbol-numeric) 2 instructions · x64 msvc · /O2 /EHsc');
   } finally { ce.restore(); }
 });
 
@@ -862,5 +866,105 @@ test('changing the compiler in the settings by hand analyzes the visible file ag
     await x.vscode.workspace.getConfiguration('asmLens').update('compilerId', 'g152', 1);
     await new Promise(r => setTimeout(r, 700));
     assert.equal(ce.requests.length, before);
+  } finally { ce.restore(); }
+});
+
+// ---------------------------------------------------------------------------
+// 0.8.0: functions defined in classes, one main, MSVC flags
+
+const CLASSY = [
+  'struct P { int dot() const { return 1; } };',                                        // 1
+  'static int helper(int x) { return x; }',                                             // 2
+  'int ext(int x) { return x; }',                                                       // 3
+  'int main() {',                                                                       // 4
+  '  auto l = [](int a) { return a + 1; };',                                            // 5
+  '  P p; return p.dot() + l(1) + helper(2);',                                          // 6
+  '}'                                                                                   // 7
+].join('\n') + '\n';
+
+const classyRows = () => [
+  { text: 'P::dot() const:' }, { text: '        mov eax, 1', source: { file: null, line: 1 } }, { text: '        ret', source: { file: null, line: 1 } },
+  { text: 'helper(int):' }, { text: '        mov eax, edi', source: { file: null, line: 2 } }, { text: '        ret', source: { file: null, line: 2 } },
+  { text: 'ext(int):' }, { text: '        mov eax, edi', source: { file: null, line: 3 } }, { text: '        ret', source: { file: null, line: 3 } },
+  { text: 'main::{lambda(int)#1}::operator()(int) const:' }, { text: '        lea eax, [rdi+1]', source: { file: null, line: 5 } }, { text: '        ret', source: { file: null, line: 5 } },
+  { text: 'main:' }, { text: '        push rbx', source: { file: null, line: 4 } }, { text: '        mov eax, 5', source: { file: null, line: 6 } }, { text: '        lea eax, [rax+1]', source: { file: null, line: 5 } }, { text: '        pop rbx', source: { file: null, line: 7 } }, { text: '        ret', source: { file: null, line: 7 } },
+  { text: 'typeinfo for P:' }, { text: '        .quad 0', source: { file: null, line: 1 } }
+];
+
+test('.cpp with GCC/Clang: in-class, static and inline functions are marked used (same lines); external ones and main are not; asmLens.emitUnusedFunctions turns it off', async () => {
+  const dir = makeProject({ 'a.cpp': CLASSY });
+  const ce = fakeCompilerExplorer(() => ({ code: 0, asm: classyRows() }));
+  try {
+    const x = start(dir);
+    await x.analyze('a.cpp');
+    const sent = ce.requests[0].body.source.split('\n');
+    assert.equal(sent.length, CLASSY.split('\n').length, 'line numbers are unchanged');
+    assert.equal(sent[0], 'struct P { __attribute__((used)) int dot() const { return 1; } };');
+    assert.equal(sent[1], '__attribute__((used)) static int helper(int x) { return x; }');
+    assert.deepEqual(sent.slice(2), CLASSY.split('\n').slice(2), 'external functions and main are sent as written');
+    assert.equal(await x.lensAt('a.cpp', 1), '$(symbol-numeric) 2 instructions · g152 · -O2');
+    assert.equal(await x.lensAt('a.cpp', 4), '$(symbol-numeric) 5 instructions · g152 · -O2', 'main: one result (not its lambda, not typeinfo)');
+    await x.vscode.workspace.getConfiguration('asmLens').update('emitUnusedFunctions', false);
+    await x.analyze('a.cpp');
+    assert.equal(ce.requests.at(-1).body.source, CLASSY, 'turned off: the text as written');
+  } finally { ce.restore(); }
+});
+
+test('.cpp with MSVC: functions are kept by taking their address (members qualified); the flags are written for cl.exe', async () => {
+  const dir = makeProject({ 'a.cpp': CLASSY }, { compilers: [{ id: 'vcpp_v19_latest_x64', name: 'x64 msvc v19.latest', flags: '-O3 -std=c++20 -march=native' }] });
+  const ce = fakeCompilerExplorer(() => ({ code: 0, asm: classyRows() }));
+  try {
+    const x = start(dir);
+    await x.analyze('a.cpp');
+    const { source, options } = ce.requests[0].body;
+    assert.ok(!source.includes('__attribute__'));
+    assert.deepEqual(source.split('\n').slice(7), ['auto __asm_lens_keep_0 = &P::dot;', 'auto __asm_lens_keep_1 = &helper;', '']);
+    assert.equal(options.userArguments, '/O2 /std:c++20 /EHsc');
+    assert.equal(await x.lensAt('a.cpp', 1), '$(symbol-numeric) 2 instructions · x64 msvc v19.latest · /O2 /std:c++20 /EHsc');
+  } finally { ce.restore(); }
+});
+
+test('.cpp: when the marked text fails and the text as written compiles, the marks are not tried again for that file and compiler', async () => {
+  const dir = makeProject({ 'a.cpp': CLASSY });
+  const ce = fakeCompilerExplorer(body => body.source.includes('__attribute__')
+    ? { code: 1, stderr: err('<source>:6:3: error: something the marks broke') }
+    : { code: 0, asm: classyRows() });
+  try {
+    const x = start(dir);
+    assert.deepEqual((await x.analyze('a.cpp')).error, []);
+    assert.equal(ce.requests.length, 2);
+    assert.ok(x.state.outputLines.some(l => /compiling it again without __attribute__\(\(used\)\)/.test(l)));
+    x.edit('a.cpp', 6, 1, 6, 1, ' // edited');
+    await x.analyze('a.cpp');
+    assert.equal(ce.requests.length, 3, 'one request: the text as written');
+    assert.ok(!ce.requests[2].body.source.includes('__attribute__'));
+  } finally { ce.restore(); }
+});
+
+test('constructors: copies with the same code are one result; different ones are "versions", not "instantiations"', async () => {
+  const dir = makeProject({ 'a.cpp': 'struct Q {\n  Q() : v(1) {}\n  ~Q() { v = 0; }\n  int v;\n};\nQ make() { return Q(); }\n' });
+  const ctor = (suffix, code) => [{ text: `Q::Q()${suffix}:` }, ...code.map(text => ({ text, source: { file: null, line: 2 } }))];
+  const ce = fakeCompilerExplorer(() => ({ code: 0, asm: [
+    ...ctor('', ['mov DWORD PTR [rdi], 1', 'ret']), ...ctor('', ['mov DWORD PTR [rdi], 1', 'ret']),
+    { text: 'Q::~Q():' }, { text: '        mov DWORD PTR [rdi], 0', source: { file: null, line: 3 } }, { text: '        ret', source: { file: null, line: 3 } },
+    { text: 'Q::~Q():' }, { text: '        jmp Q::~Q()', source: { file: null, line: 3 } }
+  ] }));
+  try {
+    const x = start(dir);
+    await x.analyze('a.cpp');
+    assert.equal(await x.lensAt('a.cpp', 2), '$(symbol-numeric) 2 instructions · g152 · -O2');
+    assert.equal(await x.lensAt('a.cpp', 3), '$(symbol-numeric) 2 versions · 2 / 1 instructions · g152');
+  } finally { ce.restore(); }
+});
+
+test('functionForLine: a line of main is main, not the lambda or library code that shares it', async () => {
+  const dir = makeProject({ 'a.cpp': CLASSY });
+  const ce = fakeCompilerExplorer(() => ({ code: 0, asm: classyRows() }));
+  try {
+    const x = start(dir);
+    await x.analyze('a.cpp');
+    const a = x.analysis('a.cpp');
+    assert.equal(x.ext._internals.functionForLine(a, a.rootPathKey, 4).name, 'main', 'line 5 (the lambda) is in main');
+    assert.equal(x.ext._internals.functionForLine(a, a.rootPathKey, 0).name, 'P::dot() const');
   } finally { ce.restore(); }
 });

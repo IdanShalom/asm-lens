@@ -5,3 +5,5 @@ test/**
 .gitignore
 .gitattributes
 node_modules/**
+demo/**
+images/demo.mov

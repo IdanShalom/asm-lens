@@ -268,6 +268,7 @@ function mergeFunctionParts(functions) {
   const byName = new Map(functions.map(f => [f.name, f]));
   const out = [];
   for (const f of functions) {
+    if (isDataSymbol(f.name)) continue;
     const parentName = partOf(f.name);
     const parent = parentName !== undefined && (byName.get(parentName) || functions.find(g => g !== f && partOf(g.name) === undefined && g.name.replace(/\(.*$/, '') === parentName.replace(/\(.*$/, '')));
     if (!parent || parent === f) { out.push(f); continue; }
@@ -280,7 +281,27 @@ function mergeFunctionParts(functions) {
     parent.assembly = parent.lines.join('\n');
     parent.parts = [...(parent.parts || []), f.name];
   }
-  return out;
+  // Labels without instructions are data (string literals, tables, aliases), not functions.
+  return out.filter(f => f.instructionRows.length > 0);
+}
+
+// Data the compiler emits next to the functions: RTTI, vtables, guard variables
+// (GCC/Clang), and MSVC's vftables and RTTI. Their names would otherwise look
+// like the class's constructor.
+const DATA_SYMBOL_RE = /^(?:typeinfo(?: name)? for|vtable for|VTT for|construction vtable for|guard variable for|reference temporary(?: #\d+)? for)\s|`(?:vftable|vbtable|RTTI [^']*|string)'/;
+function isDataSymbol(name) { return DATA_SYMBOL_RE.test(String(name || '')); }
+
+// Copies of one function with the same name and the same code (a constructor's
+// complete- and base-object versions on macOS) are shown once.
+function distinctCode(list) {
+  const seen = new Set();
+  return list.filter(f => {
+    const code = f.instructionRows.map(r => String(r.text || '').trim().replace(/\.?L[\w$.]+/g, 'L')).join('\n');
+    const key = `${String(f.name).replace(/\s*\[[^\]]*\]$/, '')}\n${code}`;
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
 }
 
 function looksLikeFunctionLabel(label) {
@@ -435,10 +456,12 @@ function sameName(asmNorm, symNorm) {
 
 // Source function for an emitted function. By location: the source function
 // of the same name that contains some of its instructions; otherwise the one
-// that contains most of them (template instantiations, lambdas, names the
-// source spells differently). A function that inlines another function of the
-// file has instructions on that function's lines too, so the name decides
-// first. With `requireName`, only symbols of the same name are considered.
+// that contains most of them, if that is most of the function (lambdas, names
+// the source spells differently). A function that inlines another function of
+// the file has instructions on that function's lines too, so the name decides
+// first; and a library function that inlined a lambda (std::sort's internals)
+// is not taken for the function around the lambda. With `requireName`, only
+// symbols of the same name are considered.
 function matchSourceSymbol(asmName, symbols, fn, docKey, opts = {}) {
   const norm = normalizeName(asmName);
   const named = symbols.filter(s => sameName(norm, normalizeName(s.name)));
@@ -447,8 +470,14 @@ function matchSourceSymbol(asmName, symbols, fn, docKey, opts = {}) {
     const mapped = fn.instructionRows.filter(r => r.ref);
     const lines = mapped.filter(r => r.ref.key === docKey).map(r => r.ref.line);
     if (lines.length) {
-      const best = mostHits(named, lines) || mostHits(candidates, lines);
-      if (best) return best;
+      const byName = mostHits(named, lines);
+      if (byName) return byName;
+      const byPlace = mostHits(candidates, lines);
+      if (byPlace) {
+        const inside = lines.filter(l => l >= byPlace.range.start.line && l <= byPlace.range.end.line).length;
+        if (inside * 2 >= Math.max(fn.instructionRows.length, 1)) return byPlace;
+      }
+      return undefined;
     }
     // All of its code comes from other files (e.g. a header template): not a function of this file.
     if (mapped.length && !lines.length) return undefined;
@@ -506,14 +535,19 @@ function findAllFunctionResults(symbol, functions, docKey, rootKey) {
   const usable = f => !docKey || !f.fileKeys || f.fileKeys.size === 0 || f.fileKeys.has(docKey);
   if (symbol.range && docKey === rootKey) {
     const all = functions.filter(f => usable(f) && f.sourceRange && f.sourceRange.start.line === symbol.range.start.line);
-    if (all.length) return all;
+    // Several are instantiations when they carry the symbol's name; lambdas and other
+    // functions inside it (main's lambdas) are not listed as its instantiations.
+    const norm = normalizeName(symbol.name);
+    const named = all.filter(f => sameName(normalizeName(f.name), norm));
+    if (named.length) return distinctCode(named);
+    if (all.length) return distinctCode(all);
   }
   if (docKey !== rootKey) {
     const norm = normalizeName(symbol.name);
     const all = functions.filter(f => f.fileKeys && f.fileKeys.has(docKey) && !f.sourceRange && sameName(normalizeName(f.name), norm));
     if (all.length) {
-      if (!symbol.range || symbol.range.start.line === symbol.range.end.line) return all;
-      return all.filter(f => hasRowsIn(f, docKey, symbol.range));
+      if (!symbol.range || symbol.range.start.line === symbol.range.end.line) return distinctCode(all);
+      return distinctCode(all.filter(f => hasRowsIn(f, docKey, symbol.range)));
     }
   }
   const one = findFunctionResult(symbol, functions, docKey, rootKey);
@@ -592,7 +626,7 @@ function cleanAssemblyForDisplay(result) {
 module.exports = {
   IS_WIN, normPath, isSystemPath,
   makeRefResolver, makeLocalRefResolver, localAsmToRows, sectionKind, unescapeAsmString, isMachO, prepareMachO, finishMachO,
-  parseFunctions, mergeFunctionParts, partOf, looksLikeFunctionLabel, isInstructionLine, cleanInstruction, buildLineIndex,
+  parseFunctions, mergeFunctionParts, partOf, isDataSymbol, looksLikeFunctionLabel, isInstructionLine, cleanInstruction, buildLineIndex,
   stripTemplateArgs, normalizeName, msvcName, sameName, matchSourceSymbol, findFunctionResult, findAllFunctionResults,
   ANSI_RE, missingIncludesFrom, preprocessorErrorFilesFrom, errorLocationsFrom, stubFilename,
   cleanAssemblyRowsForDisplay, cleanAssemblyForDisplay

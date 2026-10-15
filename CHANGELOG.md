@@ -1,5 +1,33 @@
 # Changelog
 
+## 0.8.0
+
+### New
+- **Functions inside classes, with every compiler**: methods defined in a class body, and `static`,
+  `inline` and `constexpr` functions, get their own counts in a `.cpp` file even when nothing calls them
+  or every call was inlined. The compiled copy marks them `__attribute__((used))` (MSVC: takes their
+  address after the last line); line numbers and your file stay the same, and if the marked copy does
+  not compile the file is compiled as written (and the marks are not tried again for that file and
+  compiler). New setting `asmLens.emitUnusedFunctions` (on by default).
+- **MSVC flags**: the usual GCC/Clang flags are translated for MSVC and clang-cl (`-O3` → `/O2`,
+  `-std=c++20` → `/std:c++20`, `-Wall` → `/W4`, `-fno-exceptions` → `/EHs-c-`, …); flags without an
+  equivalent (`-march`, `-g`) are left out instead of producing "D9002 ignoring unknown option", and C++
+  gets `/EHsc` like Visual Studio projects. MSVC flags given to GCC/Clang are translated the other way.
+  Each translation is listed in the output. Before, `-O3` silently compiled MSVC code unoptimized.
+- Local mode: a compiler whose default is C++98 (Apple clang 14) gets `-std=gnu++17` when the code needs
+  C++11 or later and no `-std` was given.
+
+### Fixes
+- **`main` (or a constructor) shown as several "instantiations"**: lambdas inside `main`, library
+  templates that inlined them (`std::sort` with a lambda), RTTI and vtables (`typeinfo for Sq`, which
+  looked like the constructor `Sq`) were counted as copies of the function. Now only functions of the
+  same name are, data is never a function, copies with identical code (a constructor's complete- and
+  base-object versions) are shown once, and copies of a non-template function are called "versions".
+- The cursor in `main` selects `main` in the assembly view, not a lambda or library code on that line.
+- **Hover highlighting no longer darkens the rest**: the assembly view always faded the other instructions,
+  even with `asmLens.dimOtherLines` off. Now nothing fades by default; the setting turns fading on for
+  both the editor and the assembly view.
+
 ## 0.7.1
 
 ### Fixes

@@ -103,3 +103,38 @@ test('compileFlagsOf: removes -c, -o x, -M*, -Werror*, -x lang, the source file;
   assert.equal(F.entryCompiler({ directory: dir, arguments: ['../tools/g++', '-c', 'a.cpp'] }), path.resolve(dir, '../tools/g++'));
   assert.equal(F.entryCompiler({ directory: dir, arguments: ['g++', '-c', 'a.cpp'] }), 'g++');
 });
+
+test('isMsvcStyle: cl.exe and clang-cl on Compiler Explorer, by id or name', () => {
+  for (const id of ['vcpp_v19_latest_x64', 'vcpp_v19_29_VS16_11_arm64', 'vc_v19_latest_x86', 'cl19_2015_u3_arm_exwine', 'ccl19_2015_u3_arm_exwine', 'cl_new_arm64_exwine', 'clang-cl2216', 'cclang-cl1810']) assert.equal(F.isMsvcStyle(id, ''), true, id);
+  assert.equal(F.isMsvcStyle('anything', 'x64 msvc v19.latest'), true);
+  assert.equal(F.isMsvcStyle('clang_cl_1900', 'x64 clang-cl 19.1'), true);
+  for (const id of ['g152', 'clang2010', 'cclang2010', 'icx202500', 'armv8-clang1810', 'cl4302161', 'clad_trunk', 'vcs']) assert.equal(F.isMsvcStyle(id, id), false, id);
+});
+
+test('adaptFlags: GCC/Clang flags for MSVC (/EHsc added for C++), unknown ones kept, ones without an equivalent left out', () => {
+  const m = (f, o) => F.adaptFlags(f, true, o).flags;
+  assert.equal(m('-O2'), '/O2 /EHsc');
+  assert.equal(m('-O3 -std=c++20 -Wall -DX=1 -Iinc'), '/O2 /std:c++20 /W4 -DX=1 -Iinc /EHsc');
+  assert.equal(m('-O0 -std=gnu++17 -fno-exceptions -fno-rtti'), '/Od /std:c++17 /EHs-c- /GR-');
+  assert.equal(m('-Os -std=c++23 -march=native -mtune=generic -g -m64 -Wextra -pedantic'), '/O1 /std:c++latest /EHsc');
+  assert.equal(m('-Ofast -mavx2 -fopenmp'), '/O2 /fp:fast /arch:AVX2 /openmp /EHsc');
+  assert.equal(m('-O2 -std=c11', { cxx: false }), '/O2 /std:c11', 'no /EHsc for C');
+  assert.equal(m('/O2 /std:c++latest /EHsc /permissive-'), '/O2 /std:c++latest /EHsc /permissive-', 'MSVC flags are kept as written');
+  assert.equal(m('-O2 -DMSG="a b"'), '/O2 "-DMSG=a b" /EHsc');
+  assert.deepEqual(F.adaptFlags('-O3 -march=native', true).changes, ['-O3 -> /O2', '-march=native -> (left out)', 'added /EHsc (as Visual Studio does)']);
+});
+
+test('adaptFlags: MSVC flags for GCC/Clang; GCC flags and paths are never touched', () => {
+  const g = f => F.adaptFlags(f, false);
+  assert.deepEqual(g('-O2 -O1 -Os -O3 -MD -Wall -w -std=c++20 -DA'), { flags: '-O2 -O1 -Os -O3 -MD -Wall -w -std=c++20 -DA', changes: [] });
+  assert.equal(g('/O2 /std:c++20 /W4 /EHsc /DFOO=1 /UBAR /permissive- -Zi /Zc:__cplusplus').flags, '-O2 -std=c++20 -Wall -DFOO=1 -UBAR');
+  assert.equal(g('/Od /std:c++latest /GR- /EHs-c- /fp:fast /arch:AVX2').flags, '-O0 -std=c++2b -fno-rtti -fno-exceptions -ffast-math -mavx2');
+  assert.equal(g('-I /Users/me/include /usr/include/x').flags, '-I /Users/me/include /usr/include/x');
+  assert.deepEqual(F.adaptFlags('', false), { flags: '', changes: [] });
+});
+
+test('needsNewerStd: C++11 code compiled as C++98 by Apple clang 14 or old GCC', () => {
+  assert.equal(F.needsNewerStd("<stdin>:22:3: warning: 'auto' type specifier is a C++11 extension [-Wc++11-extensions]\n<stdin>:22:13: error: expected expression"), true);
+  assert.equal(F.needsNewerStd("a.cpp:3:12: error: 'v' was not declared\nnote: extended initializer lists only available with '-std=c++11' or '-std=gnu++11'"), true);
+  assert.equal(F.needsNewerStd("a.cpp:1:5: error: use of undeclared identifier 'x'"), false);
+});

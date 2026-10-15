@@ -2,7 +2,7 @@
   "name": "asm-lens",
   "displayName": "Asm Lens",
   "description": "See the assembly of every function right in the editor: instruction counts as CodeLens, two-way source/assembly highlighting, headers and templates. Uses Compiler Explorer or your local compiler. C, C++, Rust, Go, Python, Zig, Swift, D and Fortran.",
-  "version": "0.7.1",
+  "version": "0.8.0",
   "publisher": "local-dev",
   "license": "MIT",
   "icon": "images/icon.png",
@@ -248,10 +248,15 @@
           "default": true,
           "description": "Color each source line and its assembly instructions with the same color, like Compiler Explorer."
         },
-        "asmLens.dimOtherLines": {
+        "asmLens.emitUnusedFunctions": {
           "type": "boolean",
           "default": true,
-          "description": "While an instruction is hovered, dim the other lines of its function in the editor, and the other instructions in the assembly view, so the matching part stands out."
+          "description": "C/C++: also show functions the compiler leaves out when nothing in the file calls them (functions defined inside a class, inline, static and constexpr ones). They are marked __attribute__((used)) (MSVC: their address is taken) before compiling; the file on disk is not changed. Headers analyzed on their own always do this."
+        },
+        "asmLens.dimOtherLines": {
+          "type": "boolean",
+          "default": false,
+          "description": "While an instruction is hovered, also fade the other lines of its function in the editor and the other instructions in the assembly view. Off: only the matching lines are highlighted and the rest stays as it is."
         },
         "asmLens.maxIncludeFiles": {
           "type": "number",

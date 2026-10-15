@@ -1,0 +1,9 @@
+{
+  // A ready project for recording the demo (see README.md in this folder).
+  "mode": "remote",
+  "compilers": [
+    { "id": "g152", "name": "GCC 15.2", "flags": "-O2 -std=c++20" },
+    { "id": "clang2010", "name": "Clang 20", "flags": "-O2 -std=c++20" },
+    { "id": "vcpp_v19_latest_x64", "name": "MSVC", "flags": "-O2 -std=c++20" }
+  ]
+}

@@ -328,3 +328,62 @@ test('scanDefinitions: long runs of macro-like words do not slow it down (no cat
   scan.keepHeaderFunctions(src);
   assert.ok(Date.now() - t0 < 1000, `took ${Date.now() - t0} ms`);
 });
+
+// ---------------------------------------------------------------------------
+// 0.8.0: functions defined in classes (and other droppable ones) in .cpp files
+
+const CLASSES = [
+  'class Counter {',                                              // 1
+  'public:',                                                      // 2
+  '  void add(int x) { total += x; }',                             // 3
+  '  static int helper(int v) { return v + 1; }',                  // 4
+  '  int outOfLine(int k) const;',                                 // 5
+  '  friend bool operator==(const Counter&, const Counter&) { return true; }', // 6
+  '  Counter() = default;',                                        // 7
+  '  explicit Counter(int t) : total(t) {}',                       // 8
+  '  ~Counter() {}',                                               // 9
+  'private:',                                                     // 10
+  '  int secret() const { return total; }',                        // 11
+  '  int total = 0;',                                              // 12
+  '};',                                                           // 13
+  'int Counter::outOfLine(int k) const { return total * k; }',    // 14
+  'static int file_local(int x) { return x; }',                   // 15
+  'inline int inl(int x) { return x; }',                          // 16
+  'constexpr int cx(int x) { return x; }',                        // 17
+  'int external(int x) { return x; }',                            // 18
+  'namespace { int anon(int x) { return x; } }',                  // 19
+  'template <class T> struct Box { T get() const { return T(); } };', // 20
+  'static int count = 0;',                                        // 21
+  'int main() { auto l = [](int a) { return a; }; return l(1); }' // 22
+].join('\n');
+
+test('keepable / { all: false }: in-class, static, inline, constexpr and anonymous-namespace functions; not main, templates or external ones', () => {
+  const kept = scan.keepHeaderFunctions(CLASSES, { all: false }).split('\n');
+  const marked = kept.map((l, i) => l.includes('__attribute__((used))') ? i + 1 : 0).filter(Boolean);
+  assert.deepEqual(marked, [3, 4, 6, 8, 9, 11, 15, 16, 17, 19]);
+  assert.equal(kept[2], '  __attribute__((used)) void add(int x) { total += x; }');
+  assert.equal(kept[13], CLASSES.split('\n')[13], 'an out-of-line member is always emitted: left alone');
+  assert.equal(kept[17], CLASSES.split('\n')[17], 'an external function is always emitted: left alone');
+  assert.equal(kept[20], 'static int count = 0;', 'variables are not marked in a .cpp file');
+  assert.equal(kept[21], CLASSES.split('\n')[21], 'main is never marked');
+  assert.equal(kept.length, CLASSES.split('\n').length);
+  // In a header everything is kept, the earlier line-start rule included.
+  const header = scan.keepHeaderFunctions(CLASSES).split('\n');
+  assert.ok(header[13].includes('__attribute__((used))') && header[17].includes('__attribute__((used))'));
+  assert.ok(!header[21].includes('__attribute__((used))'), 'main is not marked in a header either');
+});
+
+test('keepByAddress / { all: false }: qualified names for members; constructors, destructors, main and templates are left out', () => {
+  assert.deepEqual(scan.keepByAddress(CLASSES, { all: false }), [
+    'auto __asm_lens_keep_0 = &Counter::add;',
+    'auto __asm_lens_keep_1 = &Counter::helper;',
+    'auto __asm_lens_keep_2 = &Counter::operator==;',
+    'auto __asm_lens_keep_3 = &Counter::secret;',
+    'auto __asm_lens_keep_4 = &file_local;',
+    'auto __asm_lens_keep_5 = &inl;',
+    'auto __asm_lens_keep_6 = &cx;',
+    'auto __asm_lens_keep_7 = &anon;'
+  ]);
+  assert.ok(scan.keepByAddress('int main() { return 0; }\nint wmain() { return 0; }\n').length === 0);
+  assert.ok(scan.keepByAddress(CLASSES).some(l => /&outOfLine|&Counter::outOfLine/.test(l)), 'a header keeps out-of-line members too');
+});

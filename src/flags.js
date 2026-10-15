@@ -71,6 +71,69 @@ function syntaxArgs(kind, target, syntax = 'intel') {
 }
 
 // ---------------------------------------------------------------------------
+// GCC/Clang flags for MSVC, and the other way round
+//
+// One set of flags can serve every compiler: the common options are written
+// the way the active compiler expects. Unknown options are left as they are.
+
+// Whether a compiler takes MSVC-style options: cl.exe on Compiler Explorer (vcpp_*, vc_*,
+// cl19*, cl_new_*, and ccl* for C) and clang-cl.
+function isMsvcStyle(id, name) {
+  return /^(?:vcpp_|vc_|c?cl19|c?cl_new_|c?clang-cl)/i.test(String(id || '')) || /\bmsvc\b|clang-cl/i.test(String(name || ''));
+}
+
+const TO_MSVC = [
+  [/^-O0$|^-Og$/, ['/Od']], [/^-O1$|^-Os$|^-Oz$/, ['/O1']], [/^-O[23]?$/, ['/O2']], [/^-Ofast$/, ['/O2', '/fp:fast']],
+  [/^-std=(?:c|gnu)\+\+(?:98|03|0x|11|1y|14)$/, ['/std:c++14']], [/^-std=(?:c|gnu)\+\+(?:1z|17)$/, ['/std:c++17']],
+  [/^-std=(?:c|gnu)\+\+(?:2a|20)$/, ['/std:c++20']], [/^-std=(?:c|gnu)\+\+(?:2b|23|2c|26)$/, ['/std:c++latest']],
+  [/^-std=(?:c|gnu)(?:89|90|99|1x|11)$/, ['/std:c11']], [/^-std=(?:c|gnu)(?:17|18)$/, ['/std:c17']], [/^-std=(?:c|gnu)(?:2x|23)$/, ['/std:clatest']],
+  [/^-Wall$/, ['/W4']], [/^-Werror$/, ['/WX']], [/^-w$/, ['/w']],
+  [/^-fno-exceptions$/, ['/EHs-c-']], [/^-fexceptions$/, ['/EHsc']], [/^-fno-rtti$/, ['/GR-']], [/^-frtti$/, ['/GR']],
+  [/^-ffast-math$/, ['/fp:fast']], [/^-fopenmp$/, ['/openmp']],
+  [/^-mavx$/, ['/arch:AVX']], [/^-mavx2$/, ['/arch:AVX2']], [/^-mavx512\w*$/, ['/arch:AVX512']], [/^-msse2$/, ['/arch:SSE2']],
+  // No MSVC equivalent: left out instead of warning "D9002 ignoring unknown option".
+  [/^-(?:march|mtune|mcpu)=|^-m(?:32|64|sse\d*\w*|fma|bmi2?|popcnt|arch=.*)$|^-g|^-W|^-pedantic|^-pipe$|^-f(?:no-)?(?:PIC|pic|PIE|pie|omit-frame-pointer|strict-aliasing|stack-protector\S*|lto\S*|visibility\S*|diagnostics\S*|color-diagnostics)$/, []]
+];
+// `/` options, and `-` ones that GCC and Clang do not have (cl.exe takes both forms).
+const TO_GCC = [
+  [/^[/-]Od$/, ['-O0']], [/^\/O1$/, ['-Os']], [/^\/O2$/, ['-O2']], [/^[/-]Ox$/, ['-O3']],
+  [/^[/-]std:c\+\+(14|17|20)$/, m => [`-std=c++${m[1]}`]], [/^[/-]std:c\+\+latest$/, ['-std=c++2b']],
+  [/^[/-]std:c(11|17)$/, m => [`-std=c${m[1]}`]], [/^[/-]std:clatest$/, ['-std=c2x']],
+  [/^\/W4$|^\/Wall$/, ['-Wall']], [/^[/-]WX$/, ['-Werror']], [/^\/w$/, ['-w']],
+  [/^[/-]EHs-c-$/, ['-fno-exceptions']], [/^[/-]GR-$/, ['-fno-rtti']], [/^[/-]fp:fast$/, ['-ffast-math']], [/^\/openmp$/, ['-fopenmp']],
+  [/^[/-]arch:AVX$/, ['-mavx']], [/^[/-]arch:AVX2$/, ['-mavx2']], [/^[/-]arch:AVX512$/, ['-mavx512f']],
+  [/^\/D([A-Za-z_]\w*(?:=.*)?)$/, m => [`-D${m[1]}`]], [/^\/U([A-Za-z_]\w*)$/, m => [`-U${m[1]}`]],
+  [/^\/(?:EH\w*|GR|Z[i7I]|permissive-?|utf-8|nologo|MDd?|MTd?|W[0-3]|sdl-?|Zc:\S+|FC|diagnostics:\S+)$|^-(?:EH\w+|Z[i7I]|permissive-|utf-8|nologo|Zc:\S+|sdl-?|diagnostics:\S+)$/, []]
+];
+
+// `flags` (a string) written for a compiler that takes MSVC-style options
+// (`msvc`) or GCC/Clang ones; `cxx`: C++ (MSVC gets /EHsc unless an /EH option
+// is given). Returns { flags, changes: ["-O2 -> /O2", ...] }; flags that need
+// no change are returned as they were written.
+function adaptFlags(flags, msvc, { cxx = true } = {}) {
+  const table = msvc ? TO_MSVC : TO_GCC;
+  const out = [];
+  const changes = [];
+  for (const tok of splitCommand(flags || '', false)) {
+    const rule = table.find(([re]) => re.test(tok));
+    if (!rule) { out.push(tok); continue; }
+    const repl = typeof rule[1] === 'function' ? rule[1](rule[0].exec(tok)) : rule[1];
+    out.push(...repl);
+    changes.push(`${tok} -> ${repl.length ? repl.join(' ') : '(left out)'}`);
+  }
+  // Visual Studio compiles C++ with /EHsc; without it MSVC warns wherever exceptions are used (iostream).
+  if (msvc && cxx && !out.some(f => /^[/-]EH/.test(f))) { out.push('/EHsc'); changes.push('added /EHsc (as Visual Studio does)'); }
+  if (!changes.length) return { flags: flags || '', changes };
+  return { flags: out.map(a => (/[\s"]/.test(a) ? `"${a.replace(/"/g, '\\"')}"` : a)).join(' '), changes };
+}
+
+// Whether errors come from C++11 (or later) code compiled as C++98, the default of
+// older compilers (Apple clang 14, GCC 5).
+function needsNewerStd(stderr) {
+  return /is a C\+\+(?:11|14|17|1[yz]) extension|only available with [-'‘]*std=(?:c|gnu)\+\+(?:11|0x)|-std=(?:c|gnu)\+\+11 or -std=(?:c|gnu)\+\+11|C\+\+11 or later|requires (?:compiler and library support for the )?ISO C\+\+ 2011/.test(String(stderr || ''));
+}
+
+// ---------------------------------------------------------------------------
 // Flags a compiler rejects
 
 const REJECTED_FLAG_RES = [
@@ -205,7 +268,7 @@ function entryCompiler(entry, windows = IS_WIN) {
 }
 
 module.exports = {
-  stripSyntaxFlags, stripSyntaxArgs, compilerKind, targetOf, isX86, syntaxArgs,
+  stripSyntaxFlags, stripSyntaxArgs, compilerKind, targetOf, isX86, syntaxArgs, isMsvcStyle, adaptFlags, needsNewerStd,
   rejectedFlagsFrom, matchesOption, removeFlags, removeArgs,
   splitCommand, entryArgs, compileFlagsOf, entryCompiler
 };

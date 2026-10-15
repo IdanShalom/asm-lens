@@ -294,6 +294,8 @@ function classifyHead(m, segStart, segEnd, scopes) {
     macroLike: !beforeName && !isCtorOrDtor && !/\boperator\b/.test(name) && !name.includes('::'),
     onlyMacros,
     abbreviated: /(?:^|,)\s*(?:const\s+)?auto\b(?!\s*\()/.test(paramText),
+    // Compilers drop it when nothing calls it: defined in a class (implicitly inline), or inline/static/constexpr.
+    droppable: Boolean(cls) || /\b(?:inline|static|constexpr|__inline|__inline__|__forceinline)\b/.test(rest.slice(0, params.start)),
     consteval: /\bconsteval\b/.test(rest.slice(0, params.start))
   };
 }
@@ -343,6 +345,7 @@ function scanDefinitions(text) {
       const own = head.templateParams.filter(p => p !== '');
       defs.push({
         ...head,
+        droppable: head.droppable || scopes.some(s => s.kind === 'namespace' && !s.name),
         scopes: scopes.slice(),
         templated: own.length > 0 || head.abbreviated || scopes.some(s => s.kind === 'class' && s.templated),
         explicitSpecialization: head.templateParams.length > 0 && own.length === 0,
@@ -367,7 +370,16 @@ function guessCFunctions(text) {
 }
 
 // ---------------------------------------------------------------------------
-// Keeping unused functions of a header that is compiled on its own
+// Keeping functions that compilers drop when nothing calls them
+
+// Never kept: entry points (taking main's address is not allowed), and functions
+// whose shape is unknown (templates, macros, consteval).
+const ENTRY_POINTS = new Set(['main', 'wmain', 'WinMain', 'wWinMain', 'DllMain']);
+function keepable(d, all) {
+  if (d.kind !== 'function' || d.templated || d.macroLike || d.consteval || d.onlyMacros || d.scopes.some(s => s.maybeTemplate)) return false;
+  if (ENTRY_POINTS.has(splitQualified(d.name).pop())) return false;
+  return all || d.droppable;
+}
 
 const KEEP = '__attribute__((used)) ';
 const LEGACY_KEEP_RE = /^([ \t]*)((?:static|inline|__inline__|__inline)(?:[ \t]+(?:static|inline|__inline__|__inline|constexpr))*)(?=[ \t])(?![ \t]+namespace\b)/gm;
@@ -375,11 +387,13 @@ const LEGACY_KEEP_RE = /^([ \t]*)((?:static|inline|__inline__|__inline)(?:[ \t]+
 // For analyzing a header on its own: mark every non-template function defined
 // in it __attribute__((used)), so the compiler emits it even though nothing
 // calls it. Edits stay on the same line, so line numbers are unchanged.
-function keepHeaderFunctions(text) {
+// `all`: every non-template function (a header compiled on its own); otherwise
+// only those compilers drop when unused (in-class, inline, static, constexpr).
+function keepHeaderFunctions(text, { all = true } = {}) {
   const lineOf = lineLocator(text);
   const at = new Set();
   for (const d of scanDefinitions(text)) {
-    if (d.kind !== 'function' || d.templated || d.macroLike || d.consteval || d.onlyMacros || d.scopes.some(s => s.maybeTemplate)) continue;
+    if (!keepable(d, all)) continue;
     let pos = d.restStart;
     // After leading [[attributes]], alignas(...), extern "C", and macros (DOCTEST_NORETURN,
     // FMT_API, a macro for template<...>) as long as a type is still left before the name.
@@ -400,7 +414,8 @@ function keepHeaderFunctions(text) {
   for (const pos of [...at].sort((a, b) => a - b)) { parts.push(text.slice(prev, pos), KEEP); prev = pos; }
   parts.push(text.slice(prev));
   const out = parts.join('');
-  // Lines the scanner did not handle keep the earlier line-start rule.
+  // In a header, lines the scanner did not handle keep the earlier line-start rule.
+  if (!all) return out;
   const outLineOf = lineLocator(out);
   return out.replace(LEGACY_KEEP_RE, (all, indent, words, offset) => touched.has(outLineOf(offset)) ? all : `${indent}${KEEP}${words}`);
 }
@@ -409,10 +424,10 @@ function keepHeaderFunctions(text) {
 // function that takes its address, which makes the compiler emit it. Appended
 // after the file's last line like instantiation requests; a line that does not
 // compile (an overloaded name, ...) is dropped by the caller. `c` selects C syntax.
-function keepByAddress(text, { c = false, defs = scanDefinitions(text) } = {}) {
+function keepByAddress(text, { c = false, all = true, defs = scanDefinitions(text) } = {}) {
   const lines = [];
   for (const d of defs) {
-    if (d.kind !== 'function' || d.templated || d.macroLike || d.consteval || d.onlyMacros || d.scopes.some(s => s.maybeTemplate)) continue;
+    if (!keepable(d, all)) continue;
     const comps = splitQualified(d.name);
     const last = comps[comps.length - 1] || '';
     const owner = [...d.scopes].reverse().find(s => s.kind === 'class');

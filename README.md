@@ -19,8 +19,11 @@ Go, Python, Zig, Swift, D and Fortran are supported too.
 - **Two-way highlighting**, like Compiler Explorer: each source line and its instructions
   share a color. Hover or click a source line to highlight its instructions; hover an
   instruction to highlight its source line (and the exact token, when the compiler reports a
-  column). The rest of the function fades meanwhile, so the matching part stands out.
+  column). Everything else stays as it is (`asmLens.dimOtherLines` fades the rest instead).
   Hover a function's signature to preview its whole assembly.
+- **Every function, including unused ones**: methods defined inside a class, and `static`, `inline`
+  and `constexpr` functions get their own counts even when nothing in the file calls them, with every
+  compiler (`asmLens.emitUnusedFunctions`).
 - **Headers work**: analyze a header on its own, or analyze a `.cpp` and open the headers
   it includes. Functions defined in headers get counts too, including code inlined into callers.
 - **Templates on demand**: click **Instantiate…** above a template, type the template
@@ -31,7 +34,8 @@ Go, Python, Zig, Swift, D and Fortran are supported too.
 - **Remote or local**, per project or per compiler, on Windows, Linux and macOS. Local mode can take
   each file's compiler and flags from your build's `compile_commands.json`.
 - **Any compiler on Compiler Explorer**: GCC, Clang, MSVC (x64, x86, ARM64, ARM32), ICX/ICC, and the
-  cross compilers for ARM, RISC-V, MIPS, PowerPC, AVR, MSP430, Z80, 6502 and more.
+  cross compilers for ARM, RISC-V, MIPS, PowerPC, AVR, MSP430, Z80, 6502 and more. One set of flags
+  serves them all: `-O2 -std=c++20` reaches MSVC as `/O2 /std:c++20 /EHsc`.
 - **Fast, and visibly working**: a progress notification shows each step (finding headers,
   compiling, retrying around errors) with a **Cancel** button; the status bar and the CodeLens
   spin while it runs. Unchanged code is answered from a cache, and Compiler Explorer is asked
@@ -101,6 +105,32 @@ asks the compiler what it is (`--version`, `-dumpmachine`) and adds `-masm=intel
 not passed on (MSVC and non-x86 compilers reject it); write `-masm=att` to get AT&T syntax instead.
 If a compiler rejects any other flag (`cc65: Unknown option: -O2`), that flag is left out, the file is
 compiled again, and the output says so.
+
+**Flags for MSVC.** Write your flags once, the GCC/Clang way. For MSVC and clang-cl, Asm Lens translates
+the common ones (the output lists each translation) and leaves the rest as written, so flags you write
+for MSVC (`/O2 /std:c++latest`) are kept as they are:
+
+| You write | MSVC gets |
+|-----------|-----------|
+| `-O0`, `-O1`, `-Os`, `-O2`, `-O3` | `/Od`, `/O1`, `/O1`, `/O2`, `/O2` |
+| `-Ofast` / `-ffast-math` | `/O2 /fp:fast` / `/fp:fast` |
+| `-std=c++14` … `-std=c++20`, `-std=c++23` | `/std:c++14` … `/std:c++20`, `/std:c++latest` |
+| `-std=c11`, `-std=c17` | `/std:c11`, `/std:c17` |
+| `-Wall`, `-Werror`, `-w` | `/W4`, `/WX`, `/w` |
+| `-fno-exceptions`, `-fno-rtti` | `/EHs-c-`, `/GR-` |
+| `-mavx`, `-mavx2`, `-mavx512f`, `-fopenmp` | `/arch:AVX`, `/arch:AVX2`, `/arch:AVX512`, `/openmp` |
+| `-D…`, `-U…`, `-I…` | the same (cl accepts them) |
+| `-g`, `-march=…`, `-mtune=…`, `-m64`, other `-W…` | left out (no equivalent) |
+
+C++ also gets `/EHsc`, as Visual Studio projects do, unless you give an `/EH` option. The other way
+round, MSVC flags (`/O2`, `/std:c++20`, `/W4`, `/DNAME`) given to GCC or Clang are translated too.
+
+**Functions nothing calls.** A compiler leaves out a function defined inside a class, or a `static`,
+`inline` or `constexpr` one, when nothing in the file uses it (and often when every call was inlined).
+To show its code anyway, the copy that is compiled marks such functions `__attribute__((used))` on the
+same line (MSVC: a line after the end of the file takes each one's address). Your file is not changed,
+and if the marked copy does not compile, the file is compiled as written. Set
+`asmLens.emitUnusedFunctions` to `false` to see only what the compiler emits on its own.
 
 ### compile_commands.json (local mode)
 
@@ -277,6 +307,7 @@ Each object in `compilers` may have:
 | `asmLens.language` | `c++` | Language sent for C-family files without a project file. |
 | `asmLens.includePaths` | `[]` | Extra include folders, searched after the project file's. |
 | `asmLens.maxIncludeFiles` | `80` | Most local headers uploaded per analysis. |
+| `asmLens.emitUnusedFunctions` | `true` | C/C++: also show functions defined in a class, `static`, `inline` and `constexpr` ones that nothing in the file calls (see above). Headers analyzed on their own always do this. |
 | `asmLens.skipFailingFunctions` | `true` | Skip functions that do not compile instead of failing. |
 | `asmLens.maxRecoveryAttempts` | `12` | Most compiles per analysis while recovering. |
 | `asmLens.stubFailingHeaders` | `false` | Remote: replace an uploaded header that fails in the preprocessor (`#error`) by an empty file. |
@@ -284,7 +315,7 @@ Each object in `compilers` may have:
 | `asmLens.showCounts` | `true` | Show the CodeLens. |
 | `asmLens.highlightOnHover` | `true` | Two-way highlighting. |
 | `asmLens.colorizeLines` | `true` | Color source lines and their instructions alike. |
-| `asmLens.dimOtherLines` | `true` | While an instruction is hovered, fade the other lines of its function (editor) and the other instructions (assembly view). |
+| `asmLens.dimOtherLines` | `false` | While an instruction is hovered, also fade the other lines of its function (editor) and the other instructions (assembly view). Off: only the matching lines are highlighted. |
 | `asmLens.followCursor` | `true` | The assembly view follows the function under the cursor. |
 
 ## Commands
@@ -317,9 +348,11 @@ mode, where your own compiler and system headers are used.
 
 ## Troubleshooting
 
-- **"No code emitted"**: the function is not used (an unused `inline` function in a `.cpp`), was
-  inlined everywhere, or is a template that was never instantiated: click **Instantiate…**, or analyze a
-  file that calls it.
+- **"No code emitted"**: the function is a template that was never instantiated (click **Instantiate…**,
+  or analyze a file that calls it), or `asmLens.emitUnusedFunctions` is off and nothing uses it.
+- **Local mode on macOS: errors in C++11 code** (`'auto' type specifier is a C++11 extension`): Apple
+  clang 14 and older compile C++98 by default. Asm Lens then adds `-std=gnu++17` (the default of current
+  compilers and of Compiler Explorer) and says so in the output; put a `-std=...` in your flags to choose.
 - **Rust shows nothing**: only `pub` functions (and what they use) are compiled into a library.
 - **Zig shows nothing**: mark functions `export`.
 - **Local mode: "g++ was not found"**: install a compiler or set `"compiler"` (or `asmLens.localCompiler`)

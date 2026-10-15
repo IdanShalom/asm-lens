@@ -14,11 +14,11 @@ const baseUrl = 'https://godbolt.org';
 
 const FILES = {
   'c++': {
-    'main.cpp': '#include "util.h"\nint square(int x) { return x * x; }\nint use(int a) { return twice(a) + square(a); }\n',
+    'main.cpp': '#include "util.h"\nint square(int x) { return x * x; }\nint use(int a) { return twice(a) + square(a); }\nstruct Acc { int v; int get() const { return v; } };\n',
     'util.h': '#pragma once\nstatic inline int twice(int v) { return v + v; }\n'
   },
   c: {
-    'main.c': '#include "util.h"\nint square(int x) { return x * x; }\nint use(int a) { return twice(a) + square(a); }\n',
+    'main.c': '#include "util.h"\nint square(int x) { return x * x; }\nint use(int a) { return twice(a) + square(a); }\nstatic int unused(int x) { return x + 1; }\n',
     'util.h': '#ifndef UTIL_H\n#define UTIL_H\nstatic int twice(int v) { return v + v; }\n#endif\n'
   }
 };
@@ -49,18 +49,21 @@ function representatives(list) {
     const msg = await x.analyze(main);
     const lens2 = await x.lensAt(main, 2) || '';
     const lens3 = await x.lensAt(main, 3) || '';
+    // Line 4: a function defined in a class (C++) or a static one (C) that nothing calls.
+    const lens4 = await x.lensAt(main, 4) || '';
     const analysis = x.analysis(main);
     const ok = / \d+ instructions/.test(lens2) && / \d+ instructions/.test(lens3);
     const header = await x.lensAt('util.h', lang === 'c' ? 3 : 2) || '';
     const r = {
       key, id: compiler.id, name: compiler.name, ok, ms: Date.now() - t0,
-      square: lens2.split(' · ')[0], use: lens3.split(' · ')[0], header: header.split(' · ')[0],
+      square: lens2.split(' · ')[0], use: lens3.split(' · ')[0], header: header.split(' · ')[0], unused: lens4.split(' · ')[0],
       functions: analysis ? analysis.functions.map(f => f.name).slice(0, 8) : [],
       error: (msg.error[0] || msg.warning[0] || '').slice(0, 300),
       stderr: x.state.outputLines.filter(l => /warning|error/i.test(l)).slice(0, 3).join(' | ').slice(0, 300)
     };
     results.push(r);
-    console.log(`${ok ? 'OK  ' : 'FAIL'} ${key.padEnd(28)} ${compiler.id.padEnd(30)} ${String(r.ms).padStart(6)}ms  square: ${r.square} | use: ${r.use} | header: ${r.header}${ok ? '' : `\n       functions: ${JSON.stringify(r.functions)}\n       ${r.error}`}`);
+    await new Promise(res => setTimeout(res, 1000));   // stay within Compiler Explorer's rate limit
+    console.log(`${ok ? 'OK  ' : 'FAIL'} ${key.padEnd(28)} ${compiler.id.padEnd(30)} ${String(r.ms).padStart(6)}ms  square: ${r.square} | use: ${r.use} | header: ${r.header} | unused: ${r.unused}${ok ? '' : `\n       functions: ${JSON.stringify(r.functions)}\n       ${r.error}`}`);
   }
   console.log(`\n${results.filter(r => r.ok).length}/${results.length} OK`);
   if (jsonOut) fs.writeFileSync(jsonOut, JSON.stringify(results, null, 2));
