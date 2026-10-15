@@ -311,7 +311,7 @@ Each object in `compilers` may have:
 | `asmLens.skipFailingFunctions` | `true` | Skip functions that do not compile instead of failing. |
 | `asmLens.maxRecoveryAttempts` | `12` | Most compiles per analysis while recovering. |
 | `asmLens.stubFailingHeaders` | `false` | Remote: replace an uploaded header that fails in the preprocessor (`#error`) by an empty file. |
-| `asmLens.requestTimeoutMs` | `30000` | Timeout of one compile. |
+| `asmLens.requestTimeoutMs` | `60000` | How long to wait for one compile, in ms. A Compiler Explorer server that does not answer in time is asked once more. |
 | `asmLens.showCounts` | `true` | Show the CodeLens. |
 | `asmLens.highlightOnHover` | `true` | Two-way highlighting. |
 | `asmLens.colorizeLines` | `true` | Color source lines and their instructions alike. |
@@ -361,6 +361,10 @@ mode, where your own compiler and system headers are used.
   defaults include it; flags such as `-g0` remove it.
 - **A compiler id does not work**: ids differ between Compiler Explorer servers and change over time;
   use **Select Compiler → Browse**.
+- **"godbolt.org did not answer within 60 s, twice"**: the public Compiler Explorer is shared, and at busy
+  times a compile can wait in its queue (the progress shows the seconds meanwhile). Asm Lens asks once
+  more by itself; if it still gets no answer, analyze again in a moment, raise `asmLens.requestTimeoutMs`,
+  or use local mode.
 - **"godbolt.org is limiting how often it compiles (HTTP 429)"**: the public server allows a limited number
   of compiles per minute. Automatic re-analysis pauses for 30 seconds; set `asmLens.reanalyzeOn` to `save`
   if you hit this often, or use local mode or your own Compiler Explorer (`baseUrl`).

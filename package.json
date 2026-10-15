@@ -2,7 +2,7 @@
   "name": "asm-lens",
   "displayName": "Asm Lens",
   "description": "See the assembly of every function right in the editor: instruction counts as CodeLens, two-way source/assembly highlighting, headers and templates. Uses Compiler Explorer or your local compiler. C, C++, Rust, Go, Python, Zig, Swift, D and Fortran.",
-  "version": "0.8.0",
+  "version": "0.8.1",
   "publisher": "local-dev",
   "license": "MIT",
   "icon": "images/icon.png",
@@ -220,10 +220,10 @@
         },
         "asmLens.requestTimeoutMs": {
           "type": "number",
-          "default": 30000,
+          "default": 60000,
           "minimum": 1000,
-          "maximum": 120000,
-          "description": "Compilation request timeout in milliseconds."
+          "maximum": 300000,
+          "description": "How long to wait for one compile, in milliseconds (Compiler Explorer, or a local compiler). A Compiler Explorer server that does not answer in time is asked once more."
         },
         "asmLens.showCounts": {
           "type": "boolean",

@@ -240,7 +240,7 @@ function resolveOtherSettings(lang, project, s) {
 const ceDefaults = new Map();
 async function ceDefaultCompiler(baseUrl, lang) {
   if (!ceDefaults.has(baseUrl)) {
-    ceDefaults.set(baseUrl, fetch(`${baseUrl}/api/languages?fields=id,defaultCompiler`, { headers: { Accept: 'application/json' } })
+    ceDefaults.set(baseUrl, fetch(`${baseUrl}/api/languages?fields=id,defaultCompiler`, { headers: { Accept: 'application/json' }, signal: AbortSignal.timeout(15000) })
       .then(r => r.ok ? r.json() : [])
       .then(list => new Map((Array.isArray(list) ? list : []).filter(l => l && l.defaultCompiler).map(l => [l.id, l.defaultCompiler])))
       .catch(() => new Map()));
@@ -473,7 +473,8 @@ function activate(context) {
       let chosen;
       if (picked.browse) {
         const baseUrl = settings.baseUrl || config().get('baseUrl', 'https://godbolt.org').replace(/\/$/, '');
-        const response = await fetch(`${baseUrl}/api/compilers/${encodeURIComponent(settings.language)}`, { headers: { Accept: 'application/json' } });
+        const response = await fetch(`${baseUrl}/api/compilers/${encodeURIComponent(settings.language)}`, { headers: { Accept: 'application/json' }, signal: AbortSignal.timeout(30000) })
+          .catch(e => { throw e.name === 'TimeoutError' ? new Error(`${hostOf(baseUrl)} did not send its compiler list within 30 s; try again in a moment.`) : e; });
         if (!response.ok) throw new Error(`Compiler list request failed: HTTP ${response.status}`);
         const compilers = await response.json();
         const selected = await vscode.window.showQuickPick(compilers.map(c => ({
@@ -1111,7 +1112,7 @@ async function runAnalysis(document) {
     // The syntax flag is Compiler Explorer's job (filters.intel), per compiler: -masm=intel would break MSVC and non-x86 compilers.
     const stripped = flagsLib.stripSyntaxFlags([resolved.flags, ...resolved.defines.map(d => `-D${d}`), resolved.extraFlags].filter(Boolean).join(' '));
     const compilerId = resolved.active.id;
-    const timeoutMs = settings.get('requestTimeoutMs', 30000);
+    const timeoutMs = settings.get('requestTimeoutMs', 60000);
     // The same flags serve every compiler: -O2 -std=c++20 becomes /O2 /std:c++20 for MSVC (and the other way round).
     const msvcStyle = flagsLib.isMsvcStyle(compilerId, resolved.active.name);
     const adapted = flagsLib.adaptFlags(stripped.flags, msvcStyle, { cxx: language !== 'c' });
@@ -1137,7 +1138,7 @@ async function runAnalysis(document) {
       try { compiled = await compileWithRecovery({ ...opts, source: prepared.kept, kept: true }); }
       catch (e) {
         // Cancelled, timed out or rate-limited: compiling the plain text would not help.
-        if (e.name === 'AbortError' || e.name === 'Cancelled' || Date.now() < rateLimitedUntil) throw e;
+        if (e.name === 'AbortError' || e.name === 'TimeoutError' || e.name === 'Cancelled' || Date.now() < rateLimitedUntil) throw e;
         keptFailed = true;
         outputChannel.appendLine(`  compiling it again without ${marks === 'address' ? 'the lines that keep its functions' : '__attribute__((used))'}`);
       }
@@ -1471,7 +1472,7 @@ async function analyzeLocal(document, resolved, settings) {
   const rootPathKey = docPathKey(document);
   const fileDir = path.dirname(document.uri.fsPath);
   const baseDir = vscode.workspace.getWorkspaceFolder?.(document.uri)?.uri.fsPath || fileDir;
-  const timeoutMs = settings.get('requestTimeoutMs', 30000);
+  const timeoutMs = settings.get('requestTimeoutMs', 60000);
   const maxAttempts = Math.max(1, Number(settings.get('maxRecoveryAttempts', 12)));
   const recoverErrors = settings.get('skipFailingFunctions', true);
   const lang = resolved.language === 'c' ? 'c' : 'c++';
@@ -1634,7 +1635,7 @@ const EMPTY_HINTS = {
 
 async function analyzeOtherLanguage(document, resolved, settings) {
   const { lang } = resolved;
-  const timeoutMs = settings.get('requestTimeoutMs', 30000);
+  const timeoutMs = settings.get('requestTimeoutMs', 60000);
   const rootPathKey = docPathKey(document);
   const required = lang.requiredFlags && !String(resolved.flags).includes(lang.requiredFlags) ? lang.requiredFlags : '';
   let flags = [resolved.flags, resolved.extraFlags, required].filter(Boolean).join(' ');
@@ -1750,6 +1751,9 @@ const replyCache = new Map();
 let rateLimitedUntil = 0;
 const REPLY_CACHE_SIZE = 40;
 
+// How long a compile request waits before the progress shows the seconds.
+const WAIT_SHOWN_AFTER_MS = 3000;
+
 async function postCompile({ baseUrl, compilerId, language, timeoutMs, source, files, flags, syntax = 'intel' }) {
   const url = `${baseUrl}/api/compiler/${encodeURIComponent(compilerId)}/compile`;
   const filters = { ...CE_FILTERS, intel: syntax !== 'att' };
@@ -1761,24 +1765,42 @@ async function postCompile({ baseUrl, compilerId, language, timeoutMs, source, f
     replyCache.set(cacheKey, cached);
     return JSON.parse(cached);
   }
-  throwIfCancelled();
+  // A server that does not answer in time (busy, or starting the compiler) is asked once more.
+  // Meanwhile the progress shows how long it has been waiting.
   const job = jobContext.getStore();
-  const controller = new AbortController();
-  job?.aborts.add(controller);
-  const timeout = setTimeout(() => controller.abort(), timeoutMs);
   let response, text;
-  try {
-    response = await fetch(url, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
-      body,
-      signal: controller.signal
-    });
-    text = await response.text();
-  } catch (e) {
-    if (job?.cancelled) throw new Cancelled();
-    throw e;
-  } finally { clearTimeout(timeout); job?.aborts.delete(controller); }
+  for (let attempt = 1; ; attempt++) {
+    throwIfCancelled();
+    const controller = new AbortController();
+    job?.aborts.add(controller);
+    let timedOut = false;
+    const timeout = setTimeout(() => { timedOut = true; controller.abort(); }, timeoutMs);
+    const started = Date.now();
+    const waiting = `${attempt > 1 ? 'asking again: ' : ''}compiling with ${compilerId} on ${hostOf(baseUrl)}`;
+    const ticker = setInterval(() => {
+      const ms = Date.now() - started;
+      if (ms >= WAIT_SHOWN_AFTER_MS) report(`${waiting}… ${Math.round(ms / 1000)} s`);
+    }, 1000);
+    try {
+      response = await fetch(url, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
+        body,
+        signal: controller.signal
+      });
+      text = await response.text();
+      break;
+    } catch (e) {
+      if (job?.cancelled) throw new Cancelled();
+      if (!timedOut) throw e;
+      if (attempt >= 2) {
+        const err = new Error(`${hostOf(baseUrl)} did not answer within ${Math.round(timeoutMs / 1000)} s, twice. Compiler Explorer is sometimes slow when it is busy: analyze again in a moment, or raise asmLens.requestTimeoutMs.`);
+        err.name = 'TimeoutError';
+        throw err;
+      }
+      outputChannel.appendLine(`  ${hostOf(baseUrl)} did not answer within ${Math.round(timeoutMs / 1000)} s; asking again.`);
+    } finally { clearTimeout(timeout); clearInterval(ticker); job?.aborts.delete(controller); }
+  }
   if (response.status === 429) {
     rateLimitedUntil = Date.now() + 30000;
     throw new Error(`${hostOf(baseUrl)} is limiting how often it compiles (HTTP 429). Automatic re-analysis pauses for 30 seconds; analyze again in a moment.`);

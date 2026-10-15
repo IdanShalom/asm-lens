@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.8.1
+
+### Fixes
+- **"Compiler Explorer request timed out"**: Compiler Explorer sometimes takes much longer to answer than
+  to compile (seconds in its queue before the compiler runs). A request without an answer in time is now
+  sent once more, the progress shows how many seconds it has waited, and the default
+  `asmLens.requestTimeoutMs` is 60 s (was 30 s). When both attempts get no answer, the message says so
+  and what to do.
+- The compiler list (Select Compiler → Browse) and the lookup of a language's default compiler no longer
+  wait forever when the server does not answer.
+
 ## 0.8.0
 
 ### New

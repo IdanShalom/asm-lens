@@ -968,3 +968,74 @@ test('functionForLine: a line of main is main, not the lambda or library code th
     assert.equal(x.ext._internals.functionForLine(a, a.rootPathKey, 0).name, 'P::dot() const');
   } finally { ce.restore(); }
 });
+
+// ---------------------------------------------------------------------------
+// 0.8.1: a slow Compiler Explorer
+
+// Replies in order; 'hang' never answers (until the request is aborted), { delay, reply } answers late.
+function scriptedCompilerExplorer(script) {
+  const real = global.fetch;
+  const requests = [];
+  global.fetch = (url, init = {}) => {
+    requests.push({ url: String(url), body: init.body ? JSON.parse(init.body) : undefined });
+    const step = script.length > 1 ? script.shift() : script[0];
+    const answer = reply => ({ ok: true, status: 200, json: async () => reply, text: async () => JSON.stringify(reply) });
+    return new Promise((resolve, reject) => {
+      const abort = () => reject(Object.assign(new Error('This operation was aborted'), { name: 'AbortError' }));
+      if (init.signal?.aborted) return abort();
+      init.signal?.addEventListener('abort', abort);
+      if (step === 'hang') return;
+      setTimeout(() => resolve(answer(step.reply || step)), step.delay || 0);
+    });
+  };
+  return { requests, restore: () => { global.fetch = real; } };
+}
+
+const slowRows = [{ text: 'f():' }, { text: '        mov eax, 1', source: { file: null, line: 1 } }, { text: '        ret', source: { file: null, line: 1 } }];
+
+test('a Compiler Explorer request without an answer in time is sent once more', async () => {
+  const dir = makeProject({ 'a.cpp': 'int f() { return 1; }\n' });
+  const ce = scriptedCompilerExplorer(['hang', { code: 0, asm: slowRows }]);
+  try {
+    const x = start(dir, { settings: { 'asmLens.requestTimeoutMs': 1000 } });
+    const msg = await x.analyze('a.cpp');
+    assert.deepEqual(msg.error, []);
+    assert.equal(ce.requests.length, 2);
+    assert.ok(x.state.outputLines.some(l => /godbolt\.org did not answer within 1 s; asking again/.test(l)), x.state.outputLines.join('\n'));
+    assert.match(await x.lensAt('a.cpp', 1), /^\$\(symbol-numeric\) 2 instructions/);
+  } finally { ce.restore(); }
+});
+
+test('no answer twice: a clear error, and the text is not compiled again without the marks', async () => {
+  const dir = makeProject({ 'a.cpp': 'struct S { int g() const { return 2; } };\nint f() { return 1; }\n' });
+  const ce = scriptedCompilerExplorer(['hang']);
+  try {
+    const x = start(dir, { settings: { 'asmLens.requestTimeoutMs': 1000 } });
+    const msg = await x.analyze('a.cpp');
+    assert.match(msg.error[0] || '', /godbolt\.org did not answer within 1 s, twice\. .*asmLens\.requestTimeoutMs/);
+    assert.equal(ce.requests.length, 2, 'the marked text twice; no third request');
+  } finally { ce.restore(); }
+});
+
+test('while Compiler Explorer is slow, the progress shows how long it has waited', async () => {
+  const dir = makeProject({ 'a.cpp': 'int f() { return 1; }\n' });
+  const ce = scriptedCompilerExplorer([{ delay: 3600, reply: { code: 0, asm: slowRows } }]);
+  try {
+    const x = start(dir, { settings: { 'asmLens.requestTimeoutMs': 20000 } });
+    assert.deepEqual((await x.analyze('a.cpp')).error, []);
+    const messages = x.state.progress.at(-1).messages;
+    assert.ok(messages.some(m => /^compiling with g152 on godbolt\.org… 3 s$/.test(m)), messages.join('\n'));
+  } finally { ce.restore(); }
+});
+
+test('Python on Compiler Explorer: a request without an answer in time is sent once more', async () => {
+  const dir = makeProject({ 'p.py': 'def f(x):\n    return x\n' }, { compilers: [{ id: 'python314', name: 'Python 3.14', language: 'python' }] });
+  const pyReply = { code: 0, asm: [{ text: 'Disassembly of <code object f at 0x1, file "example.py", line 1>:' }, { text: '  2           LOAD_FAST                0 (x)', source: { line: 2, file: null } }, { text: '              RETURN_VALUE', source: { line: 2, file: null } }] };
+  const ce = scriptedCompilerExplorer(['hang', pyReply]);
+  try {
+    const x = start(dir, { settings: { 'asmLens.requestTimeoutMs': 1000 } });
+    assert.deepEqual((await x.analyze('p.py')).error, []);
+    assert.equal(ce.requests.length, 2);
+    assert.match(await x.lensAt('p.py', 1), /^\$\(symbol-numeric\) 2 instructions · Python 3\.14/);
+  } finally { ce.restore(); }
+});
