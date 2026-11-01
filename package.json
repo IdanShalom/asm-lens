@@ -1,0 +1,307 @@
+{
+  "name": "asm-lens",
+  "displayName": "Asm Lens",
+  "description": "See the assembly of every function right in the editor: instruction counts as CodeLens, two-way source/assembly highlighting, headers and templates. Uses Compiler Explorer or your local compiler. C, C++, Rust, Go, Python, Zig, Swift, D and Fortran.",
+  "version": "0.8.1",
+  "publisher": "local-dev",
+  "license": "MIT",
+  "icon": "images/icon.png",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/IdanShalom/asm-lens.git"
+  },
+  "bugs": {
+    "url": "https://github.com/IdanShalom/asm-lens/issues"
+  },
+  "homepage": "https://github.com/IdanShalom/asm-lens#readme",
+  "keywords": [
+    "assembly",
+    "asm",
+    "disassembly",
+    "compiler explorer",
+    "godbolt",
+    "codelens",
+    "c++",
+    "rust",
+    "performance",
+    "templates"
+  ],
+  "galleryBanner": {
+    "color": "#1e2433",
+    "theme": "dark"
+  },
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "categories": [
+    "Programming Languages",
+    "Visualization",
+    "Other"
+  ],
+  "main": "./src/extension.js",
+  "activationEvents": [
+    "onLanguage:c",
+    "onLanguage:cpp",
+    "onLanguage:objective-c",
+    "onLanguage:objective-cpp",
+    "onLanguage:rust",
+    "onLanguage:go",
+    "onLanguage:python",
+    "onLanguage:zig",
+    "onLanguage:swift",
+    "onLanguage:d",
+    "onLanguage:fortran",
+    "onLanguage:FortranFreeForm",
+    "onLanguage:fortran-modern",
+    "onLanguage:fortran_free-form",
+    "onLanguage:fortran_fixed-form",
+    "onLanguage:fortran90",
+    "workspaceContains:.asm-lens.json",
+    "workspaceContains:.vscode/asm-lens.json"
+  ],
+  "contributes": {
+    "commands": [
+      {
+        "command": "asmLens.analyzeFile",
+        "title": "Analyze Current File",
+        "category": "Asm Lens",
+        "icon": "$(play)"
+      },
+      {
+        "command": "asmLens.selectCompiler",
+        "title": "Select Compiler",
+        "category": "Asm Lens"
+      },
+      {
+        "command": "asmLens.showAssembly",
+        "title": "Show Function Assembly",
+        "category": "Asm Lens"
+      },
+      {
+        "command": "asmLens.instantiateTemplate",
+        "title": "Instantiate Template at Cursor…",
+        "category": "Asm Lens"
+      },
+      {
+        "command": "asmLens.manageInstantiations",
+        "title": "Remove Template Instantiations…",
+        "category": "Asm Lens"
+      },
+      {
+        "command": "asmLens.openConfig",
+        "title": "Open or Create Project Config (.asm-lens.json)",
+        "category": "Asm Lens"
+      },
+      {
+        "command": "asmLens.reloadCompileCommands",
+        "title": "Reload Compile Commands",
+        "category": "Asm Lens"
+      },
+      {
+        "command": "asmLens.showOutput",
+        "title": "Show Output",
+        "category": "Asm Lens"
+      }
+    ],
+    "menus": {
+      "commandPalette": [
+        {
+          "command": "asmLens.analyzeFile",
+          "when": "editorLangId =~ /^(c|cpp|objective-c|objective-cpp|rust|go|python|zig|swift|d|fortran.*|FortranFreeForm)$/"
+        },
+        {
+          "command": "asmLens.showAssembly",
+          "when": "false"
+        },
+        {
+          "command": "asmLens.instantiateTemplate",
+          "when": "editorLangId == cpp || editorLangId == objective-cpp"
+        },
+        {
+          "command": "asmLens.manageInstantiations",
+          "when": "editorLangId == cpp || editorLangId == objective-cpp"
+        }
+      ],
+      "editor/context": [
+        {
+          "command": "asmLens.analyzeFile",
+          "when": "editorLangId =~ /^(c|cpp|objective-c|objective-cpp|rust|go|python|zig|swift|d|fortran.*|FortranFreeForm)$/",
+          "group": "navigation@90"
+        },
+        {
+          "command": "asmLens.instantiateTemplate",
+          "when": "editorLangId == cpp || editorLangId == objective-cpp",
+          "group": "navigation@91"
+        }
+      ]
+    },
+    "configuration": {
+      "title": "Asm Lens",
+      "properties": {
+        "asmLens.mode": {
+          "type": "string",
+          "enum": [
+            "remote",
+            "local"
+          ],
+          "default": "remote",
+          "enumDescriptions": [
+            "Compile on Compiler Explorer (asmLens.baseUrl). Your file and the local headers it includes are sent there.",
+            "Compile on this machine with your own compiler. Nothing leaves the machine."
+          ],
+          "description": "Where code is compiled. A project's .asm-lens.json \"mode\" overrides this."
+        },
+        "asmLens.localCompiler": {
+          "type": "string",
+          "default": "",
+          "description": "C/C++ compiler for local mode (a GCC- or Clang-compatible command or path, e.g. g++, clang++, /usr/bin/g++-14). Empty means g++. Other languages use their own compiler (rustc, go, python3, swiftc, zig, gfortran)."
+        },
+        "asmLens.compileCommands": {
+          "type": [
+            "string",
+            "array"
+          ],
+          "items": {
+            "type": "string"
+          },
+          "default": "",
+          "description": "Local mode: compile_commands.json database(s) of your build, relative to the workspace folder (e.g. build/compile_commands.json). Used when .asm-lens.json has no \"compileCommands\"."
+        },
+        "asmLens.reanalyzeOn": {
+          "type": "string",
+          "enum": [
+            "edit",
+            "save",
+            "never"
+          ],
+          "default": "edit",
+          "enumDescriptions": [
+            "Analyze again in the background when you pause typing (and when you save). Results below an edit stay visible meanwhile.",
+            "Analyze again when you save.",
+            "Only when you ask (CodeLens or command)."
+          ],
+          "description": "When a file that was analyzed (or a header an analyzed file uses) changes, analyze it again. The whole file is recompiled, since a change can affect every function that inlines the edited one."
+        },
+        "asmLens.reanalyzeDelayMs": {
+          "type": "number",
+          "default": 1000,
+          "minimum": 200,
+          "maximum": 10000,
+          "description": "With \"asmLens.reanalyzeOn\": \"edit\", how long typing must pause before analyzing again."
+        },
+        "asmLens.baseUrl": {
+          "type": "string",
+          "default": "https://godbolt.org",
+          "description": "Compiler Explorer instance URL."
+        },
+        "asmLens.compilerId": {
+          "type": "string",
+          "default": "g152",
+          "description": "Compiler Explorer compiler ID for C/C++, for example g152 or clang1910. Use \"Asm Lens: Select Compiler\" to browse."
+        },
+        "asmLens.compilerName": {
+          "type": "string",
+          "default": "",
+          "description": "Label for asmLens.compilerId in the status bar and CodeLens. Empty: the compiler id. Select Compiler fills it in."
+        },
+        "asmLens.flags": {
+          "type": "string",
+          "default": "-O2 -masm=intel",
+          "description": "Compiler flags sent to Compiler Explorer."
+        },
+        "asmLens.language": {
+          "type": "string",
+          "enum": [
+            "c++",
+            "c"
+          ],
+          "default": "c++",
+          "description": "Language sent to Compiler Explorer for C-family files when there is no .asm-lens.json."
+        },
+        "asmLens.requestTimeoutMs": {
+          "type": "number",
+          "default": 60000,
+          "minimum": 1000,
+          "maximum": 300000,
+          "description": "How long to wait for one compile, in milliseconds (Compiler Explorer, or a local compiler). A Compiler Explorer server that does not answer in time is asked once more."
+        },
+        "asmLens.showCounts": {
+          "type": "boolean",
+          "default": true,
+          "description": "Show instruction counts as CodeLens above functions."
+        },
+        "asmLens.includePaths": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": [],
+          "description": "Extra local include directories (like -I), relative to the workspace folder or absolute. The analyzed file's directory and workspace folders are always searched."
+        },
+        "asmLens.highlightOnHover": {
+          "type": "boolean",
+          "default": true,
+          "description": "Highlight matching assembly instructions when hovering or moving the cursor over a source line, and the matching source line when hovering an instruction."
+        },
+        "asmLens.colorizeLines": {
+          "type": "boolean",
+          "default": true,
+          "description": "Color each source line and its assembly instructions with the same color, like Compiler Explorer."
+        },
+        "asmLens.emitUnusedFunctions": {
+          "type": "boolean",
+          "default": true,
+          "description": "C/C++: also show functions the compiler leaves out when nothing in the file calls them (functions defined inside a class, inline, static and constexpr ones). They are marked __attribute__((used)) (MSVC: their address is taken) before compiling; the file on disk is not changed. Headers analyzed on their own always do this."
+        },
+        "asmLens.dimOtherLines": {
+          "type": "boolean",
+          "default": false,
+          "description": "While an instruction is hovered, also fade the other lines of its function in the editor and the other instructions in the assembly view. Off: only the matching lines are highlighted and the rest stays as it is."
+        },
+        "asmLens.maxIncludeFiles": {
+          "type": "number",
+          "default": 80,
+          "minimum": 1,
+          "maximum": 500,
+          "description": "Maximum number of local header files uploaded to Compiler Explorer per analysis."
+        },
+        "asmLens.skipFailingFunctions": {
+          "type": "boolean",
+          "default": true,
+          "description": "When the code has compile errors (for example a function uses a header that could not be found), leave those functions out and still analyze the rest. Skipped functions show 'Not compiled' in their CodeLens."
+        },
+        "asmLens.maxRecoveryAttempts": {
+          "type": "number",
+          "default": 12,
+          "minimum": 1,
+          "maximum": 30,
+          "description": "Maximum number of compile requests per analysis while recovering from missing headers and failing functions."
+        },
+        "asmLens.followCursor": {
+          "type": "boolean",
+          "default": true,
+          "description": "When the assembly view is open, switch it to the function under the cursor."
+        },
+        "asmLens.stubFailingHeaders": {
+          "type": "boolean",
+          "default": false,
+          "description": "Remote mode: replace an uploaded header that fails in the preprocessor (#error, malformed #if) by an empty file and keep going. Off by default because it can hide a missing define."
+        }
+      }
+    },
+    "jsonValidation": [
+      {
+        "fileMatch": [
+          ".asm-lens.json",
+          "asm-lens.json"
+        ],
+        "url": "./schemas/asm-lens.schema.json"
+      }
+    ]
+  },
+  "scripts": {
+    "test": "node test/run.js",
+    "test:remote": "node test/run.js --remote",
+    "package": "npx --yes @vscode/vsce@3 package"
+  }
+}
