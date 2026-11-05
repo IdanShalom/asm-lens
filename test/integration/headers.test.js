@@ -26,14 +26,15 @@ function localCompilers() {
 }
 
 const COUNT = /^\$\(symbol-numeric\) \d+ instructions · /;
-const NOT_INSTANTIATED = /^\$\(info\) No code emitted: template not instantiated/;
+const NOT_INSTANTIATED = /^\$\(info\) Template: no code yet/;
 
 // Header lines (1-based) of mathx.hxx
 const L = { square: 4, clamp: 7, addInts: 14, mulInts: 16, cube: 21, push: 25, get: 26, twice: 32 };
 
+// Choosing types by hand; test/integration/auto.test.js has what happens without being asked.
 async function headerScenario(t, config) {
   const dir = makeProject({ 'mathx.hxx': fixture('headers', 'mathx.hxx'), 'user.cpp': fixture('headers', 'user.cpp') }, config);
-  const x = start(dir);
+  const x = start(dir, { settings: { 'asmLens.autoInstantiateTemplates': false, 'asmLens.reanalyzeOn': 'never' } });
 
   // 1. The header on its own: non-template functions are emitted, templates wait for instantiation.
   const alone = await x.analyze('mathx.hxx');
@@ -94,7 +95,7 @@ async function headerScenario(t, config) {
 // functions whose demangled names start with the return type.
 async function unoptimizedScenario(t, config) {
   const dir = makeProject({ 'mathx.hxx': fixture('headers', 'mathx.hxx'), 'user.cpp': fixture('headers', 'user.cpp') }, config);
-  const x = start(dir);
+  const x = start(dir, { settings: { 'asmLens.reanalyzeOn': 'never' } });
   assert.deepEqual((await x.analyze('user.cpp')).error, []);
   assert.match(await x.lensAt('mathx.hxx', L.square), /^\$\(symbol-numeric\) 2 instantiations · \d+ \/ \d+ instructions · .* via user\.cpp$/, x.describe('mathx.hxx'));
   for (const line of [L.clamp, L.cube, L.twice]) assert.match(await x.lensAt('mathx.hxx', line), /^\$\(symbol-numeric\) \d+ instructions · .* via user\.cpp$/, `line ${line}`);

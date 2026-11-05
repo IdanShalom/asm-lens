@@ -534,6 +534,26 @@ function findFunctionResult(symbol, functions, docKey, rootKey) {
     || own.find(f => usable(f) && (variant(normalizeName(f.sourceName)) || variant(normalizeName(f.name))));
 }
 
+// The template instantiation a function belongs to: "Box<int>::get() const" is
+// Box<int>, "Box<int>::conv<float>() const" is itself up to its arguments, "int
+// twice<int>(int)" is twice<int>, "operator-(Box<int> const&)" has none. '' when none.
+function instantiationOf(name) {
+  const s = String(name || '').trim();
+  let depth = 0, end = s.length, start = 0;
+  for (let i = 0; i < s.length; i++) {
+    const c = s[i];
+    if (c === '<' && !/\boperator\s*<*$/.test(s.slice(0, i))) depth++;
+    else if (c === '>' && depth && s[i - 1] !== '-') depth--;
+    else if (!depth && c === '(' && !/\boperator\s*$/.test(s.slice(0, i))) { end = i; break; }
+    else if (!depth && /\s/.test(c)) start = i + 1;
+  }
+  const head = s.slice(start, end);
+  const op = head.search(/\boperator\b/);
+  const named = op >= 0 ? head.slice(0, op) : head;
+  const id = named.slice(0, named.lastIndexOf('>') + 1).replace(/\b([A-Za-z_]\w*)(<[^:]*>)::\1<[^:]*>$/, '$1$2');   // MSVC: Box<int>::Box<int>
+  return /^[A-Za-z_:]/.test(id) ? id : '';
+}
+
 // Every emitted function for a source symbol (all template instantiations).
 // In a file other than the analyzed one (a header), functions are matched by
 // name and then by which of the header's lines their instructions come from,
@@ -635,7 +655,7 @@ module.exports = {
   IS_WIN, normPath, isSystemPath,
   makeRefResolver, makeLocalRefResolver, localAsmToRows, sectionKind, unescapeAsmString, isMachO, prepareMachO, finishMachO,
   parseFunctions, mergeFunctionParts, partOf, isDataSymbol, isLibrarySymbol, looksLikeFunctionLabel, isInstructionLine, cleanInstruction, buildLineIndex,
-  stripTemplateArgs, normalizeName, msvcName, sameName, matchSourceSymbol, findFunctionResult, findAllFunctionResults,
+  stripTemplateArgs, normalizeName, msvcName, sameName, matchSourceSymbol, findFunctionResult, findAllFunctionResults, instantiationOf,
   ANSI_RE, missingIncludesFrom, preprocessorErrorFilesFrom, errorLocationsFrom, stubFilename,
   cleanAssemblyRowsForDisplay, cleanAssemblyForDisplay
 };

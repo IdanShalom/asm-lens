@@ -489,3 +489,17 @@ test('library code with no lines in this file is not this file\'s function of th
   assert.equal(asm.findFunctionResult({ name: 'empty' }, [lib]), undefined);
   assert.equal(asm.findFunctionResult({ name: 'empty' }, [lib, mine]), mine);
 });
+
+test('instantiationOf: what a function was instantiated for', () => {
+  const { instantiationOf } = require('../../src/asm');
+  assert.equal(instantiationOf('Box<int>::get() const'), 'Box<int>');
+  assert.equal(instantiationOf('Box<int>::conv<float>() const'), 'Box<int>::conv<float>');
+  assert.equal(instantiationOf('int tfree<int>(int)'), 'tfree<int>');
+  assert.equal(instantiationOf('std::vector<int> f<int>(int)'), 'f<int>');
+  assert.equal(instantiationOf('Box<int>::operator+(Box<int> const&) const'), 'Box<int>');
+  assert.equal(instantiationOf('Box<int>::Box<int>(void)'), 'Box<int>');
+  assert.equal(instantiationOf('ns::Pair<int, char>::key() const'), 'ns::Pair<int, char>');
+  assert.equal(instantiationOf('operator-(Box<int> const&, Box<int> const&)'), '');
+  assert.equal(instantiationOf('plain(int)'), '');
+  assert.equal(instantiationOf('bool operator< <int>(Box<int> const&)'), '');
+});

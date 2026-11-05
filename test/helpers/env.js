@@ -75,6 +75,19 @@ function start(dir, options = {}) {
       const all = await this.lenses(rel);
       return all.find(l => l.line === line && !l.title.endsWith('Instantiate…'))?.title;
     },
+    // Looks at the file like the editor does until nothing is compiling any more (a header compiles by itself).
+    async settled(rel) {
+      for (let i = 0; i < 6000; i++) {
+        const all = await this.lenses(rel);
+        if (!all.some(l => /Analyzing|Updating/.test(l.title))) {
+          await new Promise(r => setTimeout(r, 30));
+          const again = await this.lenses(rel);
+          if (!again.some(l => /Analyzing|Updating/.test(l.title))) return again;
+        }
+        await new Promise(r => setTimeout(r, 20));
+      }
+      throw new Error(`${rel} is still being analyzed`);
+    },
     analysis(rel) { return ctx.ext._internals.analysisFor(ctx.vscode._openDocument(at(rel))); },
     // Edits like the editor does: replaces text from (line, char) to (endLine, endChar), 0-based, and fires the change event.
     edit(rel, line, char, endLine, endChar, text) {
@@ -83,6 +96,7 @@ function start(dir, options = {}) {
       const before = lines.slice(0, line).join('\n') + (line ? '\n' : '') + lines[line].slice(0, char);
       const after = lines[endLine].slice(endChar) + (endLine + 1 < lines.length ? '\n' + lines.slice(endLine + 1).join('\n') : '');
       doc.setText(before + text + after);
+      doc.isDirty = true;
       ctx.state.changeListener({ document: doc, contentChanges: [{ range: new ctx.vscode.Range(line, char, endLine, endChar), text }] });
       return doc;
     },

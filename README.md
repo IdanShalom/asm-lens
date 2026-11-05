@@ -26,10 +26,11 @@ Go, Python, Zig, Swift, D and Fortran are supported too.
 - **Every function, including unused ones**: methods defined inside a class, and `static`, `inline`
   and `constexpr` functions get their own counts even when nothing in the file calls them, with every
   compiler (`asmLens.emitUnusedFunctions`).
-- **Headers work**: analyze a header on its own, or analyze a `.cpp` and open the headers
-  it includes. Functions defined in headers get counts too, including code inlined into callers.
-- **Templates on demand**: click **Instantiate…** above a template, type the template
-  arguments (`int`, `float, 4`, `std::vector<int>`), and see the code for exactly that type.
+- **Headers work**: analyze a `.cpp` and open the headers it includes, and they compile by
+  themselves: every function, `static inline` or not, shows code even if the `.cpp` inlined it or never
+  called it. A header that needs what the `.cpp` includes or defines before it gets those lines too.
+- **Templates show code at once**, with the types the code uses (`Box<int>`), else `int`. Click
+  **Instantiate…** above a template to choose others (`int`, `float, 4`, `std::vector<int>`).
 - **Robust against real projects**: local headers are found and uploaded the way a
   compiler would find them; a missing header is replaced by an empty file; a function
   that does not compile is skipped and marked *Not compiled*, and the rest is analyzed.
@@ -131,9 +132,22 @@ round, MSVC flags (`/O2`, `/std:c++20`, `/W4`, `/DNAME`) given to GCC or Clang a
 **Functions nothing calls.** A compiler leaves out a function defined inside a class, or a `static`,
 `inline` or `constexpr` one, when nothing in the file uses it (and often when every call was inlined).
 To show its code anyway, the copy that is compiled marks such functions `__attribute__((used))` on the
-same line (MSVC: a line after the end of the file takes each one's address). Your file is not changed,
-and if the marked copy does not compile, the file is compiled as written. Set
+same line (MSVC: a line after the end of the file takes each one's address, or calls a constructor). Your
+file is not changed, and if the marked copy does not compile, the file is compiled as written. Set
 `asmLens.emitUnusedFunctions` to `false` to see only what the compiler emits on its own.
+
+**Templates without being asked.** A template has no code until it has types, so the copy that is compiled
+also instantiates each template, after the end of the file: with the types written where it is used, in the file
+or in an analyzed file that includes it (`Box<long>`), otherwise `int` (`1` for a number). The CodeLens names the
+types (`3 instructions · Box<long>`). A line that does not compile is dropped, and that template asks for its
+types when clicked. Types you chose with **Instantiate…** replace these. `asmLens.autoInstantiateTemplates`
+turns this off.
+
+**Headers and the files that include them.** Opening a header after analyzing a file that includes it compiles
+the header by itself, once for each saved version (not with `"reanalyzeOn": "never"`). A header that fails on its
+own, has functions that do not compile, or has functions switched off by an `#if` is compiled again with the
+preprocessor lines that come before its `#include` in that file (or in a source file found in the workspace), since
+it may rely on them, and the better of the two results is kept.
 
 ### compile_commands.json (local mode)
 
@@ -322,6 +336,7 @@ Each object in `compilers` may have:
 | `asmLens.language` | `c++` | Language sent for C-family files without a project file. |
 | `asmLens.includePaths` | `[]` | Extra include folders, searched after the project file's. |
 | `asmLens.maxIncludeFiles` | `80` | Most local headers uploaded per analysis. |
+| `asmLens.autoInstantiateTemplates` | `true` | C++: compile templates without being asked, with the types the code uses, else `int` (see above). |
 | `asmLens.emitUnusedFunctions` | `true` | C/C++: also show functions defined in a class, `static`, `inline` and `constexpr` ones that nothing in the file calls (see above). Headers analyzed on their own always do this. |
 | `asmLens.skipFailingFunctions` | `true` | Skip functions that do not compile instead of failing. |
 | `asmLens.maxRecoveryAttempts` | `12` | Most compiles per analysis while recovering. |
@@ -367,9 +382,14 @@ mode, where your own compiler and system headers are used.
 - **"Instantiations not compiled yet"**: instantiations are saved per file but compiled only when that
   file itself is analyzed. Click the CodeLens.
 - **"No separate code in user.cpp (inlined or not used)"**: that `.cpp` has no code to attribute to this
-  function. Click the CodeLens to compile the header itself, or to choose a template's types.
-- **"No code emitted"**: the function is a template that was never instantiated (click the CodeLens or
-  **Instantiate…**, or analyze a file that calls it), or `asmLens.emitUnusedFunctions` is off and nothing uses it.
+  function, and the header has not been compiled by itself (`"reanalyzeOn": "never"`). Click the CodeLens.
+- **"Template: no code yet"**: it does not compile with the types tried. Click the CodeLens to choose its types.
+- **"Not compiled · inside #ifdef X, which is off"**: the preprocessor removed the function. Add the define to
+  `"defines"` in `.asm-lens.json`, or analyze a file that defines it before including the header.
+- **"Not compiled · this function has compile errors"**: it does not compile here, even with what comes before
+  the `#include`. The Asm Lens output has the compiler's message.
+- **"No code: the compiler left it out"**: `asmLens.emitUnusedFunctions` is off and nothing uses it, or the marks
+  that keep unused functions were not accepted.
 - **Local mode on macOS: errors in C++11 code** (`'auto' type specifier is a C++11 extension`): Apple
   clang 14 and older compile C++98 by default. Asm Lens then adds `-std=gnu++17` (the default of current
   compilers and of Compiler Explorer) and says so in the output; put a `-std=...` in your flags to choose.
@@ -427,7 +447,7 @@ There are no runtime dependencies and no build step: the extension is plain Java
 Every push builds the `.vsix` on GitHub Actions (tests on Windows, Linux and macOS first); it is attached to
 the workflow run.
 
-To release, set the new version in `package.json` and push a matching tag such as `v0.8.3`. That creates a
+To release, set the new version in `package.json` and push a matching tag such as `v0.8.4`. That creates a
 GitHub release with the `.vsix` and publishes it to the Visual Studio Marketplace with
 [Trusted Publishing](https://code.visualstudio.com/api/working-with-extensions/publishing-extension), so no
 token is stored. It needs a policy for this repository and `build-vsix.yml` on the publisher's Trusted

@@ -1,8 +1,18 @@
 # Changelog
 
-## 0.8.3
+## 0.8.4
 
 ### New
+- **Headers show code without a click.** Opening a header after analyzing a `.cpp` that includes it compiles the
+  header by itself, so every function shows code: `static inline` ones the `.cpp` inlined or never called too.
+- **Templates show code at once**, with the types the code uses (`Box<long>` in the `.cpp`), else `int`. The
+  CodeLens names them. **Instantiate…** still chooses others. Setting: `asmLens.autoInstantiateTemplates`.
+- **A header that needs its `.cpp` works**: one that fails alone, or has functions switched off by `#ifdef`, is
+  compiled with the preprocessor lines before its `#include` in that `.cpp` (through other headers too, and found in
+  the workspace if nothing was analyzed yet).
+- **The CodeLens says why there is no code**: *Not compiled · inside #ifdef X, which is off*, *consteval…*,
+  *Template: no code yet*, instead of "not used, or a template never instantiated".
+- A test suite that runs the extension in a real VS Code (`npm run test:e2e`, also in CI).
 - **Asks before code leaves your machine.** The first time a file would be sent to a Compiler Explorer server,
   a dialog says so and offers **Send**, **Send, Don't Show Again** and **Use Local Compiler**. Nothing is sent
   before you agree, and analyses that start by themselves never send. "Don't show again" holds per server, so a
@@ -11,6 +21,22 @@
   server's operators can tell its traffic apart.
 
 ### Fixes
+- **Overloaded functions had no code with MSVC** ("not used, or a template never instantiated"): they are kept by
+  taking their address, and `&name` does not compile for an overloaded name. They are now selected by their type.
+  Overloaded function templates too, with every compiler.
+- **Struct templates with a `requires` clause were not seen as templates**, so their methods had no code and no way
+  to choose types; a trailing `requires` hid the method altogether. `struct ABC final` was taken for a struct named
+  `final`.
+- **Friend functions defined in a class template never had code**, since instantiating the class does not
+  instantiate them. They are now called, after the end of the compiled copy.
+- Constructors and destructors had no code with MSVC, which cannot take their address.
+- One server error (HTTP 502, a lost connection) while compiling turned off the marks that keep unused functions
+  until VS Code restarted, so `static inline` functions showed no code from then on.
+- A header whose functions were all inlined was not tied to the `.cpp` in local mode, so it kept offering to be
+  analyzed, and saving it did not update the `.cpp`.
+- clangd: an in-class declaration got a CodeLens as if it had a body.
+- Instantiating a class and a class nested in it was an error; the nested one now comes with the outer one.
+- Automatic analyses no longer show a message each time they finish. `-Iasm_lens…` is no longer listed among your flags.
 - **`static inline` functions in headers showed "No code emitted"**, with every compiler, as soon as one
   function in the header could not compile on its own, because all of the header's functions lost the marks that
   keep them. Now only the functions that fail say *Not compiled*. With MSVC this also happened for anything it

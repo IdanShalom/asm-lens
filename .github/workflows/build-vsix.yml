@@ -37,8 +37,23 @@ jobs:
       - name: Test
         run: npm test
 
+  e2e:
+    name: In a real VS Code
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Run the extension in VS Code
+        run: |
+          npm install --no-save --no-audit --no-fund @vscode/test-electron
+          xvfb-run -a node test/e2e/run.js
+
   package:
-    needs: test
+    needs: [test, e2e]
     runs-on: ubuntu-latest
     permissions:
       contents: write

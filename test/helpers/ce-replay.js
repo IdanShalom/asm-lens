@@ -27,8 +27,14 @@ function installFetch() {
     if (RECORD) {
       // Spaced out, to stay within Compiler Explorer's rate limit.
       await new Promise(r => setTimeout(r, 1500));
-      const res = await realFetch(url, init);
+      let res = await realFetch(url, init);
+      // A server having a bad moment is waited for, and never saved as if it were the answer.
+      for (let wait = 15000; res.status >= 500 && wait <= 120000; wait *= 2) {
+        await new Promise(r => setTimeout(r, wait));
+        res = await realFetch(url, init);
+      }
       if (res.status === 429) throw new Error('Compiler Explorer rate limit (HTTP 429) while recording; wait a few minutes and record again.');
+      if (res.status >= 500) throw new Error(`Compiler Explorer answered HTTP ${res.status} while recording; try again later.`);
       const text = await res.text();
       fs.mkdirSync(DIR, { recursive: true });
       fs.writeFileSync(file, zlib.gzipSync(JSON.stringify({ url: String(url).replace(/^https?:\/\/[^/]+/, ''), status: res.status, body: text })));

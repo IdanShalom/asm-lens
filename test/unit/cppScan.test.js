@@ -373,16 +373,18 @@ test('keepable / { all: false }: in-class, static, inline, constexpr and anonymo
   assert.ok(!header[21].includes('__attribute__((used))'), 'main is not marked in a header either');
 });
 
-test('keepByAddress / { all: false }: qualified names for members; constructors, destructors, main and templates are left out', () => {
+test('keepByAddress / { all: false }: qualified names for members; constructors and destructors through a call; friends, main and templates are left out', () => {
   assert.deepEqual(scan.keepByAddress(CLASSES, { all: false }), [
+    '#include <new>',
     'auto __asm_lens_keep_0 = &Counter::add;',
     'auto __asm_lens_keep_1 = &Counter::helper;',
-    'auto __asm_lens_keep_2 = &Counter::operator==;',
-    'auto __asm_lens_keep_3 = &Counter::secret;',
-    'auto __asm_lens_keep_4 = &file_local;',
-    'auto __asm_lens_keep_5 = &inl;',
-    'auto __asm_lens_keep_6 = &cx;',
-    'auto __asm_lens_keep_7 = &anon;'
+    'void __asm_lens_keep_2(void* __asm_lens_at, int t) { ::new (__asm_lens_at) Counter(t); }',
+    'void __asm_lens_keep_3(Counter* __asm_lens_at) { __asm_lens_at->~Counter(); }',
+    'auto __asm_lens_keep_4 = &Counter::secret;',
+    'auto __asm_lens_keep_5 = &file_local;',
+    'auto __asm_lens_keep_6 = &inl;',
+    'auto __asm_lens_keep_7 = &cx;',
+    'auto __asm_lens_keep_8 = &anon;'
   ]);
   assert.ok(scan.keepByAddress('int main() { return 0; }\nint wmain() { return 0; }\n').length === 0);
   assert.ok(scan.keepByAddress(CLASSES).some(l => /&outOfLine|&Counter::outOfLine/.test(l)), 'a header keeps out-of-line members too');
@@ -411,4 +413,147 @@ test('blankEnclosingDeclaration: attributes are not taken for the function name'
   for (const text of ['__attribute__((used)) static inline int f(int a) { return a; }\n', 'static inline __attribute__((always_inline)) int f(int a) { return a; }\n', '[[nodiscard]] inline int f(int a) { return a; }\n']) {
     assert.equal(scan.blankEnclosingDeclaration(text, 0).name, 'f', text);
   }
+});
+
+// ---------------------------------------------------------------------------
+// 0.8.4: requires clauses, friends, overloads, templates compiled without being asked
+
+test('scanDefinitions: a class template with a requires clause is a template', () => {
+  const src = [
+    'template <class T> requires (sizeof(T) >= 1)',
+    'struct A { T a() const { return T{}; } };',
+    'template <class T> requires C<T> && D<T> struct B { T b() const { return T{}; } };',
+    'template <class T> requires requires(T x) { x + x; } struct E { T e() const { return T{}; } };',
+    'template <class T> struct F { T f() const requires C<T> { return T{}; } };',
+    'template <class T> requires C<T> T g(T x) { return x; }',
+    'decltype(auto) after(int& x) { return (x); }'
+  ].join('\n');
+  const fns = scan.scanDefinitions(src).filter(d => d.kind === 'function');
+  assert.deepEqual(fns.map(d => d.name), ['a', 'b', 'e', 'f', 'g', 'after']);
+  assert.deepEqual(fns.map(d => d.templated), [true, true, true, true, true, false]);
+  assert.equal(scan.templateTargetAt(src, 1).make(['int']).expr, 'A<int>');
+  assert.equal(scan.templateTargetAt(src, 2).make(['int']).expr, 'B<int>');
+});
+
+test('scanDefinitions: `struct NAME final` is called NAME, a macro in front is not', () => {
+  const classes = src => scan.scanDefinitions(src).filter(d => d.kind === 'class').map(d => d.name);
+  assert.deepEqual(classes('template <class T> struct F16 final { T f() { return T{}; } };'), ['F16']);
+  assert.deepEqual(classes('struct ABC final : Base { };'), ['ABC']);
+  assert.deepEqual(classes('struct EXPORT_API Mine final { };'), ['Mine']);
+  assert.deepEqual(classes('struct ABC : Base { };'), ['ABC']);
+});
+
+test('keepByAddress: overloads are cast to their type, in their namespace; a call is not an overload', () => {
+  const lines = scan.keepByAddress([
+    'static inline int over(int x) { return x; }',
+    'static inline float over(float x = 1.0f) { return x; }',
+    'namespace ns { struct Foo {}; static inline int inner(Foo f) { return 1; } static inline int inner(int a, Foo f) { return 2; } }',
+    'struct C { int m(int) const { return 1; } int m(float) { return 2; } static int s(int) { return 3; } static int s(float) { return 4; } };',
+    'int plain(int x) { return x; }',
+    'int caller() { plain(1); return plain(2); }'
+  ].join('\n'));
+  assert.deepEqual(lines, [
+    'auto __asm_lens_keep_0 = static_cast<int (*)(int x)>(&over);',
+    'auto __asm_lens_keep_1 = static_cast<float (*)(float x)>(&over);',
+    'namespace ns { auto __asm_lens_keep_2 = static_cast<int (*)(Foo f)>(&inner); }',
+    'namespace ns { auto __asm_lens_keep_3 = static_cast<int (*)(int a, Foo f)>(&inner); }',
+    'auto __asm_lens_keep_4 = static_cast<int (C::*)(int) const>(&C::m);',
+    'auto __asm_lens_keep_5 = static_cast<int (C::*)(float)>(&C::m);',
+    'auto __asm_lens_keep_6 = static_cast<int (*)(int)>(&C::s);',
+    'auto __asm_lens_keep_7 = static_cast<int (*)(float)>(&C::s);',
+    'auto __asm_lens_keep_8 = &plain;',
+    'auto __asm_lens_keep_9 = &caller;'
+  ]);
+});
+
+test('keepByAddress: a prototype next to the definition is an overload too', () => {
+  assert.deepEqual(scan.keepByAddress('int f(int);\ninline int f(float x) { return 1; }\n'), ['auto __asm_lens_keep_0 = static_cast<int (*)(float x)>(&f);']);
+});
+
+test('templateTargetAt: an overloaded function template is selected by its type', () => {
+  const src = 'template <class T> T pick(T a) { return a; }\ntemplate <class T> T pick(T a, T b) { return b; }\n';
+  assert.deepEqual(scan.templateTargetAt(src, 1).make(['int']), { kind: 'address', expr: 'pick<int>', cast: 'int (*)(int a, int b)' });
+  assert.equal(scan.appendInstantiations('', [scan.templateTargetAt(src, 0).make(['long'])]).text.trim(), 'auto __asm_lens_inst_0 = static_cast<long (*)(long a)>(&pick<long>);');
+});
+
+test('templateUsesIn: arguments where a template is used, not inside templates or template heads', () => {
+  const src = [
+    'template <class T> struct Box { Box<T> self() { return *this; } };',
+    'template <> struct Box<char> { };',
+    'template <class T> Box<T> make(T x) { Box<T> b; return b; }',
+    'Box<int> a;',
+    'ns::Box<std::pair<int, long>> b;',
+    'Box<int> c;',
+    '// Box<float> in a comment',
+    'int n = sizeof(Box<double>);',
+    'bool lt = OtherBox < 3;'
+  ].join('\n');
+  assert.deepEqual(scan.templateUsesIn(src, 'Box'), ['int', 'std::pair<int, long>', 'double']);
+});
+
+test('autoInstantiations: the types used, else suggested ones; what was asked for wins; nested classes once', () => {
+  const header = [
+    'template <class T> struct Box { T get() const { return T{}; } struct In { T i() { return T{}; } }; };',
+    'template <class T> struct Box<T*> { T* p() const { return nullptr; } };',
+    'template <class T, int N> struct Arr { T a() const { return T{}; } };',
+    'template <class T> T twice(T x) { return x + x; }',
+    'namespace ns { template <class T> struct Q { T q() const { return T{}; } }; }'
+  ].join('\n');
+  const exprs = o => scan.autoInstantiations(header, o).map(it => it.expr);
+  assert.deepEqual(exprs({}), ['Box<int>', 'Box<int*>', 'Arr<int, 1>', 'twice<int>', 'ns::Q<int>'], 'Box<int>::In comes with Box<int>');
+  assert.deepEqual(exprs({ contexts: ['Box<float> f;\nBox<long> g;\nArr<char, 8> h;\nns::Q<short> q;\nauto z = twice<double>(1);\n'] }),
+    ['Box<float>', 'Box<long>', 'Box<int*>', 'Arr<char, 8>', 'twice<double>', 'ns::Q<short>']);
+  assert.deepEqual(exprs({ manual: [{ kind: 'class', expr: 'Box<char>' }] }), ['Arr<int, 1>', 'twice<int>', 'ns::Q<int>'], 'requests of its own: that template is left alone');
+  assert.equal(exprs({ max: 2 }).length, 2);
+  assert.deepEqual(exprs({ rejected: new Set(['Box<int>', 'twice<int>']) }), ['Box<int>::In', 'Box<int*>', 'Arr<int, 1>', 'ns::Q<int>'], 'those known not to compile are left out');
+  assert.deepEqual(scan.autoInstantiations(header, { manual: [{ kind: 'address', expr: 'Arr<int, 1>::a' }] }).map(it => it.expr).includes('Arr<int, 1>'), false, 'its class does not compile as a whole');
+  assert.ok(scan.autoInstantiations(header, { manual: [{ kind: 'address', expr: 'Box<int>::conv<float>' }] }).some(it => it.expr === 'Box<int>'), 'a member template asked for says nothing about the class');
+  const written = 'template <class T> struct W { T w() const { return T{}; } };\ntemplate struct W<int>;\nextern template struct W<char>;\nW<char> c;\n';
+  assert.deepEqual(scan.autoInstantiations(written).map(it => it.expr), ['W<char>'], 'a second explicit instantiation of W<int> would be an error; extern template asks for one');
+});
+
+test('friendUseLines: a friend of a class template is called with its arguments', () => {
+  const src = [
+    '#include <ostream>',
+    'namespace ns {',
+    'template <class T, int N> struct Box {',
+    '  friend Box operator-(const Box& a, const Box&) { return a; }',
+    '  friend std::ostream& operator<<(std::ostream& os, const Box<T, N>& c) { return os; }',
+    '  friend T peek(const Box& b, T d = T{}) { return d; }',
+    '  friend void none() { }',
+    '};',
+    '}'
+  ].join('\n');
+  assert.deepEqual(scan.friendUseLines(src, [{ kind: 'class', expr: 'ns::Box<int, 3>' }]), [
+    'namespace ns { decltype(auto) __asm_lens_use_0(const Box<int, 3>& a, const Box<int, 3>& __asm_lens_p1) { return operator-(a, __asm_lens_p1); } }',
+    'namespace ns { decltype(auto) __asm_lens_use_1(std::ostream& os, const Box<int, 3>& c) { return operator<<(os, c); } }',
+    'namespace ns { decltype(auto) __asm_lens_use_2(const Box<int, 3>& b, int d) { return peek(b, d); } }'
+  ]);
+  assert.deepEqual(scan.friendUseLines(src, [{ kind: 'address', expr: 'ns::Box<int, 3>::x' }]), []);
+});
+
+test('conditionAt: the condition around a line; an include guard does not count', () => {
+  const src = ['#ifndef G_H', '#define G_H', 'int a;', '#ifdef X // why', 'int b;', '#else', 'int c;', '#endif', '#if defined(Y)', '#  if Z', 'int d;', '#  endif', 'int e;', '#endif', 'int f;', '#endif'].join('\n');
+  const at = l => scan.conditionAt(src, l - 1);
+  assert.equal(at(3), undefined);
+  assert.equal(at(5), '#ifdef X');
+  assert.equal(at(7), '#else');
+  assert.equal(at(11), '# if Z');
+  assert.equal(at(13), '#if defined(Y)');
+  assert.equal(at(15), undefined);
+  assert.equal(scan.conditionAt('/*\n#ifdef NO\n*/\nint a;\n', 3), undefined, 'in a comment');
+});
+
+test('includeContext: the preprocessor lines before an #include, closed, through other headers', async () => {
+  const cpp = ['#pragma once', '#define A 1', 'int code_is_left_out;', '#ifdef A', '#include <vector>', '#define MULTI \\', '  2', '#include "sub/x.hxx"', '#endif', '#define AFTER'].join('\n');
+  assert.deepEqual(await scan.includeContext(cpp, 'x.hxx', { dir: '/p' }), {
+    text: ['#define A 1', '#ifdef A', '#include <vector>', '#define MULTI \\\n  2', '#endif'].join('\n'),
+    dirs: ['/p']
+  });
+  assert.equal(await scan.includeContext(cpp, 'y.hxx', { dir: '/p' }), undefined);
+  const follow = async (name, dir) => (name === 'mid.h' ? { text: '#define M\n#include "x.hxx"\n', dir: `${dir}/inc` } : undefined);
+  assert.deepEqual(await scan.includeContext('#define T\n#include "other.h"\n#include "mid.h"\n', 'x.hxx', { follow, dir: '/p' }), {
+    text: ['#define T', '#include "other.h"', '#define M'].join('\n'),
+    dirs: ['/p', '/p/inc']
+  });
 });
