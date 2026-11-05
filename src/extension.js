@@ -316,30 +316,43 @@ function activate(context) {
         })), ...extra];
       }
       const key = docPathKey(document);
-      const viaRoot = cached.rootKey !== fileKey(document) ? ` · via ${path.basename(cached.rootPath)}` : '';
-      const updating = reanalysisTimers.has(cached.rootKey) || analysisBusy.has(cached.rootKey);
+      const own = lastAnalysis.get(fileKey(document));
+      const requested = instantiationsFor(document).length > 0;
       return [...functions.map(sym => {
-        const results = findAllFunctionResults(sym, cached.functions, key, cached.rootPathKey);
+        const template = templates.has(sym);
+        const { analysis, results, inlined, skipped: wasSkipped } = codeFor(document, sym, { template });
         const result = results[0];
-        const inlined = !result ? inlinedResultFor(sym, cached, key) : undefined;
+        const viaRoot = analysis.rootKey !== fileKey(document) ? ` · via ${path.basename(analysis.rootPath)}` : '';
+        const updating = reanalysisTimers.has(analysis.rootKey) || analysisBusy.has(analysis.rootKey);
         // Edited since the last compile: its old numbers would be wrong.
-        if (isStale(cached, key, sym.range, results.length ? results : inlined ? [inlined] : [])) {
+        if (isStale(analysis, key, sym.range, results.length ? results : inlined ? [inlined] : [])) {
           return new vscode.CodeLens(sym.range, updating
             ? { title: '$(sync~spin) Updating…', command: 'asmLens.showOutput' }
-            : { title: '$(edit) Changed since the last analysis · click to update', command: 'asmLens.analyzeFile', arguments: [vscode.Uri.file(cached.rootPath)] });
+            : { title: '$(edit) Changed since the last analysis · click to update', command: 'asmLens.analyzeFile', arguments: [vscode.Uri.file(analysis.rootPath)] });
         }
-        const wasSkipped = !result && !inlined && (cached.skipped || []).some(k => k.key === key && sym.range.start.line >= k.startLine && sym.range.start.line <= k.endLine);
+        // No code, and known only through a file that includes this one: that file not using a
+        // function says nothing about the function. Compiling this file itself will show it.
+        if (!result && !inlined && !wasSkipped && viaRoot) {
+          if (analysisBusy.has(fileKey(document))) return new vscode.CodeLens(sym.range, { title: '$(sync~spin) Analyzing…', command: 'asmLens.showOutput' });
+          if ((!own || own.compilerId !== analysis.compilerId) && (!template || requested)) {
+            return new vscode.CodeLens(sym.range, {
+              title: template ? '$(play) Instantiations not compiled yet · click to analyze this file' : `$(play) Not used by ${path.basename(analysis.rootPath)} · click to analyze this file`,
+              command: 'asmLens.analyzeFile',
+              arguments: [document.uri]
+            });
+          }
+        }
         const title = results.length > 1
-          ? `$(symbol-numeric) ${results.length} ${templates.has(sym) || /</.test(results[0].name) ? 'instantiations' : 'versions'} · ${results.map(r => r.count).join(' / ')} instructions · ${cached.compilerLabel}${viaRoot}`
+          ? `$(symbol-numeric) ${results.length} ${template || /</.test(results[0].name) ? 'instantiations' : 'versions'} · ${results.map(r => r.count).join(' / ')} instructions · ${analysis.compilerLabel}${viaRoot}`
           : result
-            ? `$(symbol-numeric) ${result.count} instructions · ${cached.compilerLabel} · ${cached.flags}${viaRoot}`
+            ? `$(symbol-numeric) ${result.count} instructions · ${analysis.compilerLabel} · ${analysis.flags}${viaRoot}`
             : inlined
               ? `$(symbol-numeric) ${inlined.count} inlined instructions · used in ${inlined.users.length} function(s)${viaRoot}`
               : wasSkipped
-                ? `$(warning) Not compiled · this function has compile errors (missing include?) · ${cached.compilerLabel}`
-                : templates.has(sym)
-                  ? `$(info) No code emitted: template not instantiated · ${cached.compilerLabel}${viaRoot}`
-                  : `$(info) No code emitted (not used, or a template never instantiated) · ${cached.compilerLabel}`;
+                ? `$(warning) Not compiled · this function has compile errors (missing include?) · ${analysis.compilerLabel}`
+                : template
+                  ? `$(info) No code emitted: template not instantiated · ${analysis.compilerLabel}${viaRoot}`
+                  : `$(info) No code emitted (not used, or a template never instantiated) · ${analysis.compilerLabel}`;
         return new vscode.CodeLens(sym.range, {
           title,
           command: 'asmLens.showAssembly',
@@ -352,7 +365,7 @@ function activate(context) {
 
   context.subscriptions.push(vscode.languages.registerHoverProvider(selector, {
     provideHover(document, position) {
-      const analysis = analysisFor(document);
+      const analysis = analysisAt(document, position.line);
       if (!analysis) return undefined;
       const key = docPathKey(document);
       if ((analysis.edits || []).some(e => e.key === key && e.start <= position.line && position.line <= e.end)) return undefined;
@@ -383,9 +396,9 @@ function activate(context) {
   context.subscriptions.push(vscode.window.onDidChangeTextEditorSelection(event => {
     const document = event.textEditor.document;
     if (!LANGS.includes(document.languageId)) return;
-    const analysis = analysisFor(document);
-    if (!analysis) return;
     const line = event.selections[0].active.line;
+    const analysis = analysisAt(document, line);
+    if (!analysis) return;
     const key = docPathKey(document);
     const byUser = event.kind === vscode.TextEditorSelectionChangeKind.Mouse || event.kind === vscode.TextEditorSelectionChangeKind.Keyboard;
     clearTimeout(syncTimer);
@@ -548,7 +561,7 @@ function activate(context) {
     const tree = await vscode.commands.executeCommand('vscode.executeDocumentSymbolProvider', document.uri);
     const sym = sourceFunctionsOf(document, tree).find(s => s.name === functionName && (!Number.isInteger(line) || s.range.start.line === line))
       || (Number.isInteger(line) ? { name: functionName, range: new vscode.Range(line, 0, line, 0) } : { name: functionName });
-    const results = findAllFunctionResults(sym, cached.functions, key, cached.rootPathKey);
+    const { analysis, results, inlined } = codeFor(document, sym, { template: Boolean(sym.range) && templateTargetsOf(document, [sym]).has(sym) });
     let result = results[0];
     if (results.length > 1) {
       const pick = await vscode.window.showQuickPick(
@@ -557,9 +570,9 @@ function activate(context) {
       if (!pick) return;
       result = pick.f;
     }
-    if (!result) result = inlinedResultFor(sym, cached, key);
+    if (!result) result = inlined;
     if (!result) return vscode.window.showInformationMessage(`No emitted code for ${functionName}. It may be unused, fully inlined, or a template that is never instantiated.`);
-    showAssembly(result, cached);
+    showAssembly(result, analysis);
   }));
 
   // Saving analyzes again the newest analysis that used the file: its own, or
@@ -657,7 +670,9 @@ function applyEdits(analysis, key, changes) {
       if (k.key === key) { k.startLine = moveLine(k.startLine); k.endLine = Math.max(k.startLine, moveLine(k.endLine)); }
     }
     // The lines that now hold edited text (none when whole lines were only deleted).
-    let span = { key, start: s, end: untouchedEnd ? s + added - 1 : s + added };
+    // Text inserted at the start of a line without a line break does change that line.
+    const lastLineEdited = !untouchedEnd || (change.text !== '' && !change.text.endsWith('\n'));
+    let span = { key, start: s, end: lastLineEdited ? s + added : s + added - 1 };
     const kept = [];
     for (const x of analysis.edits) {
       if (x.key !== key) { kept.push(x); continue; }
@@ -822,19 +837,53 @@ function inlinedResultFor(sym, analysis, key) {
   return { name: sym.name, sourceName: `${sym.name} (inlined)`, rows, instructionRows: rows, count: rows.length, users: [...users], fileKeys: new Set([key]) };
 }
 
-// The analysis that covers `document`: the newest of its own analysis (if it
-// found code) and the analyses of files that include it. A header analyzed on
-// its own and later used by an analyzed .cpp shows the .cpp's results, until
-// it is analyzed (or a template in it instantiated) again.
-function analysisFor(document) {
+// The analyses that cover `document`, newest first: its own analysis (if it
+// found code) and the analyses of files that include it.
+function analysesFor(document) {
   const own = lastAnalysis.get(fileKey(document));
-  if (document.uri.scheme !== 'file') return own;
+  if (document.uri.scheme !== 'file') return own ? [own] : [];
   const key = docPathKey(document);
-  let best = own && own.functions.length ? own : undefined;
-  for (const analysis of lastAnalysis.values()) {
-    if (analysis !== own && analysis.deps.has(key) && (!best || analysis.timestamp > best.timestamp)) best = analysis;
+  const list = [...lastAnalysis.values()]
+    .filter(a => (a === own ? a.functions.length > 0 : a.deps.has(key)))
+    .sort((a, b) => b.timestamp - a.timestamp);
+  return list.length || !own ? list : [own];
+}
+
+function analysisFor(document) {
+  return analysesFor(document)[0];
+}
+
+// What is known about the function `sym` of `document`. The newest analysis
+// decides, and older ones made with the same compiler fill its gaps: a header
+// analyzed on its own emits functions that a .cpp analyzed later does not use.
+// Requested template instantiations are compiled only in the file's own
+// analysis, so it comes first for a template that has them.
+function codeFor(document, sym, { template = false } = {}) {
+  const key = docPathKey(document);
+  const all = analysesFor(document);
+  const own = lastAnalysis.get(fileKey(document));
+  const same = all.filter(a => a.compilerId === all[0].compilerId);
+  const ordered = template && same.includes(own) && instantiationsFor(document).length ? [own, ...same.filter(a => a !== own)] : same;
+  // A function that does not compile now is not shown with the code it used to have.
+  const first = ordered[0];
+  const line = sym.range?.start.line;
+  const skipped = line !== undefined && (first.skipped || []).some(k => k.key === key && line >= k.startLine && line <= k.endLine);
+  for (const analysis of skipped ? [] : ordered) {
+    const results = findAllFunctionResults(sym, analysis.functions, key, analysis.rootPathKey);
+    const inlined = results.length ? undefined : inlinedResultFor(sym, analysis, key);
+    if (results.length || inlined) return { analysis, results, inlined, skipped: false };
   }
-  return best || own;
+  return { analysis: first, results: [], inlined: undefined, skipped };
+}
+
+// The analysis to use for line `line` of `document`: the first of them that has code for it.
+function analysisAt(document, line) {
+  const all = analysesFor(document);
+  if (!all.length) return undefined;
+  const key = docPathKey(document);
+  const hasLine = a => a.lineIndex.get(key)?.get(line)?.length > 0
+    || (key === a.rootPathKey && a.functions.some(f => f.sourceRange && f.sourceRange.start.line <= line && line <= f.sourceRange.end.line));
+  return all.filter(a => a.compilerId === all[0].compilerId).find(hasLine) || all[0];
 }
 
 function functionAtSignature(document, position, analysis, key) {
@@ -2392,6 +2441,6 @@ module.exports = {
   _internals: {
     resolveSettings, showAssembly, handleWebviewMessage, syncAsmHighlight, _state: () => ({ panelState, lastAnalysis }),
     compileWithRecovery, collectLocalIncludes, guessFunctionSymbols, sourceFunctionsOf, analysisFor, analyzeDocument,
-    instantiationsFor, prepareCSource, isSystemHeader, globToRegExp, splitArgs, functionForLine
+    instantiationsFor, prepareCSource, isSystemHeader, globToRegExp, splitArgs, functionForLine, analysesFor, analysisAt
   }
 };

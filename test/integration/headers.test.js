@@ -71,11 +71,18 @@ async function headerScenario(t, config) {
     const mapped = analysis.functions.some(f => f.instructionRows.some(r => r.ref && r.ref.key === headerKey && r.ref.line >= line - 1 && r.ref.line <= last - 1));
     const lens = await x.lensAt('mathx.hxx', line);
     if (mapped) withCode++;
+    // Instantiated in step 2: the header's own result stays.
+    if (line === L.square || line === L.twice) { assert.match(lens, COUNT, `line ${line}`); assert.ok(!lens.includes('via'), lens); continue; }
     // Inlined into the .cpp's functions (GCC, Clang), or kept as functions of their own too (MSVC: "2 instantiations").
     assert.match(lens, mapped ? /^\$\(symbol-numeric\) (?:\d+ instantiations · [\d /]+ |\d+ (?:inlined )?)instructions.* · via user\.cpp$/ : /No code emitted.* · via user\.cpp$/, `line ${line}\n${x.describe('mathx.hxx')}`);
   }
   assert.ok(withCode >= 2, `inlined template code should show in the header\n${x.describe('mathx.hxx')}`);
-  for (const line of [L.addInts, L.mulInts, L.push, L.get]) assert.match(await x.lensAt('mathx.hxx', line), /No code emitted/, `line ${line}`);
+  // Functions user.cpp does not use keep what step 1 found.
+  for (const line of [L.addInts, L.mulInts, L.push, L.get]) {
+    const own = await x.lensAt('mathx.hxx', line);
+    assert.match(own, COUNT, `line ${line}`);
+    assert.ok(!own.includes('via'), own);
+  }
   // The panel opens on a header template's code.
   const lens = (await x.lenses('mathx.hxx')).find(l => l.line === L.clamp && l.command === 'asmLens.showAssembly');
   await x.state.commands.get('asmLens.showAssembly')(...lens.args);

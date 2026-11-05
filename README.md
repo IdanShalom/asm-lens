@@ -10,6 +10,8 @@ the compiler installed on your machine (nothing leaves it). C and C++ get the
 full treatment, including local headers, header-only code and templates. Rust,
 Go, Python, Zig, Swift, D and Fortran are supported too.
 
+![Asm Lens: instruction counts above every function, and source lines linked to their assembly by color](https://raw.githubusercontent.com/IdanShalom/asm-lens/main/images/demo.gif)
+
 ## Features
 
 - **Instruction counts as CodeLens** above every function: `12 instructions · GCC 15.2 · -O2`.
@@ -45,7 +47,8 @@ Go, Python, Zig, Swift, D and Fortran are supported too.
 
 ## Quick start
 
-1. Install the extension and open a C, C++, Rust, Go, Python, … file.
+1. [Install the extension](https://marketplace.visualstudio.com/items?itemName=IdanShalom.asm-lens) (or search
+   for *Asm Lens* in the Extensions panel) and open a C, C++, Rust, Go, Python, … file.
 2. Click **Analyze with Asm Lens** above any function (or run **Asm Lens: Analyze Current File**,
    or right-click in the editor).
 3. Click a count to open the assembly view. Hover lines in either view.
@@ -185,8 +188,12 @@ Template constructors cannot be instantiated this way; use them from a `.cpp` fi
 **Analyzing a `.cpp` and then opening its headers.** Every header the `.cpp` includes shows
 the result of that analysis (`· via user.cpp`): functions that were emitted show their
 counts, and code that was inlined into the `.cpp`'s functions shows as
-`N inlined instructions · used in M function(s)`. A header shows the newest analysis that
-involved it: its own, or the last analyzed file that includes it.
+`N inlined instructions · used in M function(s)`. A function the `.cpp` does not use says
+*Not used by user.cpp*; click that to analyze the header itself.
+
+For each function, the newest analysis that has code for it decides. So analyzing a `.cpp` does
+not hide what the header's own analysis found, as long as both used the same compiler, and
+templates you instantiated keep showing the code you asked for.
 
 ## Languages
 
@@ -348,6 +355,8 @@ mode, where your own compiler and system headers are used.
 
 ## Troubleshooting
 
+- **"Instantiations not compiled yet"**: instantiations are saved per file but compiled only when that
+  file itself is analyzed. Click the CodeLens.
 - **"No code emitted"**: the function is a template that was never instantiated (click **Instantiate…**,
   or analyze a file that calls it), or `asmLens.emitUnusedFunctions` is off and nothing uses it.
 - **Local mode on macOS: errors in C++11 code** (`'auto' type specifier is a C++11 extension`): Apple
@@ -401,12 +410,13 @@ There are no runtime dependencies and no build step: the extension is plain Java
 | `src/projectConfig.js` | `.asm-lens.json` parsing and validation |
 
 Every push builds the `.vsix` on GitHub Actions (tests on Windows, Linux and macOS first); it is attached to
-the workflow run. Pushing a tag such as `v0.6.0` also creates a GitHub release with the `.vsix`.
+the workflow run.
 
-To publish on the Visual Studio Marketplace: create a publisher at
-<https://marketplace.visualstudio.com/manage>, set `"publisher"` in `package.json` to its id, then run
-`npx @vscode/vsce login <publisher>` and `npx @vscode/vsce publish`. (Changing the publisher changes the
-extension id, so VS Code treats it as a new extension next to the locally installed one.)
+To release, set the new version in `package.json` and push a matching tag such as `v0.8.3`. That creates a
+GitHub release with the `.vsix` and publishes it to the Visual Studio Marketplace with
+[Trusted Publishing](https://code.visualstudio.com/api/working-with-extensions/publishing-extension), so no
+token is stored. It needs a policy for this repository and `build-vsix.yml` on the publisher's Trusted
+Publishing page. Open VSX is published too when the `OVSX_PAT` secret is set.
 
 ## License
 

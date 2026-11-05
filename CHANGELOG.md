@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.8.2
+
+### Fixes
+- **Headers kept losing their results.** A header showed only the newest analysis, so analyzing a `.cpp` that
+  includes it turned everything the `.cpp` did not use into "No code emitted", including functions the header's
+  own analysis had found and templates you had instantiated. Now the newest analysis with code for a function
+  decides, older ones made with the same compiler fill the gaps, and requested instantiations always show the
+  code you asked for. The assembly view, hovers and the cursor follow the same rule.
+- A header seen only through a `.cpp` no longer says "template not instantiated" right under its saved
+  instantiations, or "No code emitted" for a function that `.cpp` simply does not use. The CodeLens says what
+  happened (*Instantiations not compiled yet*, *Not used by user.cpp*), and clicking it analyzes the header.
+- Typing at the very start of a line without a line break did not mark that function as changed, so it could
+  keep showing old numbers.
+
 ## 0.8.1
 
 ### Fixes

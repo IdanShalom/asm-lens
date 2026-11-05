@@ -162,7 +162,7 @@ test('remote: local headers are uploaded with their layout; analyzing a .cpp giv
     assert.deepEqual(body.files.map(f => f.filename).sort(), ['asm_lens/include/util.hpp', 'asm_lens/src/.asm_lens_keep']);
     assert.match(body.options.userArguments, /-Iasm_lens\/src/);
     assert.equal(await x.lensAt('include/util.hpp', 2), '$(symbol-numeric) 1 inlined instructions · used in 1 function(s) · via main.cpp');
-    assert.match(await x.lensAt('include/util.hpp', 3), /No code emitted/);
+    assert.equal(await x.lensAt('include/util.hpp', 3), '$(play) Not used by main.cpp · click to analyze this file');
     const hover = x.state.hoverProviders[0].provider.provideHover(x.open('include/util.hpp'), new x.vscode.Position(1, 30));
     assert.match(hover.contents.value, /Line 2.*1 instruction/s);
   } finally { ce.restore(); }
@@ -1037,5 +1037,81 @@ test('Python on Compiler Explorer: a request without an answer in time is sent o
     assert.deepEqual((await x.analyze('p.py')).error, []);
     assert.equal(ce.requests.length, 2);
     assert.match(await x.lensAt('p.py', 1), /^\$\(symbol-numeric\) 2 instructions · Python 3\.14/);
+  } finally { ce.restore(); }
+});
+
+// ---------------------------------------------------------------------------
+// 0.8.2: a header keeps what its own analysis found
+
+const HEADER = '#pragma once\ninline int used() { return 1; }\ninline int spare() { return 2; }\ntemplate <class T> T t(T v) { return v; }\n';
+const USER = '#include "m.hxx"\nint u() { return used(); }\n';
+const headerReply = body => (body.source.includes('int u()')
+  ? { code: 0, asm: [{ text: 'u():' }, { text: '        mov eax, 1', source: { file: 'asm_lens/m.hxx', line: 2 } }, { text: '        ret', source: { file: null, line: 2 } }] }
+  : { code: 0, asm: asmFor(['used()', 2], ['spare()', 3], ...(body.source.includes('&t<int>') ? [['int t<int>(int)', 4]] : [])) });
+const noWatch = { settings: { 'asmLens.reanalyzeOn': 'never' } };
+
+test('header: a .cpp analyzed later does not hide what the header\'s own analysis found', async () => {
+  const dir = makeProject({ 'm.hxx': HEADER, 'u.cpp': USER });
+  const ce = fakeCompilerExplorer(headerReply);
+  try {
+    const x = start(dir, noWatch);
+    await x.analyze('m.hxx');
+    await x.instantiate('m.hxx', 4, 'int');
+    await x.analyze('u.cpp');
+    assert.equal(x.analysis('m.hxx').rootPath, x.at('u.cpp'), 'the newest analysis still decides');
+    assert.equal(await x.lensAt('m.hxx', 2), '$(symbol-numeric) 1 inlined instructions · used in 1 function(s) · via u.cpp', 'what the .cpp used');
+    assert.equal(await x.lensAt('m.hxx', 3), '$(symbol-numeric) 2 instructions · g152 · -O2', 'not used by the .cpp: the header\'s own result');
+    assert.equal(await x.lensAt('m.hxx', 4), '$(symbol-numeric) 2 instructions · g152 · -O2', 'a requested instantiation stays');
+    // The assembly view, the hover and the cursor use the same result.
+    const lens = (await x.lenses('m.hxx')).find(l => l.line === 3 && l.command === 'asmLens.showAssembly');
+    await x.state.commands.get('asmLens.showAssembly')(...lens.args);
+    assert.match(x.state.lastRender().title, /^spare/);
+    const doc = x.open('m.hxx');
+    assert.match(x.state.hoverProviders[0].provider.provideHover(doc, new x.vscode.Position(2, 12)).contents.value, /spare/);
+    assert.equal(x.ext._internals.analysisAt(doc, 2).rootPath, x.at('m.hxx'));
+    assert.equal(x.ext._internals.analysisAt(doc, 1).rootPath, x.at('u.cpp'));
+    // Its numbers do not survive an edit of that function.
+    x.edit('m.hxx', 2, 0, 2, 0, ' ');
+    const stale = (await x.lenses('m.hxx')).find(l => l.line === 3 && l.command === 'asmLens.analyzeFile');
+    assert.match(stale.title, /Changed since the last analysis/);
+    assert.equal(stale.args[0].fsPath, x.at('m.hxx'));
+  } finally { ce.restore(); }
+});
+
+test('header seen only through a .cpp: lenses offer to analyze it, and saved instantiations are not called "not instantiated"', async () => {
+  const dir = makeProject({ 'm.hxx': HEADER, 'u.cpp': USER });
+  const ce = fakeCompilerExplorer(headerReply);
+  try {
+    const x = start(dir, noWatch);
+    await x.analyze('u.cpp');
+    assert.equal(await x.lensAt('m.hxx', 3), '$(play) Not used by u.cpp · click to analyze this file');
+    assert.equal(await x.lensAt('m.hxx', 4), '$(info) No code emitted: template not instantiated · g152 · via u.cpp', 'nothing requested: this is true');
+    // Instantiations saved in an earlier session: nothing has compiled them yet.
+    x.state.workspaceState.set('asmLens.instantiations', { [require('../../src/asm').normPath(x.at('m.hxx'))]: [{ kind: 'address', expr: 't<int>' }] });
+    assert.equal(await x.lensAt('m.hxx', 4), '$(play) Instantiations not compiled yet · click to analyze this file');
+    const click = (await x.lenses('m.hxx')).find(l => l.line === 4 && l.command === 'asmLens.analyzeFile');
+    assert.equal(click.args[0].fsPath, x.at('m.hxx'));
+    await x.state.commands.get('asmLens.analyzeFile')(...click.args);
+    assert.equal(await x.lensAt('m.hxx', 3), '$(symbol-numeric) 2 instructions · g152 · -O2');
+    assert.equal(await x.lensAt('m.hxx', 4), '$(symbol-numeric) 2 instructions · g152 · -O2');
+  } finally { ce.restore(); }
+});
+
+test('header: older results fill gaps only for the same compiler, and never for a function that no longer compiles', async () => {
+  const dir = makeProject({ 'm.hxx': HEADER, 'u.cpp': USER });
+  const ce = fakeCompilerExplorer(headerReply);
+  try {
+    const x = start(dir, noWatch);
+    await x.analyze('m.hxx');
+    await x.analyze('u.cpp');
+    const { lastAnalysis } = x.ext._internals._state();
+    const newest = x.analysis('m.hxx');
+    const own = [...lastAnalysis.values()].find(a => a.rootPath === x.at('m.hxx'));
+    newest.skipped = [{ key: require('../../src/asm').normPath(x.at('m.hxx')), startLine: 2, endLine: 2 }];
+    assert.match(await x.lensAt('m.hxx', 3), /^\$\(warning\) Not compiled/);
+    newest.skipped = [];
+    own.compilerId = 'another-compiler';
+    assert.equal(await x.lensAt('m.hxx', 3), '$(play) Not used by u.cpp · click to analyze this file');
+    assert.equal(x.ext._internals.analysisAt(x.open('m.hxx'), 2).rootPath, x.at('u.cpp'));
   } finally { ce.restore(); }
 });

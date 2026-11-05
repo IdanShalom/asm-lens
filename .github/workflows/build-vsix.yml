@@ -43,26 +43,33 @@ jobs:
     permissions:
       contents: write
     env:
-      # Repository secrets (Settings -> Secrets and variables -> Actions). Without them nothing is published.
-      VSCE_PAT: ${{ secrets.VSCE_PAT }}
+      # Optional repository secret (Settings -> Secrets and variables -> Actions): publishes to Open VSX too.
       OVSX_PAT: ${{ secrets.OVSX_PAT }}
     steps:
       - uses: actions/checkout@v4
 
       - uses: actions/setup-node@v4
         with:
-          node-version: '20'
+          node-version: '22'
 
       - name: Package VSIX
         run: |
           VERSION=$(node -p "require('./package.json').version")
-          npx --yes @vscode/vsce@3 package --out "asm-lens-$VERSION.vsix"
-          npx --yes @vscode/vsce@3 ls
+          npx --yes @vscode/vsce@4 package --out "asm-lens-$VERSION.vsix"
+          npx --yes @vscode/vsce@4 ls
 
       - uses: actions/upload-artifact@v4
         with:
           name: asm-lens-vsix
           path: asm-lens-*.vsix
+
+      - name: Check that the tag matches package.json (tags v*)
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          node -e "
+            const v = 'v' + require('./package.json').version;
+            if (v !== process.env.GITHUB_REF_NAME) { console.error('Tag ' + process.env.GITHUB_REF_NAME + ' does not match ' + v + ' in package.json'); process.exit(1); }
+          "
 
       - name: Release (tags v*)
         if: startsWith(github.ref, 'refs/tags/v')
@@ -70,19 +77,27 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: gh release create "$GITHUB_REF_NAME" asm-lens-*.vsix --title "Asm Lens $GITHUB_REF_NAME" --notes "See CHANGELOG.md."
 
-      - name: Check the tag and the publisher (tags v*)
-        if: startsWith(github.ref, 'refs/tags/v') && (env.VSCE_PAT != '' || env.OVSX_PAT != '')
-        run: |
-          node -e "
-            const p = require('./package.json');
-            if ('v' + p.version !== process.env.GITHUB_REF_NAME) { console.error('Tag ' + process.env.GITHUB_REF_NAME + ' does not match version ' + p.version + ' in package.json'); process.exit(1); }
-            if (p.publisher === 'local-dev') { console.error('Set \"publisher\" in package.json to your Marketplace publisher id'); process.exit(1); }
-          "
-
-      - name: Publish to the Visual Studio Marketplace (tags v*, with secret VSCE_PAT)
-        if: startsWith(github.ref, 'refs/tags/v') && env.VSCE_PAT != ''
-        run: npx --yes @vscode/vsce@3 publish --packagePath asm-lens-*.vsix
-
       - name: Publish to Open VSX (tags v*, with secret OVSX_PAT)
         if: startsWith(github.ref, 'refs/tags/v') && env.OVSX_PAT != ''
         run: npx --yes ovsx@0 publish asm-lens-*.vsix -p "$OVSX_PAT"
+
+  # Trusted Publishing: GitHub proves who is publishing, so no token is stored. Needs a policy for this
+  # repository and this workflow file on the publisher's Trusted Publishing page.
+  publish:
+    needs: package
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: asm-lens-vsix
+
+      - name: Publish to the Visual Studio Marketplace
+        run: npx --yes @vscode/vsce@4 publish --oidc --packagePath asm-lens-*.vsix
