@@ -91,11 +91,13 @@ async function brokenHeader(config) {
 async function classTemplates(config) {
   const files = { 'stack.h': fixture('classes', 'stack.h'), 'use_stack.cpp': fixture('classes', 'use_stack.cpp') };
   const x = start(makeProject(files, config), { settings: { 'asmLens.reanalyzeOn': 'never' } });
-  // Through a .cpp that uses it: real code or inlined code, or an honest "no separate code", never "not instantiated".
+  // Through a .cpp that uses it: real code, inlined code or an honest "no separate code", never "not instantiated".
+  // With GCC and Linux Clang everything can end up attributed to library headers: then no instruction
+  // maps to stack.h, so nothing ties the analysis to it and it simply offers to be analyzed.
   assert.deepEqual((await x.analyze('use_stack.cpp')).error, [], x.state.outputLines.join('\n'));
   for (const name of ['push', 'pop', 'empty', 'size']) {
     const lens = await x.lensAt('stack.h', STACK[name]) || '';
-    assert.match(lens, /^\$\(symbol-numeric\) |No separate code in use_stack\.cpp \(inlined or not used\)/, `${name}: ${lens}`);
+    assert.match(lens, /^\$\(symbol-numeric\) |No separate code in use_stack\.cpp \(inlined or not used\)|^\$\(play\) Analyze with Asm Lens$/, `${name}: ${lens}`);
     assert.ok(!/not instantiated/.test(lens), lens);
   }
   // Choosing the types gives every member its own code, however the .cpp compiled.
