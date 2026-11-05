@@ -41,7 +41,7 @@ async function headerScenario(t, config) {
   assert.match(alone.info[0], /found 4 emitted function bodies/);
   for (const line of [L.addInts, L.mulInts, L.push, L.get]) assert.match(await x.lensAt('mathx.hxx', line), COUNT, `line ${line}`);
   for (const line of [L.square, L.clamp, L.cube, L.twice]) assert.match(await x.lensAt('mathx.hxx', line), NOT_INSTANTIATED, `line ${line}`);
-  const instantiateLenses = (await x.lenses('mathx.hxx')).filter(l => l.command === 'asmLens.instantiateTemplate').map(l => l.line);
+  const instantiateLenses = (await x.lenses('mathx.hxx')).filter(l => l.title.endsWith('Instantiate…')).map(l => l.line);
   assert.deepEqual(instantiateLenses, [L.square, L.clamp, L.cube, L.twice]);
 
   // 2. Live instantiation with chosen types; a type that does not exist is dropped with the compiler's message.
