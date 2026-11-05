@@ -48,6 +48,8 @@ async function main() {
   fs.writeFileSync(path.join(builds, '.asm-lens.json'), JSON.stringify({ mode: 'local', compileCommands: 'compile_commands.json' }));
 
   fs.cpSync(path.join(__dirname, '..', 'fixtures', 'templates'), path.join(project, 'templates'), { recursive: true });
+  // C++17: from C++20 on, GCC accepts (S)42 for an aggregate, and the member meant to fail compiles.
+  fs.writeFileSync(path.join(project, 'templates', '.asm-lens.json'), JSON.stringify({ mode: 'local', compiler, flags: '-O2 -std=c++17' }));
 
   const result = path.join(tmp, 'result.json');
   const env = { ...process.env, ASM_LENS_E2E_RESULT: result };
