@@ -184,14 +184,16 @@ async function chosenTypes(config) {
   const lens = async l => main(await x.settled('tmpl.hxx')).find(k => k.line === l)?.title || '';
   assert.deepEqual((await x.analyze('u.cpp')).error, [], x.state.outputLines.join('\n'));
   await x.settled('tmpl.hxx');
-  assert.match(await lens(10), /^\$\(symbol-numeric\).*Box<Point>/, `the type the .cpp uses: ${await lens(10)}`);
+  // Clang for Windows writes MSVC names, readable only when llvm-undname is installed: code, but no name to show.
+  const readable = () => !x.ext._internals.analysesFor(x.open('tmpl.hxx')).some(a => a.functions.some(f => /^"?\?/.test(f.name)));
+  assert.match(await lens(10), readable() ? /^\$\(symbol-numeric\).*Box<Point>/ : CODE, `the type the .cpp uses: ${await lens(10)}`);
   assert.match(await lens(11), CODE, `a member template of it: ${await lens(11)}`);
   assert.match(await lens(14), /^\$\(warning\) NeedsType<int> does not compile: .* · click to choose types$/, await lens(14));
   // A lens sits on the first line of the definition: `template <...>` for these two.
   for (const [line, at, type, name] of [[6, 5, 'std::vector<int>', 'count'], [4, 3, 'Point', 'dot'], [14, 14, 'std::vector<int>', 'NeedsType']]) {
     assert.deepEqual((await x.instantiate('tmpl.hxx', line, type)).warning, [], `${name}<${type}>\n${x.state.outputLines.slice(-10).join('\n')}`);
     assert.match(await lens(at), CODE, `${name}<${type}>: ${await lens(at)}\n${x.state.outputLines.slice(-10).join('\n')}`);
-    assert.ok((await lens(at)).includes(name) || !x.ext._internals.analysesFor(x.open('tmpl.hxx')).every(a => a.functions.every(f => !/^"?\?/.test(f.name))), await lens(at));
+    assert.ok(!readable() || (await lens(at)).includes(name), await lens(at));
   }
   assert.deepEqual(x.ext._internals.instantiationsFor(x.open('tmpl.hxx')).map(i => i.expr).sort(), ['NeedsType<std::vector<int>>', 'count<std::vector<int>>', 'dot<Point>']);
 }
