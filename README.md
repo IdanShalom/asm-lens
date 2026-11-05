@@ -170,6 +170,8 @@ When you analyze a header (`.h`, `.hpp`, `.hxx`, `.hh`, `.inl`, `.ipp`, `.tpp`, 
 marks every non-template function in it `__attribute__((used))` (only in the copy that is
 compiled, keeping every line in place), so each one is emitted and gets a count:
 free functions, `static inline` functions, and member functions defined inside classes.
+If some functions cannot compile on their own (they need another header or a define), only
+those say *Not compiled*; the rest keep their counts.
 
 **Templates.** Above every template function, and every member function of a class template,
 there is an **Instantiate…** CodeLens. Click it and type the template arguments:
@@ -177,7 +179,11 @@ there is an **Instantiate…** CodeLens. Click it and type the template argument
 - `square<T>`: type `int` and Asm Lens compiles `square<int>`;
 - `mx::Box<T>::twice()`: type `double` and Asm Lens compiles `template struct mx::Box<double>;`,
   which gives the code of every member of `Box<double>`;
-- a member template of a class template asks for both argument lists.
+- a member template of a class template asks for both argument lists;
+- a partial specialization takes its own arguments: for `Stack<T*>`, type `int` to compile `Stack<int*>`.
+
+If a class does not compile as a whole for the types you chose (one member calls `v.size()` and you typed
+`int`), only the member you clicked is compiled, and Asm Lens tells you so.
 
 The requests are added after the file's last line, so line numbers do not change. They
 are remembered per file (shown in a CodeLens at the top of the file; click it to remove
@@ -188,8 +194,10 @@ Template constructors cannot be instantiated this way; use them from a `.cpp` fi
 **Analyzing a `.cpp` and then opening its headers.** Every header the `.cpp` includes shows
 the result of that analysis (`· via user.cpp`): functions that were emitted show their
 counts, and code that was inlined into the `.cpp`'s functions shows as
-`N inlined instructions · used in M function(s)`. A function the `.cpp` does not use says
-*Not used by user.cpp*; click that to analyze the header itself.
+`N inlined instructions · used in M function(s)`. A function with nothing to show says
+*No separate code in user.cpp (inlined or not used)*: click it to analyze the header itself or,
+for a template, to choose its types. At `-O2` small template members often end up here even when the
+`.cpp` calls them, because their code is merged into the caller.
 
 For each function, the newest analysis that has code for it decides. So analyzing a `.cpp` does
 not hide what the header's own analysis found, as long as both used the same compiler, and
@@ -318,6 +326,7 @@ Each object in `compilers` may have:
 | `asmLens.skipFailingFunctions` | `true` | Skip functions that do not compile instead of failing. |
 | `asmLens.maxRecoveryAttempts` | `12` | Most compiles per analysis while recovering. |
 | `asmLens.stubFailingHeaders` | `false` | Remote: replace an uploaded header that fails in the preprocessor (`#error`) by an empty file. |
+| `asmLens.confirmRemoteUpload` | `true` | Ask before sending code to a Compiler Explorer server for the first time (see [Privacy](#privacy)). Off: never ask, for any server. |
 | `asmLens.requestTimeoutMs` | `60000` | How long to wait for one compile, in ms. A Compiler Explorer server that does not answer in time is asked once more. |
 | `asmLens.showCounts` | `true` | Show the CodeLens. |
 | `asmLens.highlightOnHover` | `true` | Two-way highlighting. |
@@ -357,8 +366,10 @@ mode, where your own compiler and system headers are used.
 
 - **"Instantiations not compiled yet"**: instantiations are saved per file but compiled only when that
   file itself is analyzed. Click the CodeLens.
-- **"No code emitted"**: the function is a template that was never instantiated (click **Instantiate…**,
-  or analyze a file that calls it), or `asmLens.emitUnusedFunctions` is off and nothing uses it.
+- **"No separate code in user.cpp (inlined or not used)"**: that `.cpp` has no code to attribute to this
+  function. Click the CodeLens to compile the header itself, or to choose a template's types.
+- **"No code emitted"**: the function is a template that was never instantiated (click the CodeLens or
+  **Instantiate…**, or analyze a file that calls it), or `asmLens.emitUnusedFunctions` is off and nothing uses it.
 - **Local mode on macOS: errors in C++11 code** (`'auto' type specifier is a C++11 extension`): Apple
   clang 14 and older compile C++98 by default. Asm Lens then adds `-std=gnu++17` (the default of current
   compilers and of Compiler Explorer) and says so in the output; put a `-std=...` in your flags to choose.
@@ -385,6 +396,9 @@ mode, where your own compiler and system headers are used.
 
 In **remote** mode the analyzed file and the local headers it includes are sent to the Compiler Explorer
 server in `baseUrl` (godbolt.org by default; see its [privacy policy](https://godbolt.org/#privacy)).
+Asm Lens asks before sending anything to a server for the first time, and analyses that start by themselves
+never send before you agree. **Send** holds until VS Code restarts. **Send, Don't Show Again** holds for that
+server only, so a project whose `.asm-lens.json` names another server asks again.
 Requests name the extension and its version in their `User-Agent`, and nothing about you or your machine.
 Use **local** mode, or a self-hosted Compiler Explorer, for code that must stay private. In local mode
 nothing is sent anywhere.

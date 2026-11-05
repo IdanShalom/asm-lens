@@ -465,3 +465,27 @@ test('findAllFunctionResults: copies with the same name and code are shown once;
   const differs = [f('P::P()', 1, ['mov eax, 1', 'ret']), f('P::P()', 1, ['jmp P::P()'])];
   assert.equal(asm.findAllFunctionResults(sym('P', 1, 1), differs, 'R', 'R').length, 2, 'different code: both shown');
 });
+
+test('partOf: cold and split pieces in every demangler form; other clones are functions of their own', () => {
+  for (const [piece, parent] of [['run(int) (.cold)', 'run(int)'], ['run(int) [clone .cold]', 'run(int)'], ['run(int) [clone .cold.12]', 'run(int)'], ['run(int) (.cold.3)', 'run(int)'], ['run(int) (.part.0)', 'run(int)'], ['run(int) [clone .part.1]', 'run(int)'], ['main.cold', 'main'], ['foo.part.2', 'foo']]) {
+    assert.equal(asm.partOf(piece), parent, piece);
+  }
+  for (const other of ['run(int) (.isra.0)', 'run(int) [clone .constprop.0]', 'run(int)', 'participant.part', 'cold']) assert.equal(asm.partOf(other), undefined, other);
+  const rows = ['run(int):', '        mov eax, 1', '        ret', 'run(int) (.cold):', '        ud2'].map(text => ({ text }));
+  assert.deepEqual(asm.mergeFunctionParts(asm.parseFunctions(rows, () => undefined)).map(f => [f.name, f.count]), [['run(int)', 3]]);
+});
+
+test('isLibrarySymbol: looks at the function\'s own name, not its return type or parameters', () => {
+  for (const n of ['bool std::vector<int,std::allocator<int> >::empty(void)const', 'std::vector<int, std::allocator<int>>::size() const', 'unsigned __int64 std::vector<int,std::allocator<int> >::size(void)const', '__gnu_cxx::__normal_iterator<int*>::base() const', 'std::__1::vector<int>::empty() const']) assert.equal(asm.isLibrarySymbol(n), true, n);
+  for (const n of ['int size(std::vector<int> const &)', 'std::string greet(std::string const&)', 'std::vector<int> make_vec(int)', 'Stack<int>::size() const', 'unsigned __int64 Stack<int>::size(void)const', 'main']) assert.equal(asm.isLibrarySymbol(n), false, n);
+});
+
+test('library code with no lines in this file is not this file\'s function of the same name', () => {
+  const sym = { name: 'empty', range: range(9, 9) };
+  const lib = { name: 'bool std::vector<int,std::allocator<int> >::empty(void)const', fileKeys: new Set(), instructionRows: [{ text: 'ret' }], count: 1 };
+  const mine = { name: 'bool Stack<int>::empty(void)const', fileKeys: new Set(), instructionRows: [{ text: 'ret' }], count: 1 };
+  assert.equal(asm.matchSourceSymbol(lib.name, [sym], lib, 'R'), undefined);
+  assert.equal(asm.matchSourceSymbol(mine.name, [sym], mine, 'R'), sym, 'without line info the name still decides');
+  assert.equal(asm.findFunctionResult({ name: 'empty' }, [lib]), undefined);
+  assert.equal(asm.findFunctionResult({ name: 'empty' }, [lib, mine]), mine);
+});

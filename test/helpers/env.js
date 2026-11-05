@@ -45,7 +45,7 @@ function fixture(...parts) { return fs.readFileSync(path.join(FIXTURES, ...parts
 // The extension activated in a mock VS Code whose workspace is `dir`.
 function start(dir, options = {}) {
   // A generous timeout: the first run of a compiler on a fresh CI machine can be slow.
-  const ctx = loadExtension({ workspaceFolders: [dir], ...options, settings: { 'asmLens.requestTimeoutMs': 120000, ...(options.settings || {}) } });
+  const ctx = loadExtension({ workspaceFolders: [dir], ...options, settings: { 'asmLens.requestTimeoutMs': 120000, 'asmLens.confirmRemoteUpload': false, ...(options.settings || {}) } });
   const at = rel => path.join(dir, rel);
   return {
     ...ctx,
@@ -73,7 +73,7 @@ function start(dir, options = {}) {
     // Title of the main (count) lens on 1-based `line`.
     async lensAt(rel, line) {
       const all = await this.lenses(rel);
-      return all.find(l => l.line === line && l.command !== 'asmLens.instantiateTemplate')?.title;
+      return all.find(l => l.line === line && !l.title.endsWith('Instantiate…'))?.title;
     },
     analysis(rel) { return ctx.ext._internals.analysisFor(ctx.vscode._openDocument(at(rel))); },
     // Edits like the editor does: replaces text from (line, char) to (endLine, endChar), 0-based, and fires the change event.

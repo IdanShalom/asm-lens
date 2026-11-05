@@ -105,6 +105,9 @@ function createVscode(options = {}) {
     selectionListeners: [],
     workspaceState: new Map(),
     globalState: new Map(),
+    dialogs: [],
+    dialogAnswers: [],
+    globalState: new Map(),
     shownDocuments: [],
     progress: [],
     activeEditorListeners: [],
@@ -203,7 +206,12 @@ function createVscode(options = {}) {
         return panel;
       },
       showInformationMessage(m) { state.messages.info.push(m); return Promise.resolve(undefined); },
-      showWarningMessage(m) { state.messages.warning.push(m); return Promise.resolve(undefined); },
+      // A modal dialog is recorded in state.dialogs and answered from state.dialogAnswers (none: Cancel).
+      showWarningMessage(m, ...rest) {
+        if (rest[0] && rest[0].modal) { state.dialogs.push({ message: m, detail: rest[0].detail, items: rest.slice(1) }); return Promise.resolve(state.dialogAnswers.shift()); }
+        state.messages.warning.push(m);
+        return Promise.resolve(undefined);
+      },
       showErrorMessage(m) { state.messages.error.push(m); return Promise.resolve(undefined); },
       async showQuickPick(items, opts) {
         const list = await items;
@@ -268,6 +276,7 @@ function createVscode(options = {}) {
     extensionPath: path.resolve(__dirname, '..', '..'),
     extensionUri: Uri.file(path.resolve(__dirname, '..', '..')),
     workspaceState: { get: (k, d) => state.workspaceState.has(k) ? state.workspaceState.get(k) : d, update: async (k, v) => { state.workspaceState.set(k, v); }, keys: () => [...state.workspaceState.keys()] },
+    globalState: { get: (k, d) => state.globalState.has(k) ? state.globalState.get(k) : d, update: async (k, v) => { state.globalState.set(k, v); }, keys: () => [...state.globalState.keys()] },
     globalState: { get: (k, d) => state.globalState.has(k) ? state.globalState.get(k) : d, update: async (k, v) => { state.globalState.set(k, v); }, keys: () => [...state.globalState.keys()], setKeysForSync() {} }
   });
   return vscode;

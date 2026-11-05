@@ -74,7 +74,7 @@ async function headerScenario(t, config) {
     // Instantiated in step 2: the header's own result stays.
     if (line === L.square || line === L.twice) { assert.match(lens, COUNT, `line ${line}`); assert.ok(!lens.includes('via'), lens); continue; }
     // Inlined into the .cpp's functions (GCC, Clang), or kept as functions of their own too (MSVC: "2 instantiations").
-    assert.match(lens, mapped ? /^\$\(symbol-numeric\) (?:\d+ instantiations · [\d /]+ |\d+ (?:inlined )?)instructions.* · via user\.cpp$/ : /No code emitted.* · via user\.cpp$/, `line ${line}\n${x.describe('mathx.hxx')}`);
+    assert.match(lens, mapped ? /^\$\(symbol-numeric\) (?:\d+ instantiations · [\d /]+ |\d+ (?:inlined )?)instructions.* · via user\.cpp$/ : /No separate code in user\.cpp \(inlined or not used\)/, `line ${line}\n${x.describe('mathx.hxx')}`);
   }
   assert.ok(withCode >= 2, `inlined template code should show in the header\n${x.describe('mathx.hxx')}`);
   // Functions user.cpp does not use keep what step 1 found.

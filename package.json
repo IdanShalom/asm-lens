@@ -218,6 +218,11 @@
           "default": "c++",
           "description": "Language sent to Compiler Explorer for C-family files when there is no .asm-lens.json."
         },
+        "asmLens.confirmRemoteUpload": {
+          "type": "boolean",
+          "default": true,
+          "description": "Ask before sending your code to a Compiler Explorer server for the first time. Choosing \"Don't Show Again\" in that dialog applies to that server only; turning this setting off stops asking for every server."
+        },
         "asmLens.requestTimeoutMs": {
           "type": "number",
           "default": 60000,

@@ -196,7 +196,7 @@ test('templateTargetAt: free function templates take the address of a specializa
 test('templateTargetAt: members of class templates instantiate the class', () => {
   const t = scan.templateTargetAt(fixture('headers', 'mathx.hxx'), 31);
   assert.equal(t.label, 'mx::Box<T>');
-  assert.deepEqual(t.make(['std::pair<int, int>']), { kind: 'class', expr: 'mx::Box<std::pair<int, int>>', keyword: 'struct' });
+  assert.deepEqual(t.make(['std::pair<int, int>']), { kind: 'class', expr: 'mx::Box<std::pair<int, int>>', keyword: 'struct', member: 'mx::Box<std::pair<int, int>>::twice' });
 });
 
 test('templateTargetAt: member templates, nested classes, out-of-line definitions, anonymous namespaces', () => {
@@ -217,8 +217,8 @@ test('templateTargetAt: member templates, nested classes, out-of-line definition
   const mix = scan.templateTargetAt(src, 4);
   assert.deepEqual(mix.prompts.map(p => p.name), ['Box', 'mix']);
   assert.deepEqual(mix.make(['int', 'double']), { kind: 'address', expr: 'ns::Box<int>::mix<double>' });
-  assert.deepEqual(scan.templateTargetAt(src, 6).make(['int']), { kind: 'class', expr: 'ns::Box<int>::Inner', keyword: 'struct' });
-  assert.deepEqual(scan.templateTargetAt(src, 8).make(['char']), { kind: 'class', expr: 'ns::Box<char>', keyword: 'class' });
+  assert.deepEqual(scan.templateTargetAt(src, 6).make(['int']), { kind: 'class', expr: 'ns::Box<int>::Inner', keyword: 'struct', member: 'ns::Box<int>::Inner::f' });
+  assert.deepEqual(scan.templateTargetAt(src, 8).make(['char']), { kind: 'class', expr: 'ns::Box<char>', keyword: 'class', member: 'ns::Box<char>::get' });
   assert.deepEqual(scan.templateTargetAt(src, 9).make(['int']), { kind: 'address', expr: 'ns::hidden<int>' });
 });
 
@@ -386,4 +386,29 @@ test('keepByAddress / { all: false }: qualified names for members; constructors,
   ]);
   assert.ok(scan.keepByAddress('int main() { return 0; }\nint wmain() { return 0; }\n').length === 0);
   assert.ok(scan.keepByAddress(CLASSES).some(l => /&outOfLine|&Counter::outOfLine/.test(l)), 'a header keeps out-of-line members too');
+});
+
+test('templateTargetAt: a partial specialization is instantiated in its own form; constructors have no member to fall back to', () => {
+  const src = [
+    'template <class T, int N> struct Buf<T*, N> {',  // 1
+    '  T at(T* p) const { return p[N]; }',            // 2
+    '};',                                             // 3
+    'template <class T> struct Plain {',              // 4
+    '  Plain() { }',                                  // 5
+    '  ~Plain() { }',                                 // 6
+    '  T get() const { return T(); }',                // 7
+    '};'
+  ].join('\n');
+  const buf = scan.templateTargetAt(src, 1);
+  assert.equal(buf.label, 'Buf<T*, N>');
+  assert.deepEqual(buf.make(['int, 4']), { kind: 'class', expr: 'Buf<int*, 4>', keyword: 'struct', member: 'Buf<int*, 4>::at' });
+  assert.equal(scan.templateTargetAt(src, 4).make(['int']).member, undefined);
+  assert.equal(scan.templateTargetAt(src, 5).make(['int']).member, undefined);
+  assert.equal(scan.templateTargetAt(src, 6).make(['int']).member, 'Plain<int>::get');
+});
+
+test('blankEnclosingDeclaration: attributes are not taken for the function name', () => {
+  for (const text of ['__attribute__((used)) static inline int f(int a) { return a; }\n', 'static inline __attribute__((always_inline)) int f(int a) { return a; }\n', '[[nodiscard]] inline int f(int a) { return a; }\n']) {
+    assert.equal(scan.blankEnclosingDeclaration(text, 0).name, 'f', text);
+  }
 });

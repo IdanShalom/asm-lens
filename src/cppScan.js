@@ -44,7 +44,7 @@ function maskCode(text) {
 // Looks at the text between the previous boundary and a `{` and decides whether
 // it opens a function body (as opposed to a class, namespace, enum, control block...).
 function classifyFunctionSegment(seg) {
-  const s = seg.replace(/\btemplate\s*<[^;{}]*?>\s*/g, '').trim();
+  const s = blankAttributes(seg).replace(/\btemplate\s*<[^;{}]*?>\s*/g, '').trim();
   if (!s || !s.includes('(')) return undefined;
   if (/^(?:if|for|while|switch|catch|else|do|try)\b/.test(s)) return undefined;
   if (/^(?:namespace|class|struct|union|enum|extern)\b/.test(s) && !/\)\s*(?:const|noexcept|override|final|\s)*$/.test(s)) return undefined;
@@ -272,7 +272,7 @@ function classifyHead(m, segStart, segEnd, scopes) {
   if (/^(?:typedef )?enum\b/.test(clean)) return { ...base, kind: 'other' };
   if ((x = /^(?:typedef |export )?(class|struct|union) (?:[A-Z_][A-Z0-9_]* )?([A-Za-z_]\w*) ?(<.*>)? ?(?:final ?)?(?:(?<!:):(?!:).*)?$/.exec(clean))) {
     // A macro in front ("NLOHMANN_BASIC_JSON_TPL_DECLARATION class basic_json") may be template<...>.
-    return { ...base, kind: 'class', keyword: x[1], name: x[2], maybeTemplate: unknownMacro };
+    return { ...base, kind: 'class', keyword: x[1], name: x[2], specialization: x[3], maybeTemplate: unknownMacro };
   }
   if (hasTopLevelAssignment(clean) || !classifyFunctionSegment(rest)) return { ...base, kind: 'other' };
   const params = parameterListOf(blankAttributes(rest));
@@ -333,7 +333,7 @@ function scanDefinitions(text) {
     const end = close < 0 ? m.length - 1 : close;
     if (head.kind === 'namespace' || head.kind === 'linkage' || head.kind === 'class') {
       const own = (head.templateParams || []).filter(p => p !== '');
-      const scope = { kind: head.kind, name: head.name || '', keyword: head.keyword, templated: own.length > 0, maybeTemplate: Boolean(head.maybeTemplate), templateParams: own[own.length - 1] };
+      const scope = { kind: head.kind, name: head.name || '', keyword: head.keyword, specialization: own.length > 0 ? head.specialization : undefined, templated: own.length > 0, maybeTemplate: Boolean(head.maybeTemplate), templateParams: own[own.length - 1] };
       if (head.kind === 'class') {
         defs.push({ ...head, ...scope, scopes: scopes.slice(), startLine: lineOf(head.declStart), endLine: lineOf(end), bodyOpen: i, bodyClose: end });
       }
@@ -487,7 +487,7 @@ function templateTargetAt(text, line, defs = scanDefinitions(text)) {
   const parts = [];
   for (const s of def.scopes) {
     if (s.kind === 'namespace') { for (const n of s.name.split('::').filter(Boolean)) parts.push({ name: n }); continue; }
-    if (s.kind === 'class') parts.push({ name: s.name, params: s.templated ? s.templateParams : undefined, keyword: s.keyword, isClass: true });
+    if (s.kind === 'class') parts.push({ name: s.name, params: s.templated ? s.templateParams : undefined, spec: s.specialization, keyword: s.keyword, isClass: true });
   }
   const comps = splitQualified(def.name);
   const own = def.templateParams.filter(p => p !== '');
@@ -501,8 +501,15 @@ function templateTargetAt(text, line, defs = scanDefinitions(text)) {
   const fnName = /^operator\b/.test(last) ? last : last.replace(/<[\s\S]*$/, '').trim();
   const fnParams = own.length ? own.join(', ') : (def.abbreviated && !parts.some(p => p.params !== undefined) ? 'auto' : undefined);
   const holder = p => ({ name: p.name, params: p.params, suggestion: defaultTemplateArgs(p.params) });
-  const build = (list, args) => list.map(p => p.params !== undefined ? `${p.name}<${args.shift() ?? ''}>` : p.name).join('::');
-  const display = list => list.map(p => p.params !== undefined ? `${p.name}<${p.params.replace(/\s*=[^,]*/g, '').replace(/\b(?:typename|class)\s+/g, '')}>` : p.name).join('::');
+  // A partial specialization takes its arguments in its own form: Derived<T*> with T = int is Derived<int*>.
+  const filled = (p, given) => {
+    if (!p.spec) return `${p.name}<${given}>`;
+    const values = splitTopLevel(given).map(v => v.trim());
+    const names = splitTopLevel(p.params).map(q => /([A-Za-z_]\w*)\s*(?:\.\.\.)?\s*$/.exec(q.replace(/=[\s\S]*$/, ''))?.[1]);
+    return p.name + p.spec.replace(/\b[A-Za-z_]\w*\b/g, w => (names.includes(w) && values[names.indexOf(w)] !== undefined ? values[names.indexOf(w)] : w));
+  };
+  const build = (list, args) => list.map(p => p.params !== undefined ? filled(p, args.shift() ?? '') : p.name).join('::');
+  const display = list => list.map(p => p.spec ? `${p.name}${p.spec}` : p.params !== undefined ? `${p.name}<${p.params.replace(/\s*=[^,]*/g, '').replace(/\b(?:typename|class)\s+/g, '')}>` : p.name).join('::');
 
   if (fnParams !== undefined) {
     const lastClass = [...parts].reverse().find(p => p.isClass);
@@ -524,7 +531,12 @@ function templateTargetAt(text, line, defs = scanDefinitions(text)) {
   return {
     label: display(scope),
     prompts: scope.filter(p => p.params !== undefined).map(holder),
-    make: args => ({ kind: 'class', expr: build(scope, [...args]), keyword: scope[idx].keyword === 'union' ? 'union' : scope[idx].keyword || 'class' })
+    make: args => {
+      const expr = build(scope, [...args]);
+      // Not for constructors and destructors, whose address cannot be taken.
+      const memberOfScope = idx === parts.length - 1 && fnName !== parts[idx].name && !fnName.startsWith('~');
+      return { kind: 'class', expr, keyword: scope[idx].keyword === 'union' ? 'union' : scope[idx].keyword || 'class', ...(memberOfScope ? { member: `${expr}::${fnName}` } : {}) };
+    }
   };
 }
 

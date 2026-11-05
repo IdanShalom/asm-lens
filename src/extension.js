@@ -334,18 +334,21 @@ function activate(context) {
             ? { title: '$(sync~spin) Updating…', command: 'asmLens.showOutput' }
             : { title: '$(edit) Changed since the last analysis · click to update', command: 'asmLens.analyzeFile', arguments: [vscode.Uri.file(analysis.rootPath)] });
         }
-        // No code, and known only through a file that includes this one: that file not using a
-        // function says nothing about the function. Compiling this file itself will show it.
+        const line = (sym.selectionRange || sym.range).start.line;
+        const chooseTypes = title => new vscode.CodeLens(sym.range, { title, command: 'asmLens.instantiateTemplate', arguments: [document.uri, line] });
+        const analyzeThis = title => new vscode.CodeLens(sym.range, { title, command: 'asmLens.analyzeFile', arguments: [document.uri] });
+        // No code, and known only through a file that includes this one. That says little about the
+        // function: it may be unused there, or inlined with its code attributed elsewhere (library
+        // calls inside it, say). Compiling this file itself, or choosing template types, will show it.
         if (!result && !inlined && !wasSkipped && viaRoot) {
           if (analysisBusy.has(fileKey(document))) return new vscode.CodeLens(sym.range, { title: '$(sync~spin) Analyzing…', command: 'asmLens.showOutput' });
-          if ((!own || own.compilerId !== analysis.compilerId) && (!template || requested)) {
-            return new vscode.CodeLens(sym.range, {
-              title: template ? '$(play) Instantiations not compiled yet · click to analyze this file' : `$(play) Not used by ${path.basename(analysis.rootPath)} · click to analyze this file`,
-              command: 'asmLens.analyzeFile',
-              arguments: [document.uri]
-            });
-          }
+          const noOwnResult = !own || own.compilerId !== analysis.compilerId;
+          const noCode = `No separate code in ${path.basename(analysis.rootPath)} (inlined or not used)`;
+          if (template && requested && noOwnResult) return analyzeThis('$(play) Instantiations not compiled yet · click to analyze this file');
+          if (template) return chooseTypes(`$(info) ${noCode} · click to choose types`);
+          if (noOwnResult) return analyzeThis(`$(play) ${noCode} · click to analyze this file`);
         }
+        if (!result && !inlined && !wasSkipped && template) return chooseTypes('$(info) No code emitted: template not instantiated · click to choose types');
         const title = results.length > 1
           ? `$(symbol-numeric) ${results.length} ${template || /</.test(results[0].name) ? 'instantiations' : 'versions'} · ${results.map(r => r.count).join(' / ')} instructions · ${analysis.compilerLabel}${viaRoot}`
           : result
@@ -1026,10 +1029,19 @@ async function dropFailedInstantiations(document, failed) {
   if (!failed.length) return;
   const list = instantiationsFor(document);
   const bad = new Set(failed.map(f => f.index));
-  await setInstantiations(document, list.filter((_, i) => !bad.has(i)));
+  // A class as a whole may not compile for these types while the member that was asked for does.
+  const narrow = it => it.kind === 'class' && it.member && !list.some(x => x.expr === it.member);
+  const next = list.flatMap((it, i) => (!bad.has(i) ? [it] : narrow(it) ? [{ kind: 'address', expr: it.member }] : []));
+  await setInstantiations(document, next);
   for (const f of failed) {
     const it = list[f.index];
     if (!it) continue;
+    if (narrow(it)) {
+      outputChannel.appendLine(`  ${describeInstantiation(it)} does not compile as a whole (${f.message || 'compile error'}); compiling only ${it.member}.`);
+      vscode.window.showInformationMessage(`Asm Lens: ${it.expr} does not compile as a whole for these types, so only ${it.member} is compiled. See the Asm Lens output.`);
+      rerunAfter.add(fileKey(document));
+      continue;
+    }
     outputChannel.appendLine(`  instantiation failed and was removed: ${describeInstantiation(it)}: ${f.message || 'compile error'}`);
     vscode.window.showWarningMessage(`Asm Lens: could not instantiate ${describeInstantiation(it)}${f.message ? `: ${f.message}` : ''}. It was removed; see the Asm Lens output for details.`);
   }
@@ -1120,6 +1132,53 @@ function setBusyStatus(message) {
 }
 
 // ---------------------------------------------------------------------------
+// Consent before code leaves the machine
+//
+// Nothing is sent to a server before the user agrees, and automatic analyses
+// never ask: they just don't run. "Don't show again" holds per server, so a
+// project file that names another server (its "baseUrl") asks again.
+
+const TRUSTED_HOSTS_KEY = 'asmLens.trustedUploadHosts';
+const sessionHosts = new Set();
+const openDialogs = new Map();
+
+async function mayUpload(document, { auto = false } = {}) {
+  let resolved;
+  try { resolved = await resolveSettings(document); }
+  catch (e) { vscode.window.showErrorMessage(`Asm Lens: ${e.message}`); return false; }
+  if (resolved.mode === 'local' || !config().get('confirmRemoteUpload', true)) return true;
+  const host = hostOf(resolved.baseUrl);
+  if (sessionHosts.has(host) || (extContext.globalState.get(TRUSTED_HOSTS_KEY, []) || []).includes(host)) return true;
+  if (auto) return false;
+  if (!openDialogs.has(host)) openDialogs.set(host, askToUpload(document, resolved, host).finally(() => openDialogs.delete(host)));
+  return openDialogs.get(host);
+}
+
+async function askToUpload(document, resolved, host) {
+  const SEND = 'Send', ALWAYS = "Send, Don't Show Again", LOCAL = 'Use Local Compiler';
+  const choice = await vscode.window.showWarningMessage(`Send your code to ${host}?`, {
+    modal: true,
+    detail: `To show the assembly, Asm Lens uploads the file you analyze and the local headers it includes to the Compiler Explorer server at ${host}. For code that must stay private, use a local compiler.\n\n"Send" asks again the next time VS Code starts.`
+  }, SEND, ALWAYS, LOCAL);
+  if (choice === SEND) { sessionHosts.add(host); return true; }
+  if (choice === ALWAYS) {
+    const hosts = extContext.globalState.get(TRUSTED_HOSTS_KEY, []) || [];
+    await extContext.globalState.update(TRUSTED_HOSTS_KEY, [...hosts, host]);
+    return true;
+  }
+  if (choice !== LOCAL) return false;
+  // A project file decides the mode itself, so a setting would not change anything.
+  if (resolved.configFile) {
+    const config = await vscode.workspace.openTextDocument(resolved.configFile);
+    await vscode.window.showTextDocument(config);
+    vscode.window.showInformationMessage(`Asm Lens: set "mode": "local" in ${path.basename(resolved.configFile)} to compile on this machine.`);
+    return false;
+  }
+  await updateSetting('mode', 'local', document);
+  return true;
+}
+
+// ---------------------------------------------------------------------------
 // Analysis
 
 async function analyzeDocument(document, { auto = false } = {}) {
@@ -1132,6 +1191,7 @@ async function analyzeDocument(document, { auto = false } = {}) {
   if (!LANGS.includes(document.languageId)) {
     return vscode.window.showWarningMessage(`Asm Lens supports C, C++, Objective-C, Rust, Go, Python, Zig, Swift, D and Fortran files (this file is "${document.languageId}").`);
   }
+  if (!(await mayUpload(document, { auto }))) return;
   analysisBusy.add(key);
   if (!analyzedFiles.has(key)) analyzedFiles.set(key, { uri: document.uri, deps: new Set([docPathKey(document)]), stamp: 0 });
   codeLensEmitter?.fire();
@@ -1246,7 +1306,7 @@ async function runAnalysis(document) {
     for (const u of includeBundle.unresolved) outputChannel.appendLine(`  not found: #include "${u.name}" (from ${u.from})`);
     if (includeBundle.truncated) outputChannel.appendLine('  include discovery stopped at the asmLens.maxIncludeFiles limit.');
     await dropFailedInstantiations(document, compiled.failedInstantiations);
-    if (!functions.length && prepared.isHeader) return reportHeaderWithoutCode(document);
+    if (!functions.length && prepared.isHeader) return reportHeaderWithoutCode(document, compiled.skipped.length);
     vscode.window.showInformationMessage(`Asm Lens: found ${functions.length} emitted function bodies${includeBundle.pathMap.length ? `; uploaded ${includeBundle.pathMap.length} local header(s)` : ''}${notes.length ? ` (${notes.join('; ')}; see the Asm Lens output)` : ''}.`);
   } catch (e) {
     if (e.name === 'Cancelled' || jobContext.getStore()?.cancelled) {
@@ -1260,7 +1320,10 @@ async function runAnalysis(document) {
   }
 }
 
-function reportHeaderWithoutCode(document) {
+function reportHeaderWithoutCode(document, skipped = 0) {
+  if (skipped) {
+    return vscode.window.showInformationMessage(`Asm Lens: this header emitted no code: ${skipped} function(s) do not compile on their own (see the Asm Lens output). Add the includes or defines they need, or analyze a .cpp file that uses the header.`);
+  }
   const templates = /cpp/.test(document.languageId) && scan.scanDefinitions(document.getText()).some(d => d.kind === 'function' && d.templated);
   vscode.window.showInformationMessage(templates
     ? 'Asm Lens: this header emitted no code: its functions are templates. Click "Instantiate…" above a template to choose its types, or analyze a .cpp file that uses the header.'
@@ -1297,6 +1360,13 @@ function prepareCSource(document, { marks = 'attribute' } = {}) {
 
 // "file \n compiler \n flags" for which the kept text failed and the plain text compiled.
 const marksRejected = new Set();
+
+// Blanks the lines that take the address of a function that was just blanked: they would only fail.
+function dropKeepLines(text, name) {
+  const last = String(name || '').split('::').pop();
+  if (!last) return text;
+  return text.split('\n').map(l => (l.includes('__asm_lens_keep_') && (l.endsWith(`&${last};`) || l.endsWith(`::${last};`)) ? l.replace(/[^\r]/g, ' ') : l)).join('\n');
+}
 
 // Undoes __attribute__((used)) on the main-file lines the compiler complains about.
 function revertKeptLines(source, original, lines) {
@@ -1551,6 +1621,7 @@ async function analyzeLocal(document, resolved, settings) {
   let keptHeader = prepared.kept !== undefined;
   const failedInstantiations = [];
   const failedLines = new Set();
+  let asWrittenFails = false;
   const isMain = f => /(?:^|[\\/])<stdin>$/.test(f);
   let asm;
   const started = Date.now();
@@ -1610,14 +1681,19 @@ async function analyzeLocal(document, resolved, settings) {
       const reverted = revertKeptLines(source, prepared.plain, errorLocationsFrom(err).filter(loc => isMain(loc.file)).map(loc => loc.line));
       if (reverted !== undefined) { source = reverted; progressed = true; }
     }
-    // Other errors while the header's functions are kept: compile the text as written first,
-    // so that what Asm Lens added never makes a function count as "Not compiled".
-    if (!progressed && keptHeader) {
-      keptHeader = false;
-      source = prepared.plain;
-      for (const l of failedLines) source = blankLine(source, l);
-      outputChannel.appendLine('  compiling it as written (without the added marks)');
-      continue;
+    // Other errors while functions are kept. If the text as written compiles, what Asm Lens added
+    // is to blame: compile it as written, which never makes a function count as "Not compiled".
+    // If it fails too, the errors are the file's own: those functions are skipped below, and the others stay kept.
+    if (!progressed && keptHeader && !asWrittenFails) {
+      const asWritten = [...failedLines].reduce((text, l) => blankLine(text, l), prepared.plain);
+      const check = await runProcess(compiler, args, { cwd, input: asWritten, timeoutMs });
+      if (check.code === 0) {
+        keptHeader = false;
+        source = asWritten;
+        outputChannel.appendLine('  compiling it as written (without the added marks)');
+        continue;
+      }
+      asWrittenFails = true;
     }
     if (!progressed && recoverErrors) {
       for (const loc of errorLocationsFrom(err)) {
@@ -1672,7 +1748,7 @@ async function analyzeLocal(document, resolved, settings) {
   for (const n of stubbed) outputChannel.appendLine(`  missing header treated as empty: ${n}`);
   for (const k of skipped) outputChannel.appendLine(`  skipped (does not compile): ${k.name || '(declaration)'} at line ${k.startLine + 1}-${k.endLine + 1}`);
   await dropFailedInstantiations(document, failedInstantiations);
-  if (!result.functions.length && prepared.isHeader) return reportHeaderWithoutCode(document);
+  if (!result.functions.length && prepared.isHeader) return reportHeaderWithoutCode(document, skipped.length);
   vscode.window.showInformationMessage(`Asm Lens (local): found ${result.functions.length} emitted function bodies in ${ms} ms${stubbed.length || skipped.length ? ' (see the Asm Lens output)' : ''}.`);
 }
 
@@ -1887,6 +1963,7 @@ async function compileWithRecovery(opts) {
   const failedInstantiations = [];
   const failedLines = new Set();
   const removedFlags = [];
+  let asWrittenFails = false;
   let source = opts.source;
   let flags = [opts.flags, ...includeBundle.includeFlags].filter(Boolean).join(' ');
   let lastErr = '';
@@ -1948,9 +2025,18 @@ async function compileWithRecovery(opts) {
     // 3. __attribute__((used)) added to a header line that the compiler rejects -> remove it there.
     const reverted = revertKeptLines(source, opts.original, errorLocationsFrom(lastErr).filter(loc => isRemoteMain(loc.file)).map(loc => loc.line));
     if (reverted !== undefined && reverted !== source) { source = reverted; continue; }
-    // Other errors while the header's functions are kept: the caller compiles the text as written
-    // instead, so that what Asm Lens added never makes a function count as "Not compiled".
-    if (opts.kept) throw new Error(lastErr.slice(0, 1800));
+    // Other errors while functions are kept. If the text as written compiles, what Asm Lens added
+    // is to blame, and the caller compiles it as written: that never makes a function count as
+    // "Not compiled". If it fails too, the errors are the file's own: those functions are skipped
+    // below, and the others stay kept.
+    if (opts.kept && !asWrittenFails) {
+      report('checking the file as written…');
+      const asWritten = [...failedLines].reduce((text, l) => blankLine(text, l), opts.original);
+      const check = await postCompile({ ...opts, source: asWritten, files, flags });
+      if (check.code === undefined || check.code === 0) throw new Error(lastErr.slice(0, 1800));
+      asWrittenFails = true;
+      lastErr = stderrText(check) || lastErr;
+    }
 
     if (!recoverErrors) break;
 
@@ -1967,7 +2053,7 @@ async function compileWithRecovery(opts) {
       const before = target === 'main' ? source : target.contents;
       const cut = blankEnclosingDeclaration(before, loc.line);
       if (!cut) continue;
-      if (target === 'main') source = cut.text; else target.contents = cut.text;
+      if (target === 'main') source = dropKeepLines(cut.text, cut.name); else target.contents = cut.text;
       skipped.push({ name: cut.name, file: target === 'main' ? opts.rootFile || 'source' : target.filename, key: target === 'main' ? 'main' : target.filename, startLine: cut.startLine, endLine: cut.endLine });
       progressed = true;
     }
@@ -2445,6 +2531,6 @@ module.exports = {
   _internals: {
     resolveSettings, showAssembly, handleWebviewMessage, syncAsmHighlight, _state: () => ({ panelState, lastAnalysis }),
     compileWithRecovery, collectLocalIncludes, guessFunctionSymbols, sourceFunctionsOf, analysisFor, analyzeDocument,
-    instantiationsFor, prepareCSource, isSystemHeader, globToRegExp, splitArgs, functionForLine, analysesFor, analysisAt
+    instantiationsFor, prepareCSource, isSystemHeader, globToRegExp, splitArgs, functionForLine, analysesFor, analysisAt, mayUpload
   }
 };

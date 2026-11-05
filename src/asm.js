@@ -255,7 +255,7 @@ function isLocalDollarLabel(label) { return label.startsWith('$') && !/^\$[sSe]\
 // Pieces of a function that compilers emit separately: GCC's cold paths
 // ("f(int) [clone .cold]", "f.cold"), MSVC's exception funclets ("main$dtor$0",
 // "f$catch$1", "`f'::`1'::dtor$0"). Returns the name of the function they belong to.
-const PART_RE = /^(.*?)(?:\s*\[clone \.cold(?:\.\d+)?\]|\.cold(?:\.\d+)?|\$(?:dtor|catch|fin|filt|unwind)\$\d+)$/;
+const PART_RE = /^(.*?)(?:\s*\[clone \.(?:cold(?:\.\d+)?|part\.\d+)\]|\s*\(\.(?:cold(?:\.\d+)?|part\.\d+)\)|\.cold(?:\.\d+)?|\.part\.\d+|\$(?:dtor|catch|fin|filt|unwind)\$\d+)$/;
 function partOf(name) {
   const m = PART_RE.exec(String(name || ''));
   if (m && m[1]) return m[1];
@@ -482,7 +482,14 @@ function matchSourceSymbol(asmName, symbols, fn, docKey, opts = {}) {
     // All of its code comes from other files (e.g. a header template): not a function of this file.
     if (mapped.length && !lines.length) return undefined;
   }
-  return named[0];
+  // Library code with no lines here: std::vector<int>::empty is not this file's empty().
+  return isLibrarySymbol(asmName) ? undefined : named[0];
+}
+
+// Whether a demangled name is in the standard library ("bool std::vector<int>::empty(void)const").
+function isLibrarySymbol(name) {
+  const head = stripTemplateArgs(String(name || '')).split('(')[0].trim();
+  return /^(?:std|__gnu_cxx|__cxxabiv1)::/.test(head.split(/\s+/).pop() || '');
 }
 
 function mostHits(symbols, lines) {
@@ -515,15 +522,16 @@ function findFunctionResult(symbol, functions, docKey, rootKey) {
     const norm = normalizeName(symbol.name);
     if (functions.some(f => f.sourceRange && normalizeName(f.sourceName) === norm)) return undefined;
   }
-  const exact = functions.find(f => usable(f) && (f.sourceName === symbol.name || f.name === symbol.name));
+  const own = functions.filter(f => f.sourceRange || !isLibrarySymbol(f.name));
+  const exact = own.find(f => usable(f) && (f.sourceName === symbol.name || f.name === symbol.name));
   if (exact) return exact;
   const normalized = normalizeName(symbol.name);
   const named = f => sameName(normalizeName(f.sourceName), normalized) || sameName(normalizeName(f.name), normalized);
   // A prefix match only for compiler-made variants ("foo.constprop.0", "foo$1"),
   // never for other functions ("cube" is not "cube_int").
   const variant = n => n.startsWith(normalized) && /^[^\w]/.test(n.slice(normalized.length));
-  return functions.find(f => usable(f) && named(f))
-    || functions.find(f => usable(f) && (variant(normalizeName(f.sourceName)) || variant(normalizeName(f.name))));
+  return own.find(f => usable(f) && named(f))
+    || own.find(f => usable(f) && (variant(normalizeName(f.sourceName)) || variant(normalizeName(f.name))));
 }
 
 // Every emitted function for a source symbol (all template instantiations).
@@ -626,7 +634,7 @@ function cleanAssemblyForDisplay(result) {
 module.exports = {
   IS_WIN, normPath, isSystemPath,
   makeRefResolver, makeLocalRefResolver, localAsmToRows, sectionKind, unescapeAsmString, isMachO, prepareMachO, finishMachO,
-  parseFunctions, mergeFunctionParts, partOf, isDataSymbol, looksLikeFunctionLabel, isInstructionLine, cleanInstruction, buildLineIndex,
+  parseFunctions, mergeFunctionParts, partOf, isDataSymbol, isLibrarySymbol, looksLikeFunctionLabel, isInstructionLine, cleanInstruction, buildLineIndex,
   stripTemplateArgs, normalizeName, msvcName, sameName, matchSourceSymbol, findFunctionResult, findAllFunctionResults,
   ANSI_RE, missingIncludesFrom, preprocessorErrorFilesFrom, errorLocationsFrom, stubFilename,
   cleanAssemblyRowsForDisplay, cleanAssemblyForDisplay

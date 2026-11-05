@@ -2,8 +2,31 @@
 
 ## 0.8.3
 
+### New
+- **Asks before code leaves your machine.** The first time a file would be sent to a Compiler Explorer server,
+  a dialog says so and offers **Send**, **Send, Don't Show Again** and **Use Local Compiler**. Nothing is sent
+  before you agree, and analyses that start by themselves never send. "Don't show again" holds per server, so a
+  project's `.asm-lens.json` cannot quietly point your code somewhere else. Setting: `asmLens.confirmRemoteUpload`.
 - Requests to Compiler Explorer identify the extension with a `User-Agent` (`asm-lens/<version>`), so that the
   server's operators can tell its traffic apart.
+
+### Fixes
+- **`static inline` functions in headers showed "No code emitted"**, with every compiler, as soon as one
+  function in the header could not compile on its own, because all of the header's functions lost the marks that
+  keep them. Now only the functions that fail say *Not compiled*. With MSVC this also happened for anything it
+  cannot parse, such as `__attribute__`.
+- **Members of class templates said "template not instantiated"** when a `.cpp` used them and they were simply
+  inlined. They now say *No separate code in user.cpp (inlined or not used)*, and clicking the CodeLens asks for
+  the types.
+- Instantiating a method of a partial specialization (`Stack<T*>`) compiled the primary template instead, so the
+  method never got code.
+- A class that does not compile as a whole for the chosen types was dropped with an error; now the member you
+  clicked is compiled on its own.
+- GCC cold paths and split parts in the newer `f(int) (.cold)` form counted as a second function, showing
+  "2 instantiations" or "2 versions" for functions that are not templates.
+- Standard library functions without line information were counted as yours when the names matched:
+  `std::vector::empty` showed up as a second instantiation of `Stack::empty` with MSVC.
+- The log named `__attribute__` as the function it skipped.
 
 ## 0.8.2
 
