@@ -2,7 +2,7 @@
   "name": "asm-lens",
   "displayName": "Asm Lens",
   "description": "See the assembly of every function right in the editor: instruction counts as CodeLens, two-way source/assembly highlighting, headers and templates. Uses Compiler Explorer or your local compiler. C, C++, Rust, Go, Python, Zig, Swift, D and Fortran.",
-  "version": "0.8.2",
+  "version": "0.8.8",
   "publisher": "IdanShalom",
   "license": "MIT",
   "icon": "images/icon.png",
@@ -218,6 +218,11 @@
           "default": "c++",
           "description": "Language sent to Compiler Explorer for C-family files when there is no .asm-lens.json."
         },
+        "asmLens.confirmRemoteUpload": {
+          "type": "boolean",
+          "default": true,
+          "description": "Ask before sending your code to a Compiler Explorer server for the first time. Choosing \"Don't Show Again\" in that dialog applies to that server only; turning this setting off stops asking for every server."
+        },
         "asmLens.requestTimeoutMs": {
           "type": "number",
           "default": 60000,
@@ -247,6 +252,11 @@
           "type": "boolean",
           "default": true,
           "description": "Color each source line and its assembly instructions with the same color, like Compiler Explorer."
+        },
+        "asmLens.autoInstantiateTemplates": {
+          "type": "boolean",
+          "default": true,
+          "description": "C++: compile templates without being asked, so that they show code at once: with the types the code uses (Box<int> in the file or in a file including it), otherwise int (or 1 for a number). A template that does not compile with those types asks for them when clicked."
         },
         "asmLens.emitUnusedFunctions": {
           "type": "boolean",
@@ -301,6 +311,7 @@
   },
   "scripts": {
     "test": "node test/run.js",
+    "test:e2e": "node test/e2e/run.js",
     "test:remote": "node test/run.js --remote",
     "package": "npx --yes @vscode/vsce@3 package"
   }

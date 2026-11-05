@@ -1,5 +1,109 @@
 # Changelog
 
+## 0.8.8
+
+### New
+- **Every build of a file counts.** A file listed more than once in `compile_commands.json` (a 32-bit and a 64-bit build,
+  in one database or several) is compiled with each entry, a `.cpp` too, and the results are combined, so code behind
+  `#ifdef __x86_64__` and behind `#ifdef __i386__` both show. The CodeLens names the target.
+- **A chosen type stays chosen until it really fails.** `std::vector<int>` brings its header along. A type from a header
+  the `.cpp` includes after this one works: those includes and its `using namespace` lines come before the request.
+  The type is removed only if it fails in every compilation, and the CodeLens then gives the compiler's message.
+- A template that does not compile with the types tried says so, with the reason: *Box<int> does not compile: ...*
+- A member template of a class whose types you chose uses those types.
+- **`compile_commands.json` decides for headers too.** A header takes the compile command of each file in the database
+  that includes it, also through other headers, until its functions have code: one behind `-DFEATURE_A` and one
+  behind `-DFEATURE_B` can both show it. In remote mode the entry's defines, include folders, standard and target
+  options are used as well.
+- Functions that still have no code are called from added lines after the end of the compiled copy, which shows
+  their code if they compile at all (`extern inline`, `gnu_inline`).
+- A *Not compiled* CodeLens gives the compiler's message.
+- **Headers show code without a click.** Opening a header after analyzing a `.cpp` that includes it compiles the
+  header by itself, so every function shows code: `static inline` ones the `.cpp` inlined or never called too.
+- **Templates show code at once**, with the types the code uses (`Box<long>` in the `.cpp`), else `int`. The
+  CodeLens names them. **Instantiate…** still chooses others. Setting: `asmLens.autoInstantiateTemplates`.
+- **A header that needs its `.cpp` works**: one that fails alone, or has functions switched off by `#ifdef`, is
+  compiled with the preprocessor lines before its `#include` in that `.cpp` (through other headers too, and found in
+  the workspace if nothing was analyzed yet).
+- **The CodeLens says why there is no code**: *Not compiled · inside #ifdef X, which is off*, *consteval…*,
+  *Template: no code yet*, instead of "not used, or a template never instantiated".
+- A test suite that runs the extension in a real VS Code (`npm run test:e2e`, also in CI).
+- **Asks before code leaves your machine.** The first time a file would be sent to a Compiler Explorer server,
+  a dialog says so and offers **Send**, **Send, Don't Show Again** and **Use Local Compiler**. Nothing is sent
+  before you agree, and analyses that start by themselves never send. "Don't show again" holds per server, so a
+  project's `.asm-lens.json` cannot quietly point your code somewhere else. Setting: `asmLens.confirmRemoteUpload`.
+- Requests to Compiler Explorer identify the extension with a `User-Agent` (`asm-lens/<version>`), so that the
+  server's operators can tell its traffic apart.
+
+### Fixes
+- **A line Asm Lens added could be blamed on your code, or stop the analysis.** For `template struct Box<S>;` Clang's notes can
+  end inside the class or in another header without naming that line, so nothing added was blamed. Then a function
+  of the file was marked *Not compiled* for it, or the analysis stopped with the error. When nothing added is blamed, the
+  file is now compiled without those lines. If that works, the added line at fault is found, from where the notes
+  end or by trying halves of them, and dropped: silently if nobody asked for it, with a warning if it was your request
+  and nothing of it compiles. Only the file's own errors can make a function *Not compiled*.
+- **A member template overloaded through SFINAE could not be instantiated** when its return type used a macro that is
+  `#undef`'d later in the file: the cast selecting the overload was copied from the source, to a place where the macro no
+  longer exists. The plain `&Box<int>::get<int>` is tried first now, since explicit arguments usually leave one
+  overload, and the cast only if that fails.
+- **One member that does not compile blocked the whole class.** `template struct Box<S>;` compiles every member, so `get` got
+  the error of `broken`. When the class does not compile as a whole, each member now gets its own line (`&Box<S>::get`),
+  constructors and destructors a small call, and the failing member says why on its own CodeLens. The whole class
+  still comes first: only it reaches private members and members defined in other files.
+- Choosing types while a compile was running saved them but compiled nothing. That compile now stops and a new one starts.
+- An automatic analysis of half-typed text could remove a type you had chosen.
+- **`static inline` functions showed no code when their type was in capitals** (`U32`, `BOOL`, `DWORD`): such a type
+  was taken for a macro, and the function was not kept. Inline functions and methods too, with every compiler.
+- **A macro after the parameters hid the function** (`int f(int x) NOEXCEPT {`, `__THROW`, `ATTR(1)`), and `EXPORT(int)
+  f(int x)` was taken for a function named `EXPORT`.
+- **One function that cannot be emitted cost all of them.** Some errors appear only when a function is emitted, which
+  made Asm Lens compile the whole file without keeping anything. Now only that function says *Not compiled*, with
+  the compiler's reason.
+- A header that needs a define from a file it includes earlier (`#include "config.h"` before it) stayed off.
+- With a language server still starting during the analysis, a function could lose its code when the server's symbol
+  started on another line than the one used then.
+- **Code the preprocessor splits hid everything after it.** `#ifdef` around half a block or a signature, `#if 0` with half
+  a function, and a digit separator (`1'000`) made every later line count as inside that function, so later functions
+  were not kept. A macro alone on a line without a semicolon (`DISALLOW_COPY(C)`) hid the function after it.
+- **`-Werror` in the flags stopped analyses**: GCC's "`#pragma once` in main file" for a header, and warnings that appear
+  only when an unused function is emitted. It is left out here, since warnings do not change the code.
+- A forced include or precompiled header that already includes the header being compiled hid all of it. It is left out then.
+- A SIMD helper without the flag for it (`-mavx2`) is compiled for that feature, and the CodeLens says so.
+- `-flto` in `compile_commands.json` gave no assembly at all: with it, `-S` writes LTO data or LLVM IR. Left out now, with
+  `-gsplit-dwarf`, coverage and other instrumentation, and flags that leave reports in the build folder.
+- **Overloaded functions had no code with MSVC** ("not used, or a template never instantiated"): they are kept by
+  taking their address, and `&name` does not compile for an overloaded name. They are now selected by their type.
+  Overloaded function templates too, with every compiler.
+- **Struct templates with a `requires` clause were not seen as templates**, so their methods had no code and no way
+  to choose types; a trailing `requires` hid the method altogether. `struct ABC final` was taken for a struct named
+  `final`.
+- **Friend functions defined in a class template never had code**, since instantiating the class does not
+  instantiate them. They are now called, after the end of the compiled copy.
+- Constructors and destructors had no code with MSVC, which cannot take their address.
+- One server error (HTTP 502, a lost connection) while compiling turned off the marks that keep unused functions
+  until VS Code restarted, so `static inline` functions showed no code from then on.
+- A header whose functions were all inlined was not tied to the `.cpp` in local mode, so it kept offering to be
+  analyzed, and saving it did not update the `.cpp`.
+- clangd: an in-class declaration got a CodeLens as if it had a body.
+- Instantiating a class and a class nested in it was an error; the nested one now comes with the outer one.
+- Automatic analyses no longer show a message each time they finish. `-Iasm_lens…` is no longer listed among your flags.
+- **`static inline` functions in headers showed "No code emitted"**, with every compiler, as soon as one
+  function in the header could not compile on its own, because all of the header's functions lost the marks that
+  keep them. Now only the functions that fail say *Not compiled*. With MSVC this also happened for anything it
+  cannot parse, such as `__attribute__`.
+- **Members of class templates said "template not instantiated"** when a `.cpp` used them and they were simply
+  inlined. They now say *No separate code in user.cpp (inlined or not used)*, and clicking the CodeLens asks for
+  the types.
+- Instantiating a method of a partial specialization (`Stack<T*>`) compiled the primary template instead, so the
+  method never got code.
+- A class that does not compile as a whole for the chosen types was dropped with an error; now the member you
+  clicked is compiled on its own.
+- GCC cold paths and split parts in the newer `f(int) (.cold)` form counted as a second function, showing
+  "2 instantiations" or "2 versions" for functions that are not templates.
+- Standard library functions without line information were counted as yours when the names matched:
+  `std::vector::empty` showed up as a second instantiation of `Stack::empty` with MSVC.
+- The log named `__attribute__` as the function it skipped.
+
 ## 0.8.2
 
 ### Fixes

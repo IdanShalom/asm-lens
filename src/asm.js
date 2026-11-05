@@ -255,7 +255,7 @@ function isLocalDollarLabel(label) { return label.startsWith('$') && !/^\$[sSe]\
 // Pieces of a function that compilers emit separately: GCC's cold paths
 // ("f(int) [clone .cold]", "f.cold"), MSVC's exception funclets ("main$dtor$0",
 // "f$catch$1", "`f'::`1'::dtor$0"). Returns the name of the function they belong to.
-const PART_RE = /^(.*?)(?:\s*\[clone \.cold(?:\.\d+)?\]|\.cold(?:\.\d+)?|\$(?:dtor|catch|fin|filt|unwind)\$\d+)$/;
+const PART_RE = /^(.*?)(?:\s*\[clone \.(?:cold(?:\.\d+)?|part\.\d+)\]|\s*\(\.(?:cold(?:\.\d+)?|part\.\d+)\)|\.cold(?:\.\d+)?|\.part\.\d+|\$(?:dtor|catch|fin|filt|unwind)\$\d+)$/;
 function partOf(name) {
   const m = PART_RE.exec(String(name || ''));
   if (m && m[1]) return m[1];
@@ -482,7 +482,14 @@ function matchSourceSymbol(asmName, symbols, fn, docKey, opts = {}) {
     // All of its code comes from other files (e.g. a header template): not a function of this file.
     if (mapped.length && !lines.length) return undefined;
   }
-  return named[0];
+  // Library code with no lines here: std::vector<int>::empty is not this file's empty().
+  return isLibrarySymbol(asmName) ? undefined : named[0];
+}
+
+// Whether a demangled name is in the standard library ("bool std::vector<int>::empty(void)const").
+function isLibrarySymbol(name) {
+  const head = stripTemplateArgs(String(name || '')).split('(')[0].trim();
+  return /^(?:std|__gnu_cxx|__cxxabiv1)::/.test(head.split(/\s+/).pop() || '');
 }
 
 function mostHits(symbols, lines) {
@@ -515,15 +522,36 @@ function findFunctionResult(symbol, functions, docKey, rootKey) {
     const norm = normalizeName(symbol.name);
     if (functions.some(f => f.sourceRange && normalizeName(f.sourceName) === norm)) return undefined;
   }
-  const exact = functions.find(f => usable(f) && (f.sourceName === symbol.name || f.name === symbol.name));
+  const own = functions.filter(f => f.sourceRange || !isLibrarySymbol(f.name));
+  const exact = own.find(f => usable(f) && (f.sourceName === symbol.name || f.name === symbol.name));
   if (exact) return exact;
   const normalized = normalizeName(symbol.name);
   const named = f => sameName(normalizeName(f.sourceName), normalized) || sameName(normalizeName(f.name), normalized);
   // A prefix match only for compiler-made variants ("foo.constprop.0", "foo$1"),
   // never for other functions ("cube" is not "cube_int").
   const variant = n => n.startsWith(normalized) && /^[^\w]/.test(n.slice(normalized.length));
-  return functions.find(f => usable(f) && named(f))
-    || functions.find(f => usable(f) && (variant(normalizeName(f.sourceName)) || variant(normalizeName(f.name))));
+  return own.find(f => usable(f) && named(f))
+    || own.find(f => usable(f) && (variant(normalizeName(f.sourceName)) || variant(normalizeName(f.name))));
+}
+
+// The template instantiation a function belongs to: "Box<int>::get() const" is
+// Box<int>, "Box<int>::conv<float>() const" is itself up to its arguments, "int
+// twice<int>(int)" is twice<int>, "operator-(Box<int> const&)" has none. '' when none.
+function instantiationOf(name) {
+  const s = String(name || '').trim();
+  let depth = 0, end = s.length, start = 0;
+  for (let i = 0; i < s.length; i++) {
+    const c = s[i];
+    if (c === '<' && !/\boperator\s*<*$/.test(s.slice(0, i))) depth++;
+    else if (c === '>' && depth && s[i - 1] !== '-') depth--;
+    else if (!depth && c === '(' && !/\boperator\s*$/.test(s.slice(0, i))) { end = i; break; }
+    else if (!depth && /\s/.test(c)) start = i + 1;
+  }
+  const head = s.slice(start, end);
+  const op = head.search(/\boperator\b/);
+  const named = op >= 0 ? head.slice(0, op) : head;
+  const id = named.slice(0, named.lastIndexOf('>') + 1).replace(/\b([A-Za-z_]\w*)(<[^:]*>)::\1<[^:]*>$/, '$1$2');   // MSVC: Box<int>::Box<int>
+  return /^[A-Za-z_:]/.test(id) ? id : '';
 }
 
 // Every emitted function for a source symbol (all template instantiations).
@@ -541,6 +569,10 @@ function findAllFunctionResults(symbol, functions, docKey, rootKey) {
     const named = all.filter(f => sameName(normalizeName(f.name), norm));
     if (named.length) return distinctCode(named);
     if (all.length) return distinctCode(all);
+    // A symbol that starts elsewhere than the one matched during the analysis (a language
+    // server that was still starting then, attributes on the line before): same name, same place.
+    const here = functions.filter(f => usable(f) && f.sourceRange && f.sourceRange.start.line <= symbol.range.end.line && symbol.range.start.line <= f.sourceRange.end.line && sameName(normalizeName(f.name), norm));
+    if (here.length) return distinctCode(here);
   }
   if (docKey !== rootKey) {
     const norm = normalizeName(symbol.name);
@@ -558,6 +590,37 @@ function findAllFunctionResults(symbol, functions, docKey, rootKey) {
 // Compiler diagnostics (GCC, Clang and MSVC formats)
 
 const ANSI_RE = /\x1b\[[0-9;]*[A-Za-z]/g;
+
+// The main-file lines (0-based) a compile error is about, each with its message:
+// where the error is, and the notes saying which line led to it (GCC puts an
+// always_inline failure in the intrinsics header, with "called from here" in yours).
+function errorLinesIn(errText, isMainFile) {
+  const out = new Map();
+  // Line -> the CPU feature the function needs, when that is what the error says.
+  out.features = new Map();
+  let last = '', feature;
+  for (const raw of errText.split(/\r?\n/)) {
+    const error = /^(.+?):(\d+)(?::\d+)?:\s*(?:fatal )?error:\s*(.*)$/.exec(raw) || /^(.+?)\((\d+)(?:,\d+)?\)\s*:\s*(?:fatal )?error\s+[A-Z]+\d+\s*:\s*(.*)$/.exec(raw);
+    const note = error ? undefined : /^(.+?):(\d+)(?::\d+)?:\s*(?:note:\s*(?:called from here|.*\brequested here)|.*\brequired from here)/.exec(raw) || /^(.+?)\((\d+)(?:,\d+)?\)\s*:\s*note:\s*see (?:the first )?reference to/.exec(raw);
+    if (error) { last = error[3].trim(); feature = featureNeeded(error[1], last); }
+    const hit = error || note;
+    if (!hit || !isMainFile(hit[1].trim())) continue;
+    const line = Number(hit[2]) - 1;
+    if (!out.has(line)) out.set(line, last);
+    if (feature && !out.features.has(line)) out.features.set(line, feature);
+  }
+  return out;
+}
+
+// The CPU feature an intrinsic needs, from the error: Clang names it, GCC's error is in
+// its header (avx2intrin.h). undefined for any other error.
+function featureNeeded(file, message) {
+  if (!/target specific option mismatch|requires target feature/.test(message)) return undefined;
+  const named = /target features? '([^']+)'/.exec(message);
+  if (named) return named[1];
+  const header = /([a-z0-9_]+)intrin\.h$/.exec(String(file).trim());
+  return header && /^(?:avx|fma|bmi|popcnt|lzcnt|f16c|aes|sha|gfni|vaes|vpclmul|adx|rdseed|movdir|xsave)/.test(header[1]) ? header[1] : undefined;
+}
 
 // Names of includes the compiler reported as missing.
 function missingIncludesFrom(errText) {
@@ -626,8 +689,8 @@ function cleanAssemblyForDisplay(result) {
 module.exports = {
   IS_WIN, normPath, isSystemPath,
   makeRefResolver, makeLocalRefResolver, localAsmToRows, sectionKind, unescapeAsmString, isMachO, prepareMachO, finishMachO,
-  parseFunctions, mergeFunctionParts, partOf, isDataSymbol, looksLikeFunctionLabel, isInstructionLine, cleanInstruction, buildLineIndex,
-  stripTemplateArgs, normalizeName, msvcName, sameName, matchSourceSymbol, findFunctionResult, findAllFunctionResults,
-  ANSI_RE, missingIncludesFrom, preprocessorErrorFilesFrom, errorLocationsFrom, stubFilename,
+  parseFunctions, mergeFunctionParts, partOf, isDataSymbol, isLibrarySymbol, looksLikeFunctionLabel, isInstructionLine, cleanInstruction, buildLineIndex,
+  stripTemplateArgs, normalizeName, msvcName, sameName, matchSourceSymbol, findFunctionResult, findAllFunctionResults, instantiationOf,
+  ANSI_RE, missingIncludesFrom, preprocessorErrorFilesFrom, errorLocationsFrom, errorLinesIn, stubFilename,
   cleanAssemblyRowsForDisplay, cleanAssemblyForDisplay
 };
