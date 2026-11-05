@@ -10,6 +10,7 @@ const scan = require('./cppScan');
 const languages = require('./languages');
 const flagsLib = require('./flags');
 const compileCommands = require('./compileCommands');
+const { version } = require('../package.json');
 const {
   IS_WIN, normPath, makeRefResolver, makeLocalRefResolver, localAsmToRows, isMachO, prepareMachO, finishMachO,
   parseFunctions, mergeFunctionParts, buildLineIndex, normalizeName, sameName,
@@ -236,11 +237,14 @@ function resolveOtherSettings(lang, project, s) {
   };
 }
 
+// Sent with every request, so that Compiler Explorer's operators can tell this extension's traffic from others'.
+const CE_HEADERS = { Accept: 'application/json', 'User-Agent': `asm-lens/${version} (+https://github.com/IdanShalom/asm-lens)` };
+
 // Compiler Explorer's default compiler for a language (cached), or a known one when offline.
 const ceDefaults = new Map();
 async function ceDefaultCompiler(baseUrl, lang) {
   if (!ceDefaults.has(baseUrl)) {
-    ceDefaults.set(baseUrl, fetch(`${baseUrl}/api/languages?fields=id,defaultCompiler`, { headers: { Accept: 'application/json' }, signal: AbortSignal.timeout(15000) })
+    ceDefaults.set(baseUrl, fetch(`${baseUrl}/api/languages?fields=id,defaultCompiler`, { headers: CE_HEADERS, signal: AbortSignal.timeout(15000) })
       .then(r => r.ok ? r.json() : [])
       .then(list => new Map((Array.isArray(list) ? list : []).filter(l => l && l.defaultCompiler).map(l => [l.id, l.defaultCompiler])))
       .catch(() => new Map()));
@@ -486,7 +490,7 @@ function activate(context) {
       let chosen;
       if (picked.browse) {
         const baseUrl = settings.baseUrl || config().get('baseUrl', 'https://godbolt.org').replace(/\/$/, '');
-        const response = await fetch(`${baseUrl}/api/compilers/${encodeURIComponent(settings.language)}`, { headers: { Accept: 'application/json' }, signal: AbortSignal.timeout(30000) })
+        const response = await fetch(`${baseUrl}/api/compilers/${encodeURIComponent(settings.language)}`, { headers: CE_HEADERS, signal: AbortSignal.timeout(30000) })
           .catch(e => { throw e.name === 'TimeoutError' ? new Error(`${hostOf(baseUrl)} did not send its compiler list within 30 s; try again in a moment.`) : e; });
         if (!response.ok) throw new Error(`Compiler list request failed: HTTP ${response.status}`);
         const compilers = await response.json();
@@ -1833,7 +1837,7 @@ async function postCompile({ baseUrl, compilerId, language, timeoutMs, source, f
     try {
       response = await fetch(url, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
+        headers: { ...CE_HEADERS, 'Content-Type': 'application/json' },
         body,
         signal: controller.signal
       });

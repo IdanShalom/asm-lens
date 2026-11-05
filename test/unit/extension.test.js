@@ -1115,3 +1115,40 @@ test('header: older results fill gaps only for the same compiler, and never for 
     assert.equal(x.ext._internals.analysisAt(x.open('m.hxx'), 2).rootPath, x.at('u.cpp'));
   } finally { ce.restore(); }
 });
+
+// ---------------------------------------------------------------------------
+// 0.8.3: requests say who is asking
+
+test('every request to Compiler Explorer identifies the extension, as sent on the wire', async () => {
+  const http = require('http');
+  const seen = [];
+  const server = http.createServer((req, res) => {
+    req.resume();
+    req.on('end', () => {
+      seen.push({ path: req.url, agent: req.headers['user-agent'], accept: req.headers.accept, type: req.headers['content-type'] });
+      const json = req.url.startsWith('/api/languages') ? [{ id: 'rust', defaultCompiler: 'r_default' }]
+        : req.url.startsWith('/api/compilers/') ? [{ id: 'r2', name: 'Rust 2' }]
+          : { code: 0, asm: [{ text: 'example::sq:' }, { text: '        ret', source: { file: null, line: 1 } }] };
+      res.setHeader('Content-Type', 'application/json');
+      res.end(JSON.stringify(json));
+    });
+  });
+  await new Promise(r => server.listen(0, '127.0.0.1', r));
+  try {
+    const dir = makeProject({ 'c.rs': 'pub fn sq() {}\n' });
+    const x = start(dir, { settings: { 'asmLens.baseUrl': `http://127.0.0.1:${server.address().port}`, 'asmLens.reanalyzeOn': 'never' } });
+    assert.deepEqual((await x.analyze('c.rs')).error, []);
+    x.state.quickPickAnswers.push(() => undefined);
+    await x.state.commands.get('asmLens.selectCompiler')();
+    const paths = seen.map(s => s.path.split('?')[0]);
+    assert.ok(paths.includes('/api/languages'), paths.join());
+    assert.ok(paths.includes('/api/compiler/r_default/compile'), paths.join());
+    assert.ok(paths.includes('/api/compilers/rust'), paths.join());
+    const expected = `asm-lens/${require('../../package.json').version} (+https://github.com/IdanShalom/asm-lens)`;
+    for (const s of seen) {
+      assert.equal(s.agent, expected, s.path);
+      assert.equal(s.accept, 'application/json', s.path);
+    }
+    assert.equal(seen.find(s => s.path.endsWith('/compile')).type, 'application/json');
+  } finally { server.close(); }
+});

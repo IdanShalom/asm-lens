@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.8.3
+
+- Requests to Compiler Explorer identify the extension with a `User-Agent` (`asm-lens/<version>`), so that the
+  server's operators can tell its traffic apart.
+
 ## 0.8.2
 
 ### Fixes

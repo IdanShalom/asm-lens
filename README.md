@@ -385,6 +385,7 @@ mode, where your own compiler and system headers are used.
 
 In **remote** mode the analyzed file and the local headers it includes are sent to the Compiler Explorer
 server in `baseUrl` (godbolt.org by default; see its [privacy policy](https://godbolt.org/#privacy)).
+Requests name the extension and its version in their `User-Agent`, and nothing about you or your machine.
 Use **local** mode, or a self-hosted Compiler Explorer, for code that must stay private. In local mode
 nothing is sent anywhere.
 
