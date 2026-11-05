@@ -255,6 +255,10 @@ function compileFlagsOf(entry, windows = IS_WIN) {
     if (a === '-o' || a === '-MF' || a === '-MT' || a === '-MQ' || a === '-x' || a === '-MJ') { i++; continue; }
     if (/^-o.+/.test(a) || /^-M[FTQJ].+/.test(a) || /^-x.+/.test(a) || /^-Werror/.test(a)) continue;
     if (/^-fdiagnostics-color/.test(a)) continue;
+    // With link-time optimization -S writes no assembly: GCC only its LTO data, Clang LLVM IR.
+    if (/^-flto(?:=|$)|^-f(?:no-)?fat-lto-objects$|^-fwhole-program$|^-gsplit-dwarf$/.test(a)) continue;
+    // Instrumentation and reports: they add noise to the code and leave files named "-.gcno" in the build folder.
+    if (/^--coverage$|^-ftest-coverage$|^-fprofile-(?:arcs|generate|instr-generate|update)|^-fcoverage-mapping$|^-save-temps|^-fdump-|^-ftime-report|^-ftime-trace|^-fsave-optimization-record|^-fstack-usage$|^-fcallgraph-info|^-pedantic-errors$/.test(a)) continue;
     if (same(a)) continue;
     out.push(a);
   }
@@ -267,7 +271,60 @@ function entryCompiler(entry, windows = IS_WIN) {
   return /[\\/]/.test(c) && !path.isAbsolute(c) ? path.resolve(entry.directory || '', c) : c;
 }
 
+// Flags without those that turn warnings into errors. Asm Lens shows code, and a warning
+// must not stop that: "#pragma once in main file" for a header, or warnings that appear
+// only once an unused function is emitted. Returns { flags, removed }.
+function withoutWarningsAsErrors(flags) {
+  const removed = [];
+  const rest = String(flags || '').replace(/(^|\s)(-Werror(?:=\S+)?|-pedantic-errors|\/WX)(?=\s|$)/g, (all, lead, flag) => { removed.push(flag); return ''; });
+  return { flags: rest.replace(/\s+/g, ' ').trim(), removed };
+}
+
+// Separates forced includes from the other arguments: -include x, -Xclang -include -Xclang x,
+// and a precompiled header (-Xclang -include-pch -Xclang x.pch, -Winvalid-pch goes with it).
+function splitForcedIncludes(args) {
+  const rest = [];
+  const files = [];
+  for (let i = 0; i < args.length; i++) {
+    const a = args[i];
+    if (a === '-Xclang' && (args[i + 1] === '-include' || args[i + 1] === '-include-pch') && args[i + 2] === '-Xclang') {
+      if (args[i + 1] === '-include') files.push(args[i + 3]);
+      i += 3;
+    } else if (a === '-include' || a === '--include') files.push(args[++i]);
+    else if (/^-include./.test(a) && !/^-include-pch/.test(a)) files.push(a.slice('-include'.length));
+    else if (/^--include=/.test(a)) files.push(a.slice('--include='.length));
+    else if (a !== '-Winvalid-pch') rest.push(a);
+  }
+  return { rest, files: files.filter(Boolean) };
+}
+
+// The folders of -I, -iquote and -isystem (and MSVC's /I) arguments, absolute.
+function includeDirsOf(args, cwd) {
+  const out = [];
+  for (let i = 0; i < args.length; i++) {
+    const m = /^(?:-I|-iquote|-isystem|\/I)(.*)$/.exec(args[i]);
+    if (!m) continue;
+    const dir = m[1] || args[++i];
+    if (dir) out.push(path.resolve(cwd || '.', dir));
+  }
+  return out;
+}
+
+// From a compile_commands.json entry, what also means something on another machine:
+// defines, the language standard and target options, and the include folders apart.
+function portableFlags(entry, windows = IS_WIN) {
+  const args = compileFlagsOf(entry, windows);
+  const flags = [];
+  for (let i = 0; i < args.length; i++) {
+    const a = args[i];
+    if (a === '-D' || a === '-U') { flags.push(`${a}${args[++i] ?? ''}`); continue; }
+    if (/^(?:-[DU].|\/[DU].|-std=|\/std:|-m(?!llvm$|asm=)|-f(?:no-)?(?:exceptions|rtti)$|\/EH)/.test(a)) flags.push(a);
+  }
+  return { flags: flags.map(a => (/\s/.test(a) ? `"${a.replace(/"/g, '\\"')}"` : a)).join(' '), dirs: includeDirsOf(args, entry.directory) };
+}
+
 module.exports = {
+  includeDirsOf, portableFlags, withoutWarningsAsErrors, splitForcedIncludes,
   stripSyntaxFlags, stripSyntaxArgs, compilerKind, targetOf, isX86, syntaxArgs, isMsvcStyle, adaptFlags, needsNewerStd,
   rejectedFlagsFrom, matchesOption, removeFlags, removeArgs,
   splitCommand, entryArgs, compileFlagsOf, entryCompiler

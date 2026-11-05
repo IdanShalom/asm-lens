@@ -305,7 +305,7 @@ test('scanDefinitions: braces inside unclosed parentheses are expressions, not b
   assert.deepEqual(fns(src).map(x => [x.name, x.startLine, x.endLine]), [['f', 0, 5], ['after', 6, 6]]);
 });
 
-test('keepHeaderFunctions: marks go after macros; functions behind unknown macros only are left alone', () => {
+test('keepHeaderFunctions: marks go after macros; a type in capitals is no reason to leave a function out; classes behind a macro are', () => {
   const kept = scan.keepHeaderFunctions([
     'DOCTEST_NORETURN void a() { throw 1; }',
     'FMT_API inline int b() { return 2; }',
@@ -315,9 +315,9 @@ test('keepHeaderFunctions: marks go after macros; functions behind unknown macro
   ].join('\n')).split('\n');
   assert.equal(kept[0], 'DOCTEST_NORETURN __attribute__((used)) void a() { throw 1; }');
   assert.equal(kept[1], 'FMT_API __attribute__((used)) inline int b() { return 2; }');
-  assert.equal(kept[2], 'DOCTEST_APPROX_PREFIX operator==(const T& l, const A& r) { return true; }');
+  assert.equal(kept[2], '__attribute__((used)) DOCTEST_APPROX_PREFIX operator==(const T& l, const A& r) { return true; }', 'if it does not fit, the compiler says so and only this function loses it');
   assert.equal(kept[3], 'TPL_DECLARATION class basic { int m() const { return 3; } };');
-  assert.equal(kept[4], 'BOOL WINAPI c() { return 0; }');
+  assert.equal(kept[4], 'BOOL __attribute__((used)) WINAPI c() { return 0; }');
 });
 
 test('scanDefinitions: long runs of macro-like words do not slow it down (no catastrophic backtracking)', () => {
@@ -556,4 +556,66 @@ test('includeContext: the preprocessor lines before an #include, closed, through
     text: ['#define T', '#include "other.h"', '#define M'].join('\n'),
     dirs: ['/p', '/p/inc']
   });
+});
+
+// ---------------------------------------------------------------------------
+// 0.8.5: every function a compiler could emit is found and kept
+
+test('scanDefinitions: macros after the parameters, and a macro call in front', () => {
+  const src = [
+    'static inline int a(int x) NOEXC { return x; }',
+    'static inline int b(int x) __THROW { return x; }',
+    'static inline int c(int x) ATTR(1, 2) NOEXC { return x; }',
+    'struct S { int d(int x) const NOEXC { return x; } };',
+    'static inline EXPORT(int) e(int x) { return x; }',
+    'S(int x) noexcept(true) { }',
+    'int f(int x) API(noexcept) { return x; }',
+    'FOO(a) { }'
+  ].join('\n');
+  assert.deepEqual(scan.scanDefinitions(src).filter(d => d.kind === 'function').map(d => d.name), ['a', 'b', 'c', 'd', 'e', 'S', 'f', 'FOO']);
+});
+
+test('keepHeaderFunctions: functions returning a type in capitals are kept, in a .cpp too', () => {
+  const src = 'static inline U32 a(U32 x) { return x; }\nINLINE BOOL b(int x) { return x; }\nstruct S { BOOL c() const { return 1; } };\n';
+  const kept = scan.keepHeaderFunctions(src, { all: false }).split('\n');
+  assert.equal(kept[0], '__attribute__((used)) static inline U32 a(U32 x) { return x; }');
+  assert.equal(kept[1], 'INLINE __attribute__((used)) BOOL b(int x) { return x; }');
+  assert.equal(kept[2], 'struct S { __attribute__((used)) BOOL c() const { return 1; } };');
+});
+
+test('callLines: free functions, namespaces, static and const members; constructors and main are left out', () => {
+  const defs = scan.scanDefinitions([
+    'extern inline int a(int x, int) { return x; }',
+    'namespace ns { inline void b() { } }',
+    'struct S { static int c(int x) { return x; } int d() const { return 1; } int e(float f = 1.0f) { return 2; } S() { } ~S() { } };',
+    'int main() { return 0; }',
+    'inline int g(int (*cb)(int)) { return cb(1); }'
+  ].join('\n')).filter(d => d.kind === 'function');
+  assert.deepEqual(scan.callLines(defs), [
+    'decltype(auto) __asm_lens_call_0(int x, int __asm_lens_p1) { return a(x, __asm_lens_p1); }',
+    'namespace ns { decltype(auto) __asm_lens_call_1() { return b(); } }',
+    'decltype(auto) __asm_lens_call_2(int x) { return S::c(x); }',
+    'decltype(auto) __asm_lens_call_3(const S& __asm_lens_self) { return __asm_lens_self.d(); }',
+    'decltype(auto) __asm_lens_call_4(S& __asm_lens_self, float f) { return __asm_lens_self.e(f); }'
+  ]);
+  assert.deepEqual(scan.callLines(scan.scanDefinitions('extern inline int h(int x) { return x; }\nextern inline void i(void) { }\n').filter(d => d.kind === 'function'), { c: true }), [
+    'int __asm_lens_call_0(int x) { return h(x); }',
+    'void __asm_lens_call_1(void) { return i(); }'
+  ]);
+});
+
+test('scanDefinitions: what follows code the preprocessor splits, digit separators and macro lines is still found', () => {
+  const names = src => scan.scanDefinitions(src).filter(d => d.kind === 'function').map(d => d.name);
+  assert.deepEqual(names('static inline int f(int x) {\n#ifdef FAST\n  if (x) {\n#else\n  if (x > 1) {\n#endif\n    return 1;\n  }\n  return 0;\n}\nstatic inline int after(int x) { return x; }\n'), ['f', 'after'], 'braces');
+  assert.deepEqual(names('#ifdef A\nstatic inline int f(int x) {\n#else\nstatic inline int f(long x) {\n#endif\n  return 1;\n}\nstatic inline int after(int x) { return x; }\n'), ['f', 'after'], 'signature');
+  assert.deepEqual(names('#ifdef _WIN32\nstatic inline int w(int x) { return x; }\n#else\nstatic inline int p(int x) { return x; }\n#endif\nstatic inline int after(int x) { return x; }\n'), ['w', 'p', 'after'], 'complete branches all stay');
+  assert.deepEqual(names('#if 0\nstatic inline int dead(int x) {\n#endif\nstatic inline int after(int x) { return x; }\n'), ['after'], '#if 0 with half a function');
+  assert.deepEqual(names('#ifdef __cplusplus\nextern "C" {\n#endif\nstatic inline int f(int x) { return x; }\n#ifdef __cplusplus\n}\n#endif\nstatic inline int after(int x) { return x; }\n'), ['f', 'after'], 'extern "C" guards');
+  assert.deepEqual(names("static inline int f(int x) { int k = 1'000'000; if (x) { return k; } return 0; }\nstatic inline int after(int x) { return x; }\n"), ['f', 'after'], 'digit separators');
+  assert.deepEqual(names("static inline char f() { char c = '{'; return c; }\nstatic inline wchar_t g() { return L'}'; }\nstatic inline int after(int x) { return x; }\n"), ['f', 'g', 'after'], 'characters are still characters');
+  assert.deepEqual(names('DECLARE_THING(foo)\nstatic inline int f(int x) { return x; }\nREGISTER(foo, bar)\nint g(int x) { return x; }\n'), ['f', 'g'], 'macro lines');
+  assert.deepEqual(names('class C {\n  DISALLOW_COPY(C)\n  int b() { return 2; }\npublic:\n  Q_DECLARE(x)\n  C(int x)\n    : v(x) { }\n  C()\n  {\n  }\n};\n'), ['b', 'C', 'C'], 'in a class; constructors stay constructors');
+  assert.deepEqual(names('TEST(a, b)\n{\n}\nFoo::Foo(int x)\n  noexcept\n{\n}\n'), ['TEST', 'Foo::Foo'], 'not a macro line: the function itself');
+  const marks = scan.keepHeaderFunctions('static inline int f(int x) {\n#ifdef FAST\n  if (x) {\n#else\n  if (x > 1) {\n#endif\n    return 1;\n  }\n  return 0;\n}\nstruct S { int m() const { return 1; } };\n', { all: false });
+  assert.equal((marks.match(/__attribute__\(\(used\)\)/g) || []).length, 2, 'and they are kept');
 });

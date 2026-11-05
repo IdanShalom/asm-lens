@@ -31,6 +31,15 @@ async function main() {
   fs.writeFileSync(path.join(project, 'remote', 'r.cpp'), 'int r() { return 1; }\n');
   fs.writeFileSync(path.join(project, 'remote', '.asm-lens.json'), JSON.stringify({ baseUrl: 'http://127.0.0.1:9', compilers: [{ id: 'g152' }] }));
 
+  // A project with compile_commands.json: a header is compiled the way the files listed there see it.
+  const db = path.join(project, 'db');
+  fs.cpSync(path.join(__dirname, '..', 'fixtures', 'db'), db, { recursive: true });
+  fs.writeFileSync(path.join(db, 'compile_commands.json'), JSON.stringify([
+    { directory: '.', file: 'src/a.cpp', command: `${compiler} -DFEATURE_A -Iinclude -O2 -std=c++17 -c src/a.cpp -o a.o` },
+    { directory: '.', file: 'src/b.cpp', command: `${compiler} -DFEATURE_B -Iinclude -O2 -std=c++17 -c src/b.cpp -o b.o` }
+  ]));
+  fs.writeFileSync(path.join(db, '.asm-lens.json'), JSON.stringify({ mode: 'local', compileCommands: 'compile_commands.json' }));
+
   const result = path.join(tmp, 'result.json');
   const env = { ...process.env, ASM_LENS_E2E_RESULT: result };
   for (const k of Object.keys(env)) if (/^(?:ELECTRON_RUN_AS_NODE|VSCODE_)/.test(k)) delete env[k];

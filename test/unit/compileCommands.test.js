@@ -2,6 +2,7 @@ const test = require('node:test');
 const assert = require('node:assert/strict');
 const fs = require('fs');
 const path = require('path');
+const os = require('os');
 const cc = require('../../src/compileCommands');
 const { makeProject } = require('../helpers/env');
 
@@ -82,4 +83,23 @@ test('includes: relative includes, includes through include paths, other files w
   assert.equal(cc.includes('// #include "api.h"\nint x;\n', from, path.resolve('/p/src/zzz.h')), false);
   assert.equal(cc.folderDistance('/a/b', '/a/b'), 0);
   assert.equal(cc.folderDistance('/a/b', '/a/c/d'), 3);
+});
+
+test('includersOf: through other headers, with the entry\'s include folders; all that include it', async () => {
+  cc.reload();
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'asm-lens-cc-'));
+  const write = (rel, text) => { const p = path.join(dir, rel); fs.mkdirSync(path.dirname(p), { recursive: true }); fs.writeFileSync(p, text); return p; };
+  const target = write('inc/deep/target.hxx', 'static inline int t() { return 1; }\n');
+  write('inc/mid.h', '#include <deep/target.hxx>\n');
+  write('inc/other.h', 'int nothing;\n');
+  write('src/a.cpp', '#include "mid.h"\n');
+  write('src/b.cpp', '#include "../inc/deep/target.hxx"\n');
+  write('src/c.cpp', '#include "other.h"\n');
+  const command = (file, extra = '') => ({ directory: dir, file, command: `g++ -Iinc ${extra} -c ${file}` });
+  write('compile_commands.json', JSON.stringify([command('src/c.cpp'), command('src/a.cpp', '-DA'), command('src/b.cpp', '-DB')]));
+  const db = await cc.loadDatabases([path.join(dir, 'compile_commands.json')]);
+  const found = await cc.includersOf(db, target);
+  assert.deepEqual(found.map(e => path.basename(e.file)).sort(), ['a.cpp', 'b.cpp']);
+  const match = await cc.entryFor(db, target);
+  assert.match(match.reason, /the entry of [ab]\.cpp, which includes it/);
 });

@@ -70,6 +70,25 @@ exports.run = async () => {
     assert.ok(at(lenses, 15).includes('Wrap<long>'), at(lenses, 15));
   });
 
+  await check('types in capitals and macros around the signature show code', async () => {
+    await vscode.commands.executeCommand('asmLens.analyzeFile', uriOf('realworld.hxx'));
+    const lenses = await settled('realworld.hxx');
+    for (const line of [11, 12, 13, 14, 15, 16, 18, 19, 20, 22, 23, 24, 25, 26, 27, 28, 29]) assert.match(at(lenses, line), CODE, `line ${line}: ${at(lenses, line)}`);
+  });
+
+  await check('one function that cannot be emitted costs only that function', async () => {
+    await vscode.commands.executeCommand('asmLens.analyzeFile', uriOf('emitted.hxx'));
+    const lenses = await settled('emitted.hxx');
+    for (const line of [3, 8, 9]) assert.match(at(lenses, line), CODE, `line ${line}: ${at(lenses, line)}`);
+  });
+
+  await check('a header takes the compile command of each file in compile_commands.json that includes it', async () => {
+    await vscode.commands.executeCommand('asmLens.analyzeFile', uriOf('db/include/feature.hxx'));
+    const lenses = await settled('db/include/feature.hxx');
+    for (const line of [2, 4, 7, 13]) assert.match(at(lenses, line), CODE, `line ${line}: ${at(lenses, line)}`);
+    assert.match(at(lenses, 10), /Not compiled · inside #ifdef NOWHERE/);
+  });
+
   await check('nothing is sent before the question is answered (tests answer no dialog)', async () => {
     const real = globalThis.fetch;
     const urls = [];

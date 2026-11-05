@@ -11,6 +11,7 @@ function maskCode(text) {
   const n = text.length;
   const out = text.split('');
   const directiveEnds = [];
+  const conditionals = [];
   const blank = (a, b) => { for (let k = a; k < b; k++) if (out[k] !== '\n') out[k] = ' '; };
   let i = 0, lineStart = true;
   while (i < n) {
@@ -21,11 +22,15 @@ function maskCode(text) {
       let j = i;
       while (j < n && !(text[j] === '\n' && text[j - 1] !== '\\')) j++;
       // comments inside the directive are blanked along with it
+      const word = /^#\s*(if|ifdef|ifndef|elif|elifdef|elifndef|else|endif)\b/.exec(text.slice(i, Math.min(i + 40, j)))?.[1];
+      if (word) conditionals.push({ word, start: i, end: j });
       blank(i, j); directiveEnds.push(j); i = j; continue;
     }
     lineStart = false;
     if (c === '/' && text[i + 1] === '/') { let j = i; while (j < n && text[j] !== '\n') j++; blank(i, j); i = j; continue; }
     if (c === '/' && text[i + 1] === '*') { let j = text.indexOf('*/', i + 2); j = j < 0 ? n : j + 2; blank(i, j); i = j; continue; }
+    // A digit separator (1'000'000), not the start of a character.
+    if (c === "'" && /[0-9a-fA-F]/.test(text[i + 1] || '') && /\b\d[\w']*$/.test(text.slice(Math.max(0, i - 40), i))) { i++; continue; }
     if (c === '"' || c === "'") {
       // raw string R"delim( ... )delim"
       if (c === '"' && text[i - 1] === 'R') {
@@ -38,7 +43,40 @@ function maskCode(text) {
     }
     i++;
   }
+  blankUnevenBranches(out, conditionals, blank);
   return { text: out.join(''), directiveEnds };
+}
+
+// Only one branch of an #if is ever compiled, but this scanner reads them all. When a
+// branch does not close what it opens (`#ifdef A` `if (x) {` `#else` `if (y) {` `#endif`,
+// half a function under `#if 0`), every line after it would count as being inside that
+// block. Such a conditional keeps its first branch, and only when it has an #else; alone,
+// it may be off, so it is ignored. Branches that are complete on their own all stay.
+function blankUnevenBranches(out, conditionals, blank) {
+  const net = (a, b) => {
+    let braces = 0, parens = 0;
+    for (let k = a; k < b; k++) {
+      const c = out[k];
+      if (c === '{') braces++;
+      else if (c === '}') braces--;
+      else if (c === '(') parens++;
+      else if (c === ')') parens--;
+    }
+    return braces !== 0 || parens !== 0;
+  };
+  const stack = [];
+  for (const d of conditionals) {
+    if (d.word.startsWith('if')) { stack.push({ marks: [d] }); continue; }
+    const group = stack[stack.length - 1];
+    if (!group) continue;
+    group.marks.push(d);
+    if (d.word !== 'endif') continue;
+    stack.pop();
+    const branches = group.marks.slice(0, -1).map((m, i) => [m.end, group.marks[i + 1].start]);
+    if (!branches.some(([a, b]) => net(a, b))) continue;
+    const hasElse = group.marks.some(m => m.word === 'else');
+    for (const [a, b] of hasElse ? branches.slice(1) : branches) blank(a, b);
+  }
 }
 
 // Looks at the text between the previous boundary and a `{` and decides whether
@@ -48,7 +86,8 @@ function classifyFunctionSegment(seg) {
   if (!s || !s.includes('(')) return undefined;
   if (/^(?:if|for|while|switch|catch|else|do|try)\b/.test(s)) return undefined;
   if (/^(?:namespace|class|struct|union|enum|extern)\b/.test(s) && !/\)\s*(?:const|noexcept|override|final|\s)*$/.test(s)) return undefined;
-  if (!/\)\s*(?:(?:const|volatile|noexcept(?:\s*\([^)]*\))?|override|final|&&?|->[^;{}]*|\s)*)$/.test(s) && !/\)\s*:/.test(s) && !/\)\s*\{?$/.test(s)) return undefined;
+  // After the parameters: qualifiers, a trailing return type, and macros (NOEXCEPT, __THROW, ATTR(x)).
+  if (!/\)\s*(?:(?:const|volatile|noexcept(?:\s*\([^)]*\))?|override|final|&&?|->[^;{}]*|(?:[A-Z_][A-Z0-9_]*|__\w+)\b(?:\s*\((?:[^()]|\([^()]*\))*\))?|\s)*)$/.test(s) && !/\)\s*:/.test(s) && !/\)\s*\{?$/.test(s)) return undefined;
   const nm = s.match(/([~A-Za-z_][\w:~]*(?:\s*<[^()]*>)?|operator\s*[^\s(]+)\s*\(/);
   return { name: nm ? nm[1] : undefined };
 }
@@ -313,6 +352,8 @@ function parameterListOf(head) {
     const named = nameBefore(head, i);
     if (!named) return undefined;
     const close = closingBracket(head, i);
+    // `static inline EXPORT(int) f(int x)`: nothing but specifiers before a call followed by a function: a macro.
+    if (close > 0 && !before.slice(0, named.start).replace(SPECIFIERS, ' ').trim() && /^\s*(?!noexcept\b|requires\b|throw\b|decltype\b|__attribute__\b|alignas\b)[~A-Za-z_][\w:~]*\s*\(/.test(head.slice(close + 1))) { i = close; continue; }
     return { open: i, close: close < 0 ? head.length : close, ...named };
   }
   return undefined;
@@ -332,6 +373,19 @@ function classifyHead(m, segStart, segEnd, scopes) {
   const macros = LEADING_MACROS.exec(seg.slice(start));
   if (macros) start += macros[0].length;
   const unknownMacro = Boolean(macros);
+  // `DISALLOW_COPY(C)` or `Q_DECLARE_METATYPE(x)` alone on a line, without a semicolon, before a declaration.
+  for (;;) {
+    const rest = seg.slice(start);
+    const call = /^[A-Za-z_]\w*[ \t]*\(/.exec(rest);
+    if (!call) break;
+    const close = closingBracket(rest, call[0].length - 1);
+    if (close < 0) break;
+    const lineEnd = /^[ \t]*\r?\n\s*/.exec(rest.slice(close + 1));
+    if (!lineEnd) break;
+    const next = rest.slice(close + 1 + lineEnd[0].length);
+    if (!/^[A-Za-z_~[]/.test(next) || /^(?:const|volatile|noexcept|override|final|requires|try|throw)\b/.test(next)) break;
+    start += close + 1 + lineEnd[0].length;
+  }
   const decl = seg.slice(start);
   const base = { declStart: segStart + start };
   if (!decl.trim()) return { ...base, kind: 'other' };
@@ -377,7 +431,8 @@ function classifyHead(m, segStart, segEnd, scopes) {
     onlyMacros,
     abbreviated: /(?:^|,)\s*(?:const\s+)?auto\b(?!\s*\()/.test(paramText),
     // Compilers drop it when nothing calls it: defined in a class (implicitly inline), or inline/static/constexpr.
-    droppable: Boolean(cls) || /\b(?:inline|static|constexpr|__inline|__inline__|__forceinline)\b/.test(rest.slice(0, params.start)),
+    // A macro in front may be any of those.
+    droppable: Boolean(cls) || /\b(?:inline|static|constexpr|__inline|__inline__|__forceinline)\b|\b[A-Z_][A-Z0-9_]{2,}\b/.test(rest.slice(0, params.start)),
     consteval: /\bconsteval\b/.test(rest.slice(0, params.start))
   };
 }
@@ -462,10 +517,12 @@ function guessCFunctions(text) {
 // Keeping functions that compilers drop when nothing calls them
 
 // Never kept: entry points (taking main's address is not allowed), and functions
-// whose shape is unknown (templates, macros, consteval).
+// that cannot be: templates, consteval, TEST(a, b) { } (no type, so likely a macro).
+// A type in capitals (U32, BOOL) or a macro in front is not reason enough: if the
+// mark turns out not to fit, the compiler says so and only that function loses it.
 const ENTRY_POINTS = new Set(['main', 'wmain', 'WinMain', 'wWinMain', 'DllMain']);
 function keepable(d, all) {
-  if (d.kind !== 'function' || d.templated || d.macroLike || d.consteval || d.onlyMacros || d.scopes.some(s => s.maybeTemplate)) return false;
+  if (d.kind !== 'function' || d.templated || d.macroLike || d.consteval || d.scopes.some(s => s.maybeTemplate)) return false;
   if (ENTRY_POINTS.has(splitQualified(d.name).pop())) return false;
   return all || d.droppable;
 }
@@ -853,6 +910,35 @@ function friendUseLines(text, requests, defs = scanDefinitions(text)) {
   return lines;
 }
 
+// Lines that call functions, for those no other way gave code (`extern inline`,
+// gnu_inline): the result is returned so that the call stays, and the instructions
+// inlined into it map to the function's own lines. A line that does not compile is
+// dropped by the caller. `c` writes C.
+function callLines(defs, { c = false } = {}) {
+  const lines = [];
+  for (const d of defs) {
+    const params = namedParameters(d.paramText);
+    if (params.some(p => !p)) continue;
+    const comps = splitQualified(d.name);
+    const last = comps.pop() || '';
+    const classes = d.scopes.filter(s => s.kind === 'class').map(s => s.name);
+    const namespaces = d.scopes.filter(s => s.kind === 'namespace').flatMap(s => s.name.split('::')).filter(Boolean);
+    const owner = [...classes, ...comps.map(x => x.replace(/<[\s\S]*$/, '').trim())];
+    if (last.startsWith('~') || last === owner[owner.length - 1] || ENTRY_POINTS.has(last)) continue;
+    const names = params.map(p => p.name).join(', ');
+    const list = params.map(p => p.text);
+    const self = owner.join('::');
+    const isConst = /\bconst\b/.test((d.afterParams || '').replace(/->[\s\S]*$/, ''));
+    const member = owner.length > 0 && !d.isStatic;
+    const callee = member ? `__asm_lens_self.${last}` : owner.length ? `${self}::${last}` : last;
+    if (member) list.unshift(`${isConst ? 'const ' : ''}${self}& __asm_lens_self`);
+    const head = c ? (d.returnText || 'int') : 'decltype(auto)';
+    const body = `${head} __asm_lens_call_${lines.length}(${list.join(', ') || (c ? 'void' : '')}) { return ${callee}(${names}); }`;
+    lines.push(namespaces.length ? `${namespaces.map(n => `namespace ${n} {`).join(' ')} ${body} ${namespaces.map(() => '}').join(' ')}` : body);
+  }
+  return lines;
+}
+
 // For each line, the preprocessor condition around it ("#ifdef X"), not counting an include guard.
 function conditionsByLine(text) {
   const lines = text.split(/\r?\n/);
@@ -925,6 +1011,6 @@ async function includeContext(text, target, { follow, dir, depth = 0 } = {}) {
 module.exports = {
   maskCode, classifyFunctionSegment, blankEnclosingDeclaration,
   scanDefinitions, guessCFunctions, keepHeaderFunctions, keepByAddress, templateTargetAt, appendInstantiations,
-  autoInstantiations, templateUsesIn, friendUseLines, conditionAt, conditionsByLine, includeContext,
+  autoInstantiations, templateUsesIn, friendUseLines, callLines, conditionAt, conditionsByLine, includeContext,
   defaultTemplateArgs, splitQualified, splitTemplatePrefixes, lineLocator, classifyHead
 };

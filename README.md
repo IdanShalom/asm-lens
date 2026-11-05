@@ -144,17 +144,21 @@ types when clicked. Types you chose with **Instantiate…** replace these. `asmL
 turns this off.
 
 **Headers and the files that include them.** Opening a header after analyzing a file that includes it compiles
-the header by itself, once for each saved version (not with `"reanalyzeOn": "never"`). A header that fails on its
-own, has functions that do not compile, or has functions switched off by an `#if` is compiled again with the
-preprocessor lines that come before its `#include` in that file (or in a source file found in the workspace), since
-it may rely on them, and the better of the two results is kept.
+the header by itself, once for each saved version (not with `"reanalyzeOn": "never"`). A header with functions that
+lack code (compile errors, an `#if` that is off, templates without types) is also compiled the way the files
+including it see it: with the preprocessor lines before its `#include`, and with their entries in
+`compile_commands.json`, directly or through other headers. Files that were analyzed come first, then those of the
+database, else one found in the workspace. The best result is the main one, and the others fill in what it lacks, so
+a function behind `-DFEATURE_A` and one behind `-DFEATURE_B` can both show code.
 
-### compile_commands.json (local mode)
+### compile_commands.json
 
 With `"compileCommands"` in `.asm-lens.json` (or the `asmLens.compileCommands` setting), each file is
 compiled the way your build compiles it: with the compiler and flags of its entry in the
 `compile_commands.json` database that CMake (`-DCMAKE_EXPORT_COMPILE_COMMANDS=ON`), Bear, Meson and
-others write.
+others write. A header takes the entries of the files that include it, also through other headers. In remote mode
+the entry's defines, include folders, language standard and target options (`-m...`) are used, and the
+flags in `.asm-lens.json` come after them.
 
 ```jsonc
 {
@@ -384,12 +388,13 @@ mode, where your own compiler and system headers are used.
 - **"No separate code in user.cpp (inlined or not used)"**: that `.cpp` has no code to attribute to this
   function, and the header has not been compiled by itself (`"reanalyzeOn": "never"`). Click the CodeLens.
 - **"Template: no code yet"**: it does not compile with the types tried. Click the CodeLens to choose its types.
-- **"Not compiled · inside #ifdef X, which is off"**: the preprocessor removed the function. Add the define to
-  `"defines"` in `.asm-lens.json`, or analyze a file that defines it before including the header.
-- **"Not compiled · this function has compile errors"**: it does not compile here, even with what comes before
-  the `#include`. The Asm Lens output has the compiler's message.
-- **"No code: the compiler left it out"**: `asmLens.emitUnusedFunctions` is off and nothing uses it, or the marks
-  that keep unused functions were not accepted.
+- **"Not compiled · inside #ifdef X, which is off"**: no file that includes this one turns it on, in the files
+  analyzed or in `compile_commands.json`. Add the define to `"defines"` in `.asm-lens.json`.
+- **"Not compiled · ..."** with a compiler's message: it does not compile here, even with what comes before the
+  `#include`. The other functions are not affected.
+- **"for -mavx2 (not in your flags)"**: a SIMD helper needs that feature, so it was compiled for it, to show its code.
+- **"No code found · click for details"**: everything was tried, and the compiler produced nothing for it. The
+  Asm Lens output says what happened; please report it, with the function, if it does not make sense.
 - **Local mode on macOS: errors in C++11 code** (`'auto' type specifier is a C++11 extension`): Apple
   clang 14 and older compile C++98 by default. Asm Lens then adds `-std=gnu++17` (the default of current
   compilers and of Compiler Explorer) and says so in the output; put a `-std=...` in your flags to choose.
@@ -447,7 +452,7 @@ There are no runtime dependencies and no build step: the extension is plain Java
 Every push builds the `.vsix` on GitHub Actions (tests on Windows, Linux and macOS first); it is attached to
 the workflow run.
 
-To release, set the new version in `package.json` and push a matching tag such as `v0.8.4`. That creates a
+To release, set the new version in `package.json` and push a matching tag such as `v0.8.5`. That creates a
 GitHub release with the `.vsix` and publishes it to the Visual Studio Marketplace with
 [Trusted Publishing](https://code.visualstudio.com/api/working-with-extensions/publishing-extension), so no
 token is stored. It needs a policy for this repository and `build-vsix.yml` on the publisher's Trusted

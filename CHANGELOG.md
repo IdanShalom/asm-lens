@@ -1,8 +1,15 @@
 # Changelog
 
-## 0.8.4
+## 0.8.5
 
 ### New
+- **`compile_commands.json` decides for headers too.** A header takes the compile command of each file in the database
+  that includes it, also through other headers, until its functions have code: one behind `-DFEATURE_A` and one
+  behind `-DFEATURE_B` can both show it. In remote mode the entry's defines, include folders, standard and target
+  options are used as well.
+- Functions that still have no code are called from added lines after the end of the compiled copy, which shows
+  their code if they compile at all (`extern inline`, `gnu_inline`).
+- A *Not compiled* CodeLens gives the compiler's message.
 - **Headers show code without a click.** Opening a header after analyzing a `.cpp` that includes it compiles the
   header by itself, so every function shows code: `static inline` ones the `.cpp` inlined or never called too.
 - **Templates show code at once**, with the types the code uses (`Box<long>` in the `.cpp`), else `int`. The
@@ -21,6 +28,25 @@
   server's operators can tell its traffic apart.
 
 ### Fixes
+- **`static inline` functions showed no code when their type was in capitals** (`U32`, `BOOL`, `DWORD`): such a type
+  was taken for a macro, and the function was not kept. Inline functions and methods too, with every compiler.
+- **A macro after the parameters hid the function** (`int f(int x) NOEXCEPT {`, `__THROW`, `ATTR(1)`), and `EXPORT(int)
+  f(int x)` was taken for a function named `EXPORT`.
+- **One function that cannot be emitted cost all of them.** Some errors appear only when a function is emitted, which
+  made Asm Lens compile the whole file without keeping anything. Now only that function says *Not compiled*, with
+  the compiler's reason.
+- A header that needs a define from a file it includes earlier (`#include "config.h"` before it) stayed off.
+- With a language server still starting during the analysis, a function could lose its code when the server's symbol
+  started on another line than the one used then.
+- **Code the preprocessor splits hid everything after it.** `#ifdef` around half a block or a signature, `#if 0` with half
+  a function, and a digit separator (`1'000`) made every later line count as inside that function, so later functions
+  were not kept. A macro alone on a line without a semicolon (`DISALLOW_COPY(C)`) hid the function after it.
+- **`-Werror` in the flags stopped analyses**: GCC's "`#pragma once` in main file" for a header, and warnings that appear
+  only when an unused function is emitted. It is left out here, since warnings do not change the code.
+- A forced include or precompiled header that already includes the header being compiled hid all of it. It is left out then.
+- A SIMD helper without the flag for it (`-mavx2`) is compiled for that feature, and the CodeLens says so.
+- `-flto` in `compile_commands.json` gave no assembly at all: with it, `-S` writes LTO data or LLVM IR. Left out now, with
+  `-gsplit-dwarf`, coverage and other instrumentation, and flags that leave reports in the build folder.
 - **Overloaded functions had no code with MSVC** ("not used, or a template never instantiated"): they are kept by
   taking their address, and `&name` does not compile for an overloaded name. They are now selected by their type.
   Overloaded function templates too, with every compiler.

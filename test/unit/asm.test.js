@@ -503,3 +503,33 @@ test('instantiationOf: what a function was instantiated for', () => {
   assert.equal(instantiationOf('plain(int)'), '');
   assert.equal(instantiationOf('bool operator< <int>(Box<int> const&)'), '');
 });
+
+test('errorLinesIn: where an error is, and the lines that led to it', () => {
+  const { errorLinesIn } = require('../../src/asm');
+  const isMain = f => f === '<source>';
+  const gcc = errorLinesIn([
+    "/x/avx2intrin.h:119:1: error: inlining failed in call to 'always_inline' '_mm256_add_epi32': target specific option mismatch",
+    '  119 | _mm256_add_epi32 (__m256i __A, __m256i __B)',
+    '<source>:3:26: note: called from here',
+    "<source>:9:5: error: 'x' was not declared in this scope",
+    '<source>:12:1: note: declared here'
+  ].join('\n'), isMain);
+  assert.deepEqual([...gcc], [[2, "inlining failed in call to 'always_inline' '_mm256_add_epi32': target specific option mismatch"], [8, "'x' was not declared in this scope"]]);
+  const msvc = errorLinesIn("<source>(4): error C2228: left of '.x'\n<source>(20): note: see reference to class template instantiation 'A<int>' being compiled\n", isMain);
+  assert.deepEqual([...msvc], [[3, "left of '.x'"], [19, "left of '.x'"]]);
+  const clang = errorLinesIn("<source>:2:10: error: always_inline function requires target feature\n<source>:7:3: note: in instantiation of function template specialization 'f<int>' requested here\n", isMain);
+  assert.deepEqual([...clang.keys()], [1, 6]);
+  const gccFeature = errorLinesIn("/x/avx2intrin.h:119:1: error: inlining failed in call to 'always_inline' 'a': target specific option mismatch\n<source>:3:26: note: called from here\n", isMain);
+  assert.equal(gccFeature.features.get(2), 'avx2');
+  const clangFeature = errorLinesIn("<source>:3:10: error: always_inline function '_mm256_add_epi32' requires target feature 'avx2', but would be inlined into function 'add8' that is compiled without support for 'avx2'\n", isMain);
+  assert.equal(clangFeature.features.get(2), 'avx2');
+  assert.equal(errorLinesIn("<source>:3:10: error: 'x' was not declared\n", isMain).features.size, 0);
+});
+
+test('findAllFunctionResults: a symbol that starts on another line than the one matched during the analysis', () => {
+  const { findAllFunctionResults } = require('../../src/asm');
+  const range = (a, b) => ({ start: { line: a }, end: { line: b } });
+  const fn = { name: 'f(int)', sourceName: 'f', sourceRange: range(4, 6), instructionRows: [{ text: 'ret', ref: { key: 'k', line: 5 } }], rows: [], count: 1, fileKeys: new Set(['k']) };
+  assert.equal(findAllFunctionResults({ name: 'f', range: range(5, 6) }, [fn], 'k', 'k').length, 1, 'same name, same place');
+  assert.equal(findAllFunctionResults({ name: 'f', range: range(20, 22) }, [fn], 'k', 'k').length, 0, 'an overload elsewhere is not it');
+});
