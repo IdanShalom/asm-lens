@@ -717,3 +717,14 @@ test('templateTargetAt: what is saved for a request has not changed', () => {
   assert.deepEqual(scan.templateTargetAt(src, 1).make(['int']), { kind: 'class', expr: 'B<int*>', keyword: 'struct', member: 'B<int*>::q' });
   assert.deepEqual(scan.templateTargetAt(src, 2).make(['int']), { kind: 'address', expr: 'f<int>' });
 });
+
+test('templateAtLine: which template a line of the file belongs to', () => {
+  const src = 'template <class T> struct Box {\n  T get() const { return T{}; }\n  struct In { T i() const { return T{}; } };\n  int data;\n};\nstatic int plain() { return 1; }\nnamespace ns { template <class T> T twice(T x) { return x; } }\n';
+  assert.equal(scan.templateAtLine(src, 1).name, 'Box');
+  assert.equal(scan.templateAtLine(src, 1).fn.name, 'get');
+  assert.equal(scan.templateAtLine(src, 2).name, 'Box::In');
+  assert.equal(scan.templateAtLine(src, 3).name, 'Box');
+  assert.equal(scan.templateAtLine(src, 5).name, undefined, 'not a template');
+  assert.equal(scan.templateAtLine(src, 6).name, 'ns::twice');
+  assert.deepEqual(scan.templateAtLine(src, 7), {});
+});

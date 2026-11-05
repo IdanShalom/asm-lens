@@ -2,7 +2,7 @@
   "name": "asm-lens",
   "displayName": "Asm Lens",
   "description": "See the assembly of every function right in the editor: instruction counts as CodeLens, two-way source/assembly highlighting, headers and templates. Uses Compiler Explorer or your local compiler. C, C++, Rust, Go, Python, Zig, Swift, D and Fortran.",
-  "version": "0.8.7",
+  "version": "0.8.8",
   "publisher": "IdanShalom",
   "license": "MIT",
   "icon": "images/icon.png",

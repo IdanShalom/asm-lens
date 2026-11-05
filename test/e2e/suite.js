@@ -131,6 +131,21 @@ exports.run = async () => {
     } finally { api.window.showInputBox = realBox; }
   });
 
+  await check('an added class the compiler\'s notes do not name is dropped, and the file keeps its functions', async () => {
+    const ext = vscode.extensions.all.find(e => /asm-lens$/i.test(e.id));
+    const api = Module._load('vscode', { filename: path.join(ext.extensionPath, 'src', 'extension.js') }, false);
+    const realBox = api.window.showInputBox;
+    api.window.showInputBox = async () => 'S';
+    try {
+      await vscode.commands.executeCommand('asmLens.instantiateTemplate', uriOf('templates/no_chain.hxx'), 3);
+      const lenses = await settled('templates/no_chain.hxx');
+      assert.match(at(lenses, 4), /^\$\(symbol-numeric\) \d+ instructions · Box<S>/, at(lenses, 4));
+      assert.match(at(lenses, 5), /Box<S>::broken does not compile/, at(lenses, 5));
+      for (const line of [8, 9]) assert.match(at(lenses, line), CODE, at(lenses, line));
+      assert.ok(!lenses.some(l => /Not compiled/.test(l.title)), JSON.stringify(lenses));
+    } finally { api.window.showInputBox = realBox; }
+  });
+
   await check('nothing is sent before the question is answered (tests answer no dialog)', async () => {
     const real = globalThis.fetch;
     const urls = [];

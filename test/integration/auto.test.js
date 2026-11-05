@@ -202,6 +202,46 @@ async function brokenMember(config) {
   assert.deepEqual(x.ext._internals.instantiationsFor(x.open('broken_member.hxx')).map(i => i.expr), ['Box<S>']);
 }
 
+// An error Clang's notes do not connect to the line that was added: inside the class, or in another header.
+async function noChain(config) {
+  const text = fs.readFileSync(path.join(FIXTURES, 'templates', 'no_chain.hxx'), 'utf8');
+  const x = start(makeProject({ 'no_chain.hxx': text }, config), { settings: { 'asmLens.reanalyzeOn': 'never', 'asmLens.autoInstantiateTemplates': false } });
+  const r = await x.instantiate('no_chain.hxx', 4, 'S');
+  assert.deepEqual([r.error, r.warning], [[], []], x.state.outputLines.slice(-10).join('\n'));
+  const lenses = main(await x.lenses('no_chain.hxx'));
+  const at = l => lenses.find(k => k.line === l)?.title || '';
+  assert.match(at(4), CODE, `get: ${at(4)}\n${x.state.outputLines.slice(-10).join('\n')}`);
+  assert.match(at(5), /^\$\(warning\) Box<S>::broken does not compile: /, at(5));
+  for (const line of [8, 9]) assert.match(at(line), CODE, `line ${line}: the file is not at fault: ${at(line)}`);
+  assert.ok(!lenses.some(l => /Not compiled/.test(l.title)), JSON.stringify(lenses.map(l => l.title)));
+}
+
+async function noChainOtherFile(config) {
+  const x = start(makeProject({
+    'no_chain_other.hxx': fs.readFileSync(path.join(FIXTURES, 'templates', 'no_chain_other.hxx'), 'utf8'),
+    'no_chain_cell.h': fs.readFileSync(path.join(FIXTURES, 'templates', 'no_chain_cell.h'), 'utf8')
+  }, config), { settings: { 'asmLens.reanalyzeOn': 'never', 'asmLens.autoInstantiateTemplates': false } });
+  await x.analyze('no_chain_other.hxx');
+  const r = await x.instantiate('no_chain_other.hxx', 3, 'S');
+  assert.deepEqual(r.error, [], `the analysis goes on\n${x.state.outputLines.slice(-10).join('\n')}`);
+  const lenses = main(await x.lenses('no_chain_other.hxx'));
+  const at = l => lenses.find(k => k.line === l)?.title || '';
+  assert.match(at(3), CODE, `get: ${at(3)}\n${x.state.outputLines.slice(-10).join('\n')}`);
+  assert.match(at(8), CODE, `a function of the file: ${at(8)}`);
+}
+
+// That is not the same as a file that does not compile by itself: its error is still reported.
+async function headerWithItsOwnError(config) {
+  const x = start(makeProject({
+    'h.hxx': '#include "bad.h"\nstatic inline int plain_one(int x) { return x + 1; }\ntemplate <class T> struct B { T b() const { return T{}; } };\n',
+    'bad.h': '#pragma once\ninline int bad() { return nope(); }\n'
+  }, config), { settings: { 'asmLens.reanalyzeOn': 'never' } });
+  const r = await x.analyze('h.hxx');
+  const lens = await x.lensAt('h.hxx', 2) || '';
+  assert.ok(r.error.length > 0 || /Not compiled|^\$\(symbol-numeric\)/.test(lens), `no error and no result: ${lens}`);
+  assert.ok(!/does not compile: .*nope/.test(await x.lensAt('h.hxx', 3) || ''), 'an added line is not blamed for an error of the file');
+}
+
 // Types chosen by hand that need what the .cpp includes, or a standard header nobody included.
 async function chosenTypes(config) {
   const types = '#pragma once\nstruct Point { int x, y; Point operator+(const Point& o) const { return {x + o.x, y + o.y}; } };\n';
@@ -226,6 +266,9 @@ async function chosenTypes(config) {
 
 for (const cc of localCompilers()) {
   const config = { mode: 'local', compiler: cc, flags: '-O2 -std=c++20' };
+  test(`local ${cc}: an added class the compiler's notes do not name`, () => noChain({ mode: 'local', compiler: cc, flags: '-O2 -std=c++17' }));
+  test(`local ${cc}: the same, with the error in another header`, () => noChainOtherFile({ mode: 'local', compiler: cc, flags: '-O2 -std=c++17' }));
+  test(`local ${cc}: a file that does not compile by itself still reports its error`, () => headerWithItsOwnError({ mode: 'local', compiler: cc, flags: '-O2 -std=c++17' }));
   test(`local ${cc}: a member template overloaded through SFINAE, with a macro that is gone`, () => sfinaeMacro({ mode: 'local', compiler: cc, flags: '-O2 -std=c++17' }));
   test(`local ${cc}: one member that does not compile costs only itself`, () => brokenMember({ mode: 'local', compiler: cc, flags: '-O2 -std=c++17' }));
   test(`local ${cc}: two builds of a file in compile_commands.json`, () => twoBuilds({ cc, json: { mode: 'local' } }, '-DBUILD_A', '-DBUILD_B', 'BUILD_A', 'BUILD_B'));
@@ -247,6 +290,8 @@ for (const id of ['g152', 'clang2010', 'vcpp_v19_latest_x64']) {
   const config = { flags: '-O2 -std=c++20', compilers: [{ id, name: id }] };
   const msvc = /^vcpp/.test(id);
   const remote = fn => async () => { const ce = installFetch(); try { await fn(); } finally { ce.restore(); } };
+  test(`remote ${id} (Compiler Explorer): an added class the compiler's notes do not name`, remote(() => noChain({ flags: '-O2 -std=c++17', compilers: [{ id, name: id }] })));
+  test(`remote ${id} (Compiler Explorer): the same, with the error in another header`, remote(() => noChainOtherFile({ flags: '-O2 -std=c++17', compilers: [{ id, name: id }] })));
   test(`remote ${id} (Compiler Explorer): a member template overloaded through SFINAE, with a macro that is gone`, remote(() => sfinaeMacro({ flags: '-O2 -std=c++17', compilers: [{ id, name: id }] })));
   test(`remote ${id} (Compiler Explorer): one member that does not compile costs only itself`, remote(() => brokenMember({ flags: '-O2 -std=c++17', compilers: [{ id, name: id }] })));
   test(`remote ${id} (Compiler Explorer): types in capitals, macros around the signature`, remote(() => realWorld(config)));

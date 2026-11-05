@@ -822,9 +822,9 @@ function memberLines(it, index, text, defs) {
     const expr = `${owner}::${name}`;
     // An overload set has no plain form: only its type says which one is meant.
     const cast = count.get(`${owner}::${fn}`) > 1 && known ? pointerTypeOf(d, owner, subst) : undefined;
-    if (cast) return { text: inScope(`auto ${id} = static_cast<${cast}>(&${expr});`), expr };
+    if (cast) return { text: inScope(`auto ${id} = static_cast<${cast}>(&${expr});`), expr, def: d };
     const rob = `__asm_lens_rob_${index}_${j}`;
-    return { text: `auto ${id} = &${expr};`, expr, ifPrivate: `template <auto P> struct ${rob} { static inline auto kept = P; }; template struct ${rob}<&${expr}>;` };
+    return { text: `auto ${id} = &${expr};`, expr, def: d, ifPrivate: `template <auto P> struct ${rob} { static inline auto kept = P; }; template struct ${rob}<&${expr}>;` };
   }).filter(Boolean);
 }
 
@@ -902,6 +902,18 @@ function templateUsesIn(text, name, defs = scanDefinitions(text), m = maskCode(t
     if (args && !/\bauto\b|\.\.\./.test(args) && !out.includes(args)) out.push(args);
   }
   return out;
+}
+
+// What `line` of the file belongs to: the function around it, and the template name of it or of its class.
+function templateAtLine(text, line, defs = scanDefinitions(text)) {
+  const fn = defs.filter(d => d.kind === 'function' && d.startLine <= line && line <= d.endLine).sort((a, b) => b.startLine - a.startLine)[0];
+  if (fn) {
+    const target = fn.templated ? templateTargetAt(text, fn.nameLine ?? fn.startLine, defs, fn) : undefined;
+    return { fn, name: target && !target.unsupported ? templateName(target.label) : undefined };
+  }
+  const cls = defs.filter(d => d.kind === 'class' && d.templated && d.startLine <= line && line <= d.endLine).sort((a, b) => b.startLine - a.startLine)[0];
+  if (!cls) return {};
+  return { name: [...cls.scopes.flatMap(s => String(s.name || '').split('::')).filter(Boolean), cls.name].join('::') };
 }
 
 // A template without its arguments: Box<int>::conv<float> is Box::conv.
@@ -1148,6 +1160,6 @@ async function includeContext(text, target, { follow, dir, depth = 0 } = {}) {
 module.exports = {
   maskCode, classifyFunctionSegment, blankEnclosingDeclaration,
   scanDefinitions, guessCFunctions, keepHeaderFunctions, keepByAddress, templateTargetAt, appendInstantiations,
-  autoInstantiations, instantiationLines, appendLines, templateUsesIn, templateName, includesForTypes, friendUseLines, callLines, conditionAt, conditionsByLine, includeContext,
+  autoInstantiations, instantiationLines, appendLines, templateUsesIn, templateName, templateAtLine, includesForTypes, friendUseLines, callLines, conditionAt, conditionsByLine, includeContext,
   defaultTemplateArgs, splitQualified, splitTemplatePrefixes, lineLocator, classifyHead
 };

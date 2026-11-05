@@ -459,7 +459,7 @@ There are no runtime dependencies and no build step: the extension is plain Java
 Every push builds the `.vsix` on GitHub Actions (tests on Windows, Linux and macOS first); it is attached to
 the workflow run.
 
-To release, set the new version in `package.json` and push a matching tag such as `v0.8.7`. That creates a
+To release, set the new version in `package.json` and push a matching tag such as `v0.8.8`. That creates a
 GitHub release with the `.vsix` and publishes it to the Visual Studio Marketplace with
 [Trusted Publishing](https://code.visualstudio.com/api/working-with-extensions/publishing-extension), so no
 token is stored. It needs a policy for this repository and `build-vsix.yml` on the publisher's Trusted

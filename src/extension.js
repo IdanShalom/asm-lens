@@ -1177,6 +1177,48 @@ function nextForm(prepared, state, line, message, classLevel) {
   return out;
 }
 
+// The lines added after the file that are still there and can be at fault.
+function addedLinesIn(source, firstLine) {
+  if (firstLine === undefined || firstLine < 0) return [];
+  const rows = String(source).split('\n');
+  const out = [];
+  for (let i = firstLine; i < rows.length; i++) {
+    const t = rows[i].trim();
+    if (t && !/^#\s*include\b|^using\s+namespace\b/.test(t)) out.push(i);
+  }
+  return out;
+}
+
+function blankLines(text, lines) {
+  return lines.reduce((t, l) => blankLine(t, l), text);
+}
+
+// The added line at fault, when the file compiles without the added lines and the compiler's notes
+// do not reach any of them: its notes for `template class X<T>;` can end inside the class, or in another
+// file. The last place the notes name in this file says which request, and failing that, halves of
+// the lines are compiled until one is left. `compiles(text)`: whether that text compiles.
+async function addedLineAtFault(source, lines, prepared, state, errors, compiles) {
+  const infos = lines.map(l => ({ l, info: state.added.get(l) ?? prepared?.lines?.[l - prepared.firstLine] })).filter(x => x.info);
+  if (prepared?.defs) {
+    for (const at of [...errors.keys()].filter(l => l < prepared.firstLine).reverse()) {
+      const { fn, name } = scan.templateAtLine(prepared.text, at, prepared.defs);
+      const exact = fn && infos.find(x => x.info.def === fn);
+      if (exact) return exact.l;
+      if (!name) continue;
+      const hit = infos.find(x => !x.info.def && (name === scan.templateName(x.info.expr) || name.startsWith(`${scan.templateName(x.info.expr)}::`)));
+      if (hit) return hit.l;
+    }
+  }
+  let left = lines;
+  while (left.length > 1) {
+    report('finding the added line that does not compile…');
+    const half = left.slice(0, Math.ceil(left.length / 2));
+    const rest = left.slice(half.length);
+    left = await compiles(blankLines(source, lines.filter(l => !half.includes(l)))) ? rest : half;
+  }
+  return left[0];
+}
+
 function setLine(text, line, value) {
   if (!value) return blankLine(text, line);
   const lines = text.split('\n');
@@ -1894,7 +1936,7 @@ function prepareCSource(document, { marks = 'attribute', compiler = '', calls, c
   return {
     isHeader, firstLine: appended ? (base.match(/\n/g) || []).length + before.length : -1,
     lines, manualRequests: insts.length, instCount: lines.filter(l => l.request < insts.length).length,
-    callTargets: called.targets, kept, plain
+    callTargets: called.targets, kept, plain, defs, text: original
   };
 }
 
@@ -2316,7 +2358,7 @@ async function analyzeLocal(document, resolved, settings, { context, calls } = {
     report(attempt === 1 ? `compiling with ${path.basename(compiler)}…` : `compiling again (${attempt}/${maxAttempts}), working around errors…`);
     const r = await runProcess(compiler, args, { cwd, input: `${prefix}${source}`, timeoutMs });
     if (r.code === 0) { asm = r.stdout; break; }
-    const err = r.stderr.replace(ANSI_RE, '');
+    let err = r.stderr.replace(ANSI_RE, '');
     let progressed = false;
     // A compiler whose default is C++98 (Apple clang 14, GCC 5) and no -std given -> C++17, the default of current ones.
     if (lang === 'c++' && !addedStd && !baseArgs.some(a => /^-std=/.test(a)) && flagsLib.needsNewerStd(err)) {
@@ -2350,15 +2392,26 @@ async function analyzeLocal(document, resolved, settings, { context, calls } = {
       const first = firstErrorMessage(err);
       const lineErrors = errorLinesIn(err, isMain);
       const hit = instantiationLinesIn(err, prepared.firstLine, isMain, prepared.instCount);
-      for (const l of hit) {
-        if (failedLines.has(l)) continue;
-        const message = lineErrors.get(l) || first;
-        const step = nextForm(prepared, requestState, l, message, hit.classLevel?.has(l));
+      const take = (l, message, classLevel) => {
+        const step = nextForm(prepared, requestState, l, message, classLevel);
         for (const [line, value] of step.edits) { source = setLine(source, line, value); plainSource = setLine(plainSource, line, value); }
         if (step.dropped) { failedLines.add(l); failedMessages.set(l, message); }
         for (const other of step.alsoGone || []) { failedLines.add(other); failedMessages.set(other, message); }
         if (step.failedRequest !== undefined && step.failedRequest < prepared.manualRequests) failedInstantiations.push({ index: step.failedRequest, message });
         progressed = true;
+      };
+      for (const l of hit) if (!failedLines.has(l)) take(l, lineErrors.get(l) || first, hit.classLevel?.has(l));
+      // Nothing added is blamed, yet it may be at fault: the file without those lines tells. From here on
+      // the errors are the file's own, so that a function of the file is never blamed for a line added to it.
+      if (!progressed) {
+        const added = addedLinesIn(source, prepared.firstLine);
+        if (added.length) {
+          const run = text => runProcess(compiler, args, { cwd, input: `${prefix}${text}`, timeoutMs });
+          const without = await run(blankLines(source, added));
+          if (without.code === 0) {
+            take(await addedLineAtFault(source, added, prepared, requestState, lineErrors, async text => (await run(text)).code === 0), first, false);
+          } else err = without.stderr.replace(ANSI_RE, '');
+        }
       }
     }
     // Other errors while functions are kept. If the text as written fails too, the errors are the
@@ -2366,7 +2419,7 @@ async function analyzeLocal(document, resolved, settings, { context, calls } = {
     // (a SIMD helper built without -mavx2, a mark that does not fit): only that function loses its mark.
     let errors = err;
     if (!progressed && keptHeader) {
-      const check = await runProcess(compiler, args, { cwd, input: `${prefix}${plainSource}`, timeoutMs });
+      const check = await runProcess(compiler, args, { cwd, input: `${prefix}${blankLines(plainSource, addedLinesIn(plainSource, prepared.firstLine))}`, timeoutMs });
       if (check.code === 0) {
         const off = unmarkFunctions(source, prepared.plain, errorLinesIn(err, isMain));
         if (off) {
@@ -2709,10 +2762,8 @@ async function compileWithRecovery(opts) {
     const firstMessage = firstErrorMessage(lastErr);
     const lineErrors = errorLinesIn(lastErr, isRemoteMain);
     const hit = instantiationLinesIn(lastErr, opts.instFirstLine ?? -1, isRemoteMain, opts.instCount ?? 0);
-    for (const l of hit) {
-      if (failedLines.has(l)) continue;
-      const message = lineErrors.get(l) || firstMessage;
-      const step = nextForm(opts.prepared, requestState, l, message, hit.classLevel?.has(l));
+    const take = (l, message, classLevel) => {
+      const step = nextForm(opts.prepared, requestState, l, message, classLevel);
       for (const [line, value] of step.edits) {
         source = setLine(source, line, value);
         if (plainSource !== undefined) plainSource = setLine(plainSource, line, value);
@@ -2721,15 +2772,30 @@ async function compileWithRecovery(opts) {
       for (const other of step.alsoGone || []) { failedLines.add(other); failedMessages.set(other, message); }
       if (step.failedRequest !== undefined && step.failedRequest < (opts.prepared?.manualRequests ?? 0)) failedInstantiations.push({ index: step.failedRequest, message });
       progressed = true;
-    }
+    };
+    for (const l of hit) if (!failedLines.has(l)) take(l, lineErrors.get(l) || firstMessage, hit.classLevel?.has(l));
     if (progressed) continue;
+
+    // 2b. Nothing added is blamed, yet it may be at fault: the file without those lines tells. From here on
+    // the errors are the file's own, so that a function of the file is never blamed for a line added to it.
+    const added = addedLinesIn(source, opts.instFirstLine ?? -1);
+    if (added.length) {
+      const compile = text => postCompile({ ...opts, source: text, files, flags });
+      const compiled = d => d.code === undefined || d.code === 0;
+      const without = await compile(blankLines(source, added));
+      if (compiled(without)) {
+        take(await addedLineAtFault(source, added, opts.prepared, requestState, lineErrors, async text => compiled(await compile(text))), firstMessage, false);
+        continue;
+      }
+      lastErr = stderrText(without) || lastErr;
+    }
 
     // 3. Other errors while functions are kept. If the text as written fails too, the errors are the
     // file's own: those functions are skipped below. If it compiles, emitting a function is what fails
     // (a SIMD helper built without -mavx2, a mark that does not fit): only that function loses its mark.
     if (opts.kept) {
       report('checking the file as written…');
-      const check = await postCompile({ ...opts, source: plainSource, files, flags });
+      const check = await postCompile({ ...opts, source: blankLines(plainSource, addedLinesIn(plainSource, opts.instFirstLine ?? -1)), files, flags });
       if (check.code === undefined || check.code === 0) {
         const off = unmarkFunctions(source, opts.original, errorLinesIn(lastErr, isRemoteMain));
         if (off) { source = off.text; noteUnmarked(off, mainKey, unkept, retargeted); continue; }

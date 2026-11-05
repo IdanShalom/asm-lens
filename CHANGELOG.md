@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.8.7
+## 0.8.8
 
 ### New
 - **Every build of a file counts.** A file listed more than once in `compile_commands.json` (a 32-bit and a 64-bit build,
@@ -36,6 +36,12 @@
   server's operators can tell its traffic apart.
 
 ### Fixes
+- **A line Asm Lens added could be blamed on your code, or stop the analysis.** For `template struct Box<S>;` Clang's notes can
+  end inside the class or in another header without naming that line, so nothing added was blamed. Then a function
+  of the file was marked *Not compiled* for it, or the analysis stopped with the error. When nothing added is blamed, the
+  file is now compiled without those lines. If that works, the added line at fault is found, from where the notes
+  end or by trying halves of them, and dropped: silently if nobody asked for it, with a warning if it was your request
+  and nothing of it compiles. Only the file's own errors can make a function *Not compiled*.
 - **A member template overloaded through SFINAE could not be instantiated** when its return type used a macro that is
   `#undef`'d later in the file: the cast selecting the overload was copied from the source, to a place where the macro no
   longer exists. The plain `&Box<int>::get<int>` is tried first now, since explicit arguments usually leave one

@@ -1894,3 +1894,77 @@ test('an error in the class itself: all its members go at once, not one per comp
     assert.deepEqual(x.ext._internals.instantiationsFor(x.open('m.h')), []);
   } finally { ce.restore(); }
 });
+
+// ---------------------------------------------------------------------------
+// 0.8.8: an added line nobody names is still found, and never blamed on the file
+
+// Like Clang: the error is in another template, and the notes end inside the class, before the added line.
+const NO_CHAIN_FILE = 'template <class U> struct Cell { U weak() const { return (U)1; } };\nstruct S { int a; };\ntemplate <class T> struct Box {\n  T get() const { return T{}; }\n  T broken() const { return Cell<S>{}.weak(); }\n};\nstatic inline int plain(int x) { return x; }\n';
+function noChainReply(body) {
+  const lines = body.source.split('\n');
+  const whole = lines.indexOf('template struct Box<S>;');
+  const member = lines.findIndex(l => l.includes('&Box<S>::broken'));
+  if (whole >= 0) return { code: 1, stderr: err("<source>:1:40: error: no matching conversion", "<source>:5:37: note: in instantiation of member function 'Cell<S>::weak' requested here") };
+  if (member >= 0) return { code: 1, stderr: err("<source>:1:40: error: no matching conversion", "<source>:5:37: note: in instantiation of member function 'Cell<S>::weak' requested here", `<source>:${member + 1}:8: note: in instantiation of member function 'Box<S>::broken' requested here`) };
+  return { code: 0, asm: [...asmFor(['plain(int)', 7]), ...(lines.some(l => l.includes('&Box<S>::get')) ? asmFor(['Box<S>::get() const', 4]) : [])] };
+}
+
+test('an added class the notes do not name: found from where they end, and the file keeps its functions', async () => {
+  const dir = makeProject({ 'h.hxx': NO_CHAIN_FILE });
+  const ce = fakeCompilerExplorer(noChainReply);
+  try {
+    const x = start(dir, { settings: { 'asmLens.reanalyzeOn': 'never', 'asmLens.autoInstantiateTemplates': false } });
+    const msg = await x.instantiate('h.hxx', 4, 'S');
+    assert.deepEqual([msg.error, msg.warning], [[], []], 'the part that compiles is there');
+    assert.equal(await x.lensAt('h.hxx', 7), '$(symbol-numeric) 2 instructions · g152 · -O2', 'the file is not at fault');
+    assert.match(await x.lensAt('h.hxx', 4), /^\$\(symbol-numeric\) 2 instructions · Box<S>/);
+    assert.match(await x.lensAt('h.hxx', 5), /^\$\(warning\) Box<S>::broken does not compile: no matching conversion/);
+    assert.ok(!(x.analysis('h.hxx').skipped || []).length, 'nothing of the file counts as not compiling');
+    assert.deepEqual(x.ext._internals.instantiationsFor(x.open('h.hxx')).map(i => i.expr), ['Box<S>']);
+  } finally { ce.restore(); }
+});
+
+test('an added line with no note in this file at all: found by compiling halves of the added lines', async () => {
+  const src = 'template <class T> struct A { T a() const { return T{}; } };\ntemplate <class T> struct B { T b() const { return T{}; } };\ntemplate <class T> struct C { T c() const { return T{}; } };\n';
+  const dir = makeProject({ 'h.hxx': src });
+  const ce = fakeCompilerExplorer(body => {
+    // The error is in another header, whichever line causes it.
+    if (body.source.includes('template struct B<int>;') || body.source.includes('&B<int>::b')) return { code: 1, stderr: err('other.h:9:9: error: this fails for B') };
+    return { code: 0, asm: [...(body.source.includes('template struct A<int>;') ? asmFor(['A<int>::a() const', 1]) : []), ...(body.source.includes('template struct C<int>;') ? asmFor(['C<int>::c() const', 3]) : [])] };
+  });
+  try {
+    const x = start(dir, { settings: { 'asmLens.reanalyzeOn': 'never' } });
+    const msg = await x.analyze('h.hxx');
+    assert.deepEqual([msg.error, msg.warning], [[], []], 'nobody asked for it: silently');
+    assert.match(await x.lensAt('h.hxx', 1), /^\$\(symbol-numeric\) 2 instructions · A<int>/);
+    assert.match(await x.lensAt('h.hxx', 3), /^\$\(symbol-numeric\) 2 instructions · C<int>/, 'what compiles stays');
+    assert.match(await x.lensAt('h.hxx', 2), /B<int>(?:::b)? does not compile: this fails for B/);
+  } finally { ce.restore(); }
+});
+
+test('a requested class nothing of which compiles, and no note names it: it goes with a warning, the analysis goes on', async () => {
+  const src = 'template <class T> struct B { T b() const { return T{}; } };\nstatic inline int plain(int x) { return x; }\n';
+  const dir = makeProject({ 'h.hxx': src });
+  const ce = fakeCompilerExplorer(body => (body.source.includes('B<S>') ? { code: 1, stderr: err('other.h:9:9: error: this fails for S') } : { code: 0, asm: asmFor(['plain(int)', 2]) }));
+  try {
+    const x = start(dir, { settings: { 'asmLens.reanalyzeOn': 'never', 'asmLens.autoInstantiateTemplates': false } });
+    const msg = await x.instantiate('h.hxx', 1, 'S');
+    assert.deepEqual(msg.error, []);
+    assert.match(msg.warning[0], /could not instantiate template struct B<S>: this fails for S/);
+    assert.deepEqual(x.ext._internals.instantiationsFor(x.open('h.hxx')), []);
+    assert.equal(await x.lensAt('h.hxx', 2), '$(symbol-numeric) 2 instructions · g152 · -O2');
+  } finally { ce.restore(); }
+});
+
+test('the file\'s own error is still the file\'s: with added lines around, the function at fault says Not compiled', async () => {
+  const src = 'static inline int bad(int x) { return nope(x); }\nstatic inline int good(int x) { return x; }\ntemplate <class T> struct B { T b() const { return T{}; } };\n';
+  const dir = makeProject({ 'h.hxx': src });
+  const ce = fakeCompilerExplorer(body => (body.source.includes('nope(x)') ? { code: 1, stderr: err("<source>:1:39: error: 'nope' was not declared in this scope") } : { code: 0, asm: [...asmFor(['good(int)', 2]), ...(body.source.includes('template struct B<int>;') ? asmFor(['B<int>::b() const', 3]) : [])] }));
+  try {
+    const x = start(dir, { settings: { 'asmLens.reanalyzeOn': 'never' } });
+    await x.analyze('h.hxx');
+    assert.match(await x.lensAt('h.hxx', 1), /^\$\(warning\) Not compiled · 'nope' was not declared/);
+    assert.match(await x.lensAt('h.hxx', 2), /^\$\(symbol-numeric\) 2 instructions/);
+    assert.match(await x.lensAt('h.hxx', 3), /^\$\(symbol-numeric\) 2 instructions · B<int>/, 'the added line is not blamed either');
+  } finally { ce.restore(); }
+});
