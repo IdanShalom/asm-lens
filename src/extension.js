@@ -1583,6 +1583,7 @@ async function runAnalysis(document, { context, calls } = {}) {
       }),
       unkept: compiled.unkept,
       retargeted: compiled.retargeted,
+      callTargets: prepared.callTargets,
       marksDropped,
       stubbed: compiled.stubbed
     });
@@ -1652,16 +1653,22 @@ function prepareCSource(document, { marks = 'attribute', compiler = '', calls } 
     : [];
   if (autos.length) outputChannel?.appendLine(`  templates compiled for: ${autos.map(it => it.expr).join(', ')}`);
   const requests = [...insts, ...autos];
-  const friends = [
-    ...(isCpp ? scan.friendUseLines(original, requests, defs) : []),
-    ...(calls ? scan.callLines(calls, { c: !isCpp }) : [])
-  ];
+  const called = calls ? scan.callLines(calls, { c: !isCpp }) : [];
+  const friends = [...(isCpp ? scan.friendUseLines(original, requests, defs) : []), ...called];
   const withInsts = text => scan.appendInstantiations(text, requests, friends).text;
   const plain = withInsts(original);
   const keep = marks !== 'none' && unused;
   let kept;
   if (keep && marks === 'attribute') {
-    const marked = keepHeaderFunctions(original, { all: isHeader });
+    let marked = keepHeaderFunctions(original, { all: isHeader });
+    // Inlined into their calls, at -O0 too: a function that gets here has no code of its own.
+    if (called.targets?.length) {
+      const lines = marked.split('\n');
+      for (const d of called.targets) {
+        for (let l = d.startLine; l <= (d.nameLine ?? d.startLine); l++) lines[l] = lines[l].replace('__attribute__((used))', '__attribute__((used, always_inline))');
+      }
+      marked = lines.join('\n');
+    }
     if (marked !== original) kept = withInsts(marked);
   } else if (keep) {
     const lines = scan.keepByAddress(original, { c: document.languageId === 'c', all: isHeader });
@@ -1669,7 +1676,7 @@ function prepareCSource(document, { marks = 'attribute', compiler = '', calls } 
   }
   const base = original.endsWith('\n') ? original : `${original}\n`;
   const appended = requests.length || friends.length || (kept !== undefined && marks === 'address');
-  return { isHeader, firstLine: appended ? (base.match(/\n/g) || []).length : -1, instCount: insts.length, requests, kept, plain };
+  return { isHeader, firstLine: appended ? (base.match(/\n/g) || []).length : -1, instCount: insts.length, requests, callTargets: called.targets, kept, plain };
 }
 
 // Automatic instantiations that did not compile, per file and compiler: automatic
@@ -1746,6 +1753,17 @@ function noteUnmarked(off, key, unkept, retargeted) {
   for (const k of off.functions) { const known = retargeted.findIndex(x => x.startLine === k.startLine); if (known >= 0) retargeted.splice(known, 1); }
 }
 
+// The function a __asm_lens_call_N line calls, if `fn` is that line and the call was inlined:
+// compilers may credit a short inlined body to the caller's line, so its lines do not tell.
+// A body that still calls the function is not that function's code.
+function calledFunction(fn, targets) {
+  const n = /__asm_lens_call_(\d+)/.exec(fn.name);
+  const target = n && targets ? targets[Number(n[1])] : undefined;
+  if (!target) return undefined;
+  const name = scan.splitQualified(target.name).pop();
+  return fn.instructionRows.some(r => String(r.text || '').includes(name)) ? undefined : target;
+}
+
 let lastStamp = 0;
 
 // Parses rows (Compiler Explorer style), matches functions with the document's
@@ -1767,7 +1785,10 @@ async function recordAnalysis(document, o) {
     : await vscode.commands.executeCommand('vscode.executeDocumentSymbolProvider', document.uri)) || [];
   const allSourceFunctions = sourceFunctionsOf(document, symbols);
   const matched = functions.map(fn => {
-    const symbol = matchSourceSymbol(fn.name, allSourceFunctions, fn, rootPathKey, { requireName: o.requireName });
+    const called = calledFunction(fn, o.callTargets);
+    const symbol = called
+      ? allSourceFunctions.find(s => s.range && s.range.start.line <= (called.nameLine ?? called.startLine) && (called.nameLine ?? called.startLine) <= s.range.end.line)
+      : matchSourceSymbol(fn.name, allSourceFunctions, fn, rootPathKey, { requireName: o.requireName });
     return { ...fn, sourceName: symbol?.name || fn.name, sourceRange: symbol?.range, sourceSelection: symbol?.selectionRange };
   });
   let deps = o.deps;
@@ -2157,6 +2178,7 @@ async function analyzeLocal(document, resolved, settings, { context, calls } = {
     skipped: skipped.filter(k => prepared.firstLine < 0 || k.startLine < prepared.firstLine),
     unkept,
     retargeted,
+    callTargets: prepared.callTargets,
     marksDropped,
     stubbed,
     includes: await localIncludes(`${context?.text || ''}\n${document.getText()}`, fileDir, flagsLib.includeDirsOf(args, cwd))

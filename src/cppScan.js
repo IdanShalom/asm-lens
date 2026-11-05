@@ -911,11 +911,12 @@ function friendUseLines(text, requests, defs = scanDefinitions(text)) {
 }
 
 // Lines that call functions, for those no other way gave code (`extern inline`,
-// gnu_inline): the result is returned so that the call stays, and the instructions
-// inlined into it map to the function's own lines. A line that does not compile is
+// gnu_inline): the result is returned so that the call stays, and what is inlined
+// into __asm_lens_call_N is the code of `targets[N]`. A line that does not compile is
 // dropped by the caller. `c` writes C.
 function callLines(defs, { c = false } = {}) {
   const lines = [];
+  const targets = [];
   for (const d of defs) {
     const params = namedParameters(d.paramText);
     if (params.some(p => !p)) continue;
@@ -934,8 +935,10 @@ function callLines(defs, { c = false } = {}) {
     if (member) list.unshift(`${isConst ? 'const ' : ''}${self}& __asm_lens_self`);
     const head = c ? (d.returnText || 'int') : 'decltype(auto)';
     const body = `${head} __asm_lens_call_${lines.length}(${list.join(', ') || (c ? 'void' : '')}) { return ${callee}(${names}); }`;
+    targets.push(d);
     lines.push(namespaces.length ? `${namespaces.map(n => `namespace ${n} {`).join(' ')} ${body} ${namespaces.map(() => '}').join(' ')}` : body);
   }
+  lines.targets = targets;
   return lines;
 }
 

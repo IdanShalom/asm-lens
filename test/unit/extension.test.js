@@ -1662,3 +1662,25 @@ test('automatic analyses of a header go straight to what worked, and do not sear
     assert.match(ce.requests.at(-1).body.source, /^#define ON\n#line 1\n/);
   } finally { ce.restore(); }
 });
+
+test('a call added for a function counts as its code wherever the compiler says the instructions are; a real call does not', async () => {
+  const dir = makeProject({ 'h.hxx': 'extern inline int gnu(int x) { return x + 1; }\nextern inline int other(int x) { return x + 2; }\n' });
+  const ce = fakeCompilerExplorer(body => {
+    if (!body.source.includes('__asm_lens_call_')) return { code: 0, asm: [] };
+    assert.match(body.source, /__attribute__\(\(used, always_inline\)\) int gnu|extern __attribute__\(\(used, always_inline\)\) inline int gnu|__attribute__\(\(used, always_inline\)\) extern inline int gnu/);
+    const lines = body.source.split('\n');
+    const line = name => lines.findIndex(l => l.includes(`return ${name}(`)) + 1;
+    return { code: 0, asm: [
+      // Credited to the line of the call, as GCC on macOS does for a short body.
+      { text: '__asm_lens_call_0(int):' }, { text: '        lea eax, [rdi+1]', source: { file: null, line: line('gnu') } }, { text: '        ret', source: { file: null, line: line('gnu') } },
+      // Not inlined.
+      { text: '__asm_lens_call_1(int):' }, { text: '        jmp other(int)', source: { file: null, line: line('other') } }
+    ] };
+  });
+  try {
+    const x = start(dir);
+    await x.analyze('h.hxx');
+    assert.match(await x.lensAt('h.hxx', 1), /^\$\(symbol-numeric\) 2 instructions/);
+    assert.equal(await x.lensAt('h.hxx', 2), '$(warning) No code found · click for details');
+  } finally { ce.restore(); }
+});

@@ -591,14 +591,15 @@ test('callLines: free functions, namespaces, static and const members; construct
     'int main() { return 0; }',
     'inline int g(int (*cb)(int)) { return cb(1); }'
   ].join('\n')).filter(d => d.kind === 'function');
-  assert.deepEqual(scan.callLines(defs), [
+  assert.deepEqual([...scan.callLines(defs)], [
     'decltype(auto) __asm_lens_call_0(int x, int __asm_lens_p1) { return a(x, __asm_lens_p1); }',
     'namespace ns { decltype(auto) __asm_lens_call_1() { return b(); } }',
     'decltype(auto) __asm_lens_call_2(int x) { return S::c(x); }',
     'decltype(auto) __asm_lens_call_3(const S& __asm_lens_self) { return __asm_lens_self.d(); }',
     'decltype(auto) __asm_lens_call_4(S& __asm_lens_self, float f) { return __asm_lens_self.e(f); }'
   ]);
-  assert.deepEqual(scan.callLines(scan.scanDefinitions('extern inline int h(int x) { return x; }\nextern inline void i(void) { }\n').filter(d => d.kind === 'function'), { c: true }), [
+  assert.deepEqual(scan.callLines(defs).targets.map(d => d.name), ['a', 'b', 'c', 'd', 'e'], 'which function each line calls');
+  assert.deepEqual([...scan.callLines(scan.scanDefinitions('extern inline int h(int x) { return x; }\nextern inline void i(void) { }\n').filter(d => d.kind === 'function'), { c: true })], [
     'int __asm_lens_call_0(int x) { return h(x); }',
     'void __asm_lens_call_1(void) { return i(); }'
   ]);
