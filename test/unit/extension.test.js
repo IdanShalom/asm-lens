@@ -331,11 +331,14 @@ test('editing while a compile runs cancels it; the next one starts after the pau
     const x = start(dir, { settings: { 'asmLens.reanalyzeDelayMs': 200 } });
     await x.analyze('a.cpp');
     x.edit('a.cpp', 0, 17, 0, 18, '2');
-    await new Promise(r => setTimeout(r, 250));      // the background compile has started
+    // Waits by what happened, not for a fixed time: a busy machine can run timers late.
+    const until = async n => { for (let i = 0; i < 1000 && calls.length < n; i++) await new Promise(r => setTimeout(r, 10)); };
+    await until(2);                                   // the background compile has started
     assert.equal(calls.length, 2);
     x.edit('a.cpp', 0, 17, 0, 18, '3');               // ... and is now outdated
     assert.equal(calls[1].aborted, true);
-    await new Promise(r => setTimeout(r, 700));
+    assert.equal(calls.length, 2, 'not before the pause');
+    await until(3);
     assert.equal(calls.length, 3);
     assert.match(calls[2].body.source, /return 3;/);
     assert.equal(x.state.messages.error.length, 0);
