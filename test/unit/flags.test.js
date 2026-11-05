@@ -162,3 +162,10 @@ test('portableFlags: defines, standard and target options; folders apart', () =>
   assert.equal(flags, '-DA -DB=1 -UC "-DNAME=a b" -std=c++17 -mavx2 -march=haswell -fno-rtti');
   assert.deepEqual(dirs, [require('path').resolve('/p/inc'), require('path').resolve('/sys')]);
 });
+
+test('macroFlags and targetFlags: what changes what the preprocessor sees', () => {
+  const args = ['-O2', '-m32', '-DX=1', '-D', 'Y', '-UZ', '-Iinc', '-std=c++17', '-Wall', '-masm=intel', '--target=i386-linux', '-mavx2'];
+  assert.deepEqual(flagsLib.macroFlags(args), ['-m32', '-DX=1', '-DY', '-UZ', '-std=c++17', '--target=i386-linux', '-mavx2']);
+  assert.deepEqual(flagsLib.targetFlags(args), ['-m32', '--target=i386-linux']);
+  assert.deepEqual(flagsLib.targetFlags(['-target', 'x86_64-linux', '-O2']), ['-target x86_64-linux']);
+});

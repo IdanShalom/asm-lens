@@ -5,7 +5,7 @@
 const fs = require('fs/promises');
 const path = require('path');
 const { normPath } = require('./asm');
-const { compileFlagsOf, includeDirsOf } = require('./flags');
+const { compileFlagsOf, includeDirsOf, entryCompiler, macroFlags } = require('./flags');
 
 const cache = new Map();   // database path -> { mtimeMs, size, entries, byFile, error }
 
@@ -75,8 +75,22 @@ function includes(text, from, target) {
 
 const includerCache = new Map();   // `${database stamps}\n${file}` -> entries
 
+// All entries of a file. It can be listed more than once: a 32-bit and a 64-bit build,
+// in one database or in several.
+function entriesOf(db, file) {
+  const key = normPath(file);
+  return (db?.entries || []).filter(e => normPath(e.file) === key);
+}
+
+// What makes a build different for the preprocessor: its compiler, defines and target.
+function buildOf(entry) {
+  return [entryCompiler(entry), ...macroFlags(compileFlagsOf(entry))].join(' ');
+}
+
 // The entries whose source file includes `file`, directly or through other headers
-// (followed the way the entry's own include folders find them), nearest folders first.
+// (followed the way the entry's own include folders find them), nearest folders first,
+// with one of each build before a second one of any: thousands of files of a 32-bit build
+// listed first must not hide the 64-bit one.
 async function includersOf(db, file, { readText = defaultRead, maxScan = 400, maxFiles = 3000, max = 8 } = {}) {
   if (!db || !db.entries.length) return [];
   const stamp = `${db.stamp || ''}\n${normPath(file)}`;
@@ -91,13 +105,23 @@ async function includersOf(db, file, { readText = defaultRead, maxScan = 400, ma
     return texts.get(key);
   };
   const found = [];
-  for (const entry of nearest.slice(0, maxScan)) {
-    if (found.length >= max) break;
+  const perBuild = new Map();
+  let scanned = 0;
+  for (const entry of nearest) {
+    if (found.length >= max || scanned >= maxScan) break;
     if (normPath(entry.file) === target) continue;
-    if (await reaches(entry.file, file, includeDirsOf(compileFlagsOf(entry), entry.directory), read)) found.push(entry);
+    const build = buildOf(entry);
+    if ((perBuild.get(build) || 0) >= 2) continue;
+    scanned++;
+    if (!await reaches(entry.file, file, includeDirsOf(compileFlagsOf(entry), entry.directory), read)) continue;
+    perBuild.set(build, (perBuild.get(build) || 0) + 1);
+    found.push(entry);
   }
-  includerCache.set(stamp, found);
-  return found;
+  const seen = new Set();
+  const firsts = found.filter(e => { const b = buildOf(e); if (seen.has(b)) return false; seen.add(b); return true; });
+  const result = [...firsts, ...found.filter(e => !firsts.includes(e))];
+  includerCache.set(stamp, result);
+  return result;
 }
 
 // Whether `from` includes `file`, directly or through other headers found in `dirs`.
@@ -159,4 +183,4 @@ async function defaultRead(file) {
 
 function clearIncluderCache() { includerCache.clear(); }
 
-module.exports = { loadDatabase, loadDatabases, reload: () => { reload(); clearIncluderCache(); }, entryFor, includersOf, reaches, includes, folderDistance };
+module.exports = { loadDatabase, loadDatabases, reload: () => { reload(); clearIncluderCache(); }, entryFor, entriesOf, buildOf, includersOf, reaches, includes, folderDistance };

@@ -26,7 +26,7 @@ function localCompilers() {
 }
 
 const COUNT = /^\$\(symbol-numeric\) \d+ instructions · /;
-const NOT_INSTANTIATED = /^\$\(info\) Template: no code yet/;
+const NOT_INSTANTIATED = /^\$\((?:info|warning)\) (?:Template: click to choose its types|.* does not compile: .* · click to choose types)/;
 
 // Header lines (1-based) of mathx.hxx
 const L = { square: 4, clamp: 7, addInts: 14, mulInts: 16, cube: 21, push: 25, get: 26, twice: 32 };

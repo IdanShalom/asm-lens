@@ -2,6 +2,7 @@
 const assert = require('assert');
 const fs = require('fs');
 const path = require('path');
+const Module = require('module');
 const vscode = require('vscode');
 
 const sleep = ms => new Promise(r => setTimeout(r, ms));
@@ -87,6 +88,28 @@ exports.run = async () => {
     const lenses = await settled('db/include/feature.hxx');
     for (const line of [2, 4, 7, 13]) assert.match(at(lenses, line), CODE, `line ${line}: ${at(lenses, line)}`);
     assert.match(at(lenses, 10), /Not compiled · inside #ifdef NOWHERE/);
+  });
+
+  await check('a file listed for two builds in compile_commands.json: what each has off, the other shows', async () => {
+    await vscode.commands.executeCommand('asmLens.analyzeFile', uriOf('builds/arch.hxx'));
+    const lenses = await settled('builds/arch.hxx');
+    for (const line of [2, 4, 7]) assert.match(at(lenses, line), CODE, `line ${line}: ${at(lenses, line)}`);
+    assert.match(at(lenses, 10), /Not compiled · inside #ifdef NEVER_DEFINED, which is off in all \d+ compile commands tried/);
+  });
+
+  await check('a chosen type from a header the .cpp includes later is compiled, while another compile runs too', async () => {
+    const ext = vscode.extensions.all.find(e => /asm-lens$/i.test(e.id));
+    // Tests cannot type into an input box: the extension's own API object answers it.
+    const api = Module._load('vscode', { filename: path.join(ext.extensionPath, 'src', 'extension.js') }, false);
+    const realBox = api.window.showInputBox;
+    api.window.showInputBox = async () => 'Point';
+    try {
+      const running = vscode.commands.executeCommand('asmLens.analyzeFile', uriOf('builds/u.cpp'));
+      await vscode.commands.executeCommand('asmLens.instantiateTemplate', uriOf('builds/arch.hxx'), 12);
+      await running;
+      const lenses = await settled('builds/arch.hxx');
+      assert.match(at(lenses, 12), /^\$\(symbol-numeric\) \d+ instructions · pick<Point>/, at(lenses, 12));
+    } finally { api.window.showInputBox = realBox; }
   });
 
   await check('nothing is sent before the question is answered (tests answer no dialog)', async () => {

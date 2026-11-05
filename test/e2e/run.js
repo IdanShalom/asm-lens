@@ -40,6 +40,13 @@ async function main() {
   ]));
   fs.writeFileSync(path.join(db, '.asm-lens.json'), JSON.stringify({ mode: 'local', compileCommands: 'compile_commands.json' }));
 
+  // The same file listed for two builds, and a chosen type that needs the .cpp's includes.
+  const builds = path.join(project, 'builds');
+  fs.cpSync(path.join(__dirname, '..', 'fixtures', 'builds'), builds, { recursive: true });
+  const entry = flag => ({ directory: '.', file: 'u.cpp', command: `${compiler} ${flag} -O2 -std=c++17 -c u.cpp -o u.o` });
+  fs.writeFileSync(path.join(builds, 'compile_commands.json'), JSON.stringify([entry('-DBUILD_A'), entry('-DBUILD_B')]));
+  fs.writeFileSync(path.join(builds, '.asm-lens.json'), JSON.stringify({ mode: 'local', compileCommands: 'compile_commands.json' }));
+
   const result = path.join(tmp, 'result.json');
   const env = { ...process.env, ASM_LENS_E2E_RESULT: result };
   for (const k of Object.keys(env)) if (/^(?:ELECTRON_RUN_AS_NODE|VSCODE_)/.test(k)) delete env[k];

@@ -280,6 +280,22 @@ function withoutWarningsAsErrors(flags) {
   return { flags: rest.replace(/\s+/g, ' ').trim(), removed };
 }
 
+// The arguments that change what the preprocessor sees: defines and the target.
+function macroFlags(args) {
+  const out = [];
+  for (let i = 0; i < args.length; i++) {
+    const a = args[i];
+    if (a === '-D' || a === '-U' || a === '-target' || a === '--target' || a === '-arch') out.push(`${a}${a.startsWith('-t') || a.startsWith('--') ? ' ' : ''}${args[++i] ?? ''}`);
+    else if (/^(?:-[DU].|\/[DU].|-m\w|--target=|-target=|-std=|\/std:)/.test(a) && !/^-masm=/.test(a)) out.push(a);
+  }
+  return out;
+}
+
+// The arguments that say which machine a build is for: -m32, -m64, --target=...
+function targetFlags(args) {
+  return macroFlags(args).filter(a => /^(?:-m32|-m64|-mx32|--target|-target|-arch)\b/.test(a));
+}
+
 // Separates forced includes from the other arguments: -include x, -Xclang -include -Xclang x,
 // and a precompiled header (-Xclang -include-pch -Xclang x.pch, -Winvalid-pch goes with it).
 function splitForcedIncludes(args) {
@@ -324,7 +340,7 @@ function portableFlags(entry, windows = IS_WIN) {
 }
 
 module.exports = {
-  includeDirsOf, portableFlags, withoutWarningsAsErrors, splitForcedIncludes,
+  includeDirsOf, portableFlags, withoutWarningsAsErrors, splitForcedIncludes, macroFlags, targetFlags,
   stripSyntaxFlags, stripSyntaxArgs, compilerKind, targetOf, isX86, syntaxArgs, isMsvcStyle, adaptFlags, needsNewerStd,
   rejectedFlagsFrom, matchesOption, removeFlags, removeArgs,
   splitCommand, entryArgs, compileFlagsOf, entryCompiler

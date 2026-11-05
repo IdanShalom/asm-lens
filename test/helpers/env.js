@@ -88,6 +88,9 @@ function start(dir, options = {}) {
       }
       throw new Error(`${rel} is still being analyzed`);
     },
+    async settledLens(rel, line) {
+      return (await this.settled(rel)).find(l => l.line === line && !l.title.endsWith('Instantiate…'))?.title;
+    },
     analysis(rel) { return ctx.ext._internals.analysisFor(ctx.vscode._openDocument(at(rel))); },
     // Edits like the editor does: replaces text from (line, char) to (endLine, endChar), 0-based, and fires the change event.
     edit(rel, line, char, endLine, endChar, text) {

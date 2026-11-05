@@ -207,7 +207,7 @@ test('header without code: a message that points at Instantiate…', async () =>
     const msg = await x.analyze('t.hpp');
     assert.match(msg.info[0], /emitted no code: none of its templates compiled with the types tried\. Click "Instantiate…"/);
     const lenses = await x.lenses('t.hpp');
-    assert.deepEqual(lenses.map(l => l.title), ['$(info) Template: no code yet · click to choose types', '$(symbol-type-parameter) Instantiate…']);
+    assert.deepEqual(lenses.map(l => l.title), ['$(info) Template: click to choose its types', '$(symbol-type-parameter) Instantiate…']);
   } finally { ce.restore(); }
 });
 
@@ -231,7 +231,8 @@ test('instantiate: requests are appended, remembered per file, deduplicated, fai
     assert.match(failed.warning[0], /could not instantiate mx::cube<Nope>: 'Nope' was not declared in this scope/);
     const doc = x.open('m.hxx');
     assert.deepEqual(x.ext._internals.instantiationsFor(doc), [{ kind: 'address', expr: 'square<int>' }, { kind: 'class', expr: 'mx::Box<long>', keyword: 'struct', member: 'mx::Box<long>::twice' }]);
-    const src = ce.requests.at(-1).body.source.split('\n');
+    // Not the last compile: functions this fake compiler gives no code for are called from added lines then.
+    const src = ce.requests.filter(r => !r.body.source.includes('__asm_lens_call_')).at(-1).body.source.split('\n');
     assert.equal(src[34], 'auto __asm_lens_inst_0 = &square<int>;');
     assert.equal(src[35], 'template struct mx::Box<long>;');
     assert.equal(src.length, fixture('headers', 'mathx.hxx').split('\n').length + 3);
@@ -1469,7 +1470,7 @@ test('no code: the lens says why', async () => {
     assert.equal(await x.lensAt('h.hxx', 4), '$(info) consteval: it runs only while compiling, so it has no code');
     assert.equal(await x.lensAt('h.hxx', 5), '$(warning) No code found · click for details');
     assert.ok(x.state.outputLines.some(l => /no code for dropped at line 5: it was kept and called/.test(l)), x.state.outputLines.join('\n'));
-    assert.equal(await x.lensAt('h.hxx', 6), '$(info) Template: no code yet · click to choose types');
+    assert.equal(await x.lensAt('h.hxx', 6), '$(info) Template: click to choose its types');
   } finally { ce.restore(); }
 });
 
@@ -1516,7 +1517,7 @@ test('an automatic instantiation that does not compile is dropped silently, and 
     const msg = await x.analyze('h.hxx');
     assert.deepEqual([msg.warning, msg.error], [[], []], 'nobody asked for it');
     assert.equal(ce.requests.length, 2);
-    assert.equal(await x.lensAt('h.hxx', 1), '$(info) Template: no code yet · click to choose types');
+    assert.match(await x.lensAt('h.hxx', 1), /^\$\(warning\) A<int> does not compile: 'int' is not a class · click to choose types$/);
     assert.equal(await x.lensAt('h.hxx', 2), '$(symbol-numeric) 2 instructions · B<int> · g152 · -O2');
     x.edit('h.hxx', 1, 0, 1, 0, ' ');
     for (let i = 0; i < 400 && ce.requests.length < 3; i++) await new Promise(r => setTimeout(r, 10));
@@ -1686,4 +1687,118 @@ test('a call added for a function counts as its code wherever the compiler says 
     assert.match(await x.lensAt('h.hxx', 1), /^\$\(symbol-numeric\) 2 instructions/);
     assert.equal(await x.lensAt('h.hxx', 2), '$(warning) No code found · click for details');
   } finally { ce.restore(); }
+});
+
+// ---------------------------------------------------------------------------
+// 0.8.6: every build of a file; a chosen type is not lost
+
+test('a file listed twice in compile_commands.json: both builds are compiled, and what each has off the other shows', async () => {
+  const header = '#pragma once\n#ifdef B64\nstatic inline long a(long x) { return x; }\n#else\nstatic inline int b(int x) { return x; }\n#endif\n#ifdef NEVER\nstatic inline int c() { return 1; }\n#endif\n';
+  for (const dbs of [1, 2]) {
+    const entry = flag => ({ directory: '.', file: 'u.cpp', command: `g++ ${flag} -O2 -c u.cpp` });
+    const files = { 'h.hxx': header, 'u.cpp': '#include "h.hxx"\nint u() { return 1; }\n' };
+    if (dbs === 1) files['compile_commands.json'] = JSON.stringify([entry('-DB32'), entry('-DB64')]);
+    else { files['a/compile_commands.json'] = JSON.stringify([{ ...entry('-DB32'), directory: '..' }]); files['b/compile_commands.json'] = JSON.stringify([{ ...entry('-DB64'), directory: '..' }]); }
+    const dir = makeProject(files, { compileCommands: dbs === 1 ? 'compile_commands.json' : ['a/compile_commands.json', 'b/compile_commands.json'], compilers: [{ id: 'g152', name: 'g152' }] });
+    const ce = fakeCompilerExplorer(body => ({ code: 0, asm: /-DB64/.test(body.options.userArguments) ? asmFor(['a(long)', 3]) : asmFor(['b(int)', 5]) }));
+    try {
+      const x = start(dir);
+      await x.analyze('h.hxx');
+      assert.match(await x.lensAt('h.hxx', 3), /^\$\(symbol-numeric\) 2 instructions/, `${dbs} database(s): ${await x.lensAt('h.hxx', 3)}`);
+      assert.match(await x.lensAt('h.hxx', 5), /^\$\(symbol-numeric\) 2 instructions/, await x.lensAt('h.hxx', 5));
+      assert.match(await x.lensAt('h.hxx', 8), /^\$\(info\) Not compiled · inside #ifdef NEVER, which is off in all \d+ compile commands tried · g152$/);
+    } finally { ce.restore(); }
+  }
+});
+
+test('a .cpp listed for two builds is compiled with both too', async () => {
+  const src = '#ifdef B64\nstatic inline long a(long x) { return x; }\n#else\nstatic inline int b(int x) { return x; }\n#endif\n';
+  const entry = flag => ({ directory: '.', file: 'u.cpp', command: `g++ ${flag} -O2 -c u.cpp` });
+  const dir = makeProject({ 'u.cpp': src, 'compile_commands.json': JSON.stringify([entry('-DB32'), entry('-DB64')]) }, { compileCommands: 'compile_commands.json', compilers: [{ id: 'g152', name: 'g152' }] });
+  const ce = fakeCompilerExplorer(body => ({ code: 0, asm: /-DB64/.test(body.options.userArguments) ? asmFor(['a(long)', 2]) : asmFor(['b(int)', 4]) }));
+  try {
+    const x = start(dir);
+    await x.analyze('u.cpp');
+    assert.match(await x.lensAt('u.cpp', 2), /^\$\(symbol-numeric\) 2 instructions/);
+    assert.match(await x.lensAt('u.cpp', 4), /^\$\(symbol-numeric\) 2 instructions/);
+  } finally { ce.restore(); }
+});
+
+test('a chosen type that needs what the .cpp includes after the header is compiled with that, not removed', async () => {
+  const dir = makeProject({
+    'h.hxx': '#pragma once\ntemplate <class T> struct Box { T get() const { return T{}; } };\n',
+    'types.h': '#pragma once\nstruct Point { int x; };\n',
+    'u.cpp': '#include "h.hxx"\n#include "types.h"\nusing namespace app;\nint u() { return 1; }\n'
+  });
+  const ce = fakeCompilerExplorer(body => {
+    if (body.source.includes('int u()')) return { code: 0, asm: asmFor(['u()', 4]) };
+    const lines = body.source.split('\n');
+    const request = lines.findIndex(l => l.includes('template struct Box<Point>;'));
+    if (request >= 0 && !body.source.includes('#include "types.h"')) return { code: 1, stderr: err(`<source>:${request + 1}:17: error: 'Point' was not declared in this scope`) };
+    return { code: 0, asm: request >= 0 ? asmFor(['Box<Point>::get() const', 2]) : [] };
+  });
+  try {
+    const x = start(dir, { settings: { 'asmLens.autoInstantiateTemplates': false, 'asmLens.reanalyzeOn': 'never' } });
+    await x.analyze('u.cpp');
+    const msg = await x.instantiate('h.hxx', 2, 'Point');
+    assert.deepEqual(msg.warning, []);
+    assert.deepEqual(x.ext._internals.instantiationsFor(x.open('h.hxx')).map(i => i.expr), ['Box<Point>']);
+    assert.equal(await x.lensAt('h.hxx', 2), '$(symbol-numeric) 2 instructions · Box<Point> · g152 · -O2');
+    assert.match(ce.requests.at(-1).body.source, /#include "types\.h"\nusing namespace app;\ntemplate struct Box<Point>;/);
+  } finally { ce.restore(); }
+});
+
+test('a chosen type from the standard library brings its header along', async () => {
+  const dir = makeProject({ 'h.hxx': 'template <class C> auto count(const C& c) { return c.size(); }\n' });
+  const ce = fakeCompilerExplorer(body => {
+    if (!body.source.includes('count<std::vector<int>>')) return { code: 0, asm: [] };
+    assert.match(body.source, /#include <vector>\nauto __asm_lens_inst_0 = &count<std::vector<int>>;/);
+    return { code: 0, asm: asmFor(['unsigned long count<std::vector<int>>(std::vector<int> const&)', 1]) };
+  });
+  try {
+    const x = start(dir, { settings: { 'asmLens.autoInstantiateTemplates': false } });
+    const msg = await x.instantiate('h.hxx', 1, 'std::vector<int>');
+    assert.deepEqual(msg.warning, []);
+    assert.equal(await x.lensAt('h.hxx', 1), '$(symbol-numeric) 2 instructions · count<std::vector<int>> · g152 · -O2');
+  } finally { ce.restore(); }
+});
+
+test('a chosen type that does not compile: the lens gives the reason', async () => {
+  const dir = makeProject({ 'h.hxx': 'template <class T> struct Box { T get() const { return T{}; } };\n' });
+  const ce = fakeCompilerExplorer(body => {
+    const lines = body.source.split('\n');
+    const bad = lines.findIndex(l => l.includes('Nope'));
+    return bad >= 0 ? { code: 1, stderr: err(`<source>:${bad + 1}:17: error: 'Nope' was not declared in this scope`) } : { code: 0, asm: [] };
+  });
+  try {
+    const x = start(dir, { settings: { 'asmLens.autoInstantiateTemplates': false } });
+    await x.instantiate('h.hxx', 1, 'Nope');
+    // The class first, then only the member that was clicked, and only then it is given up.
+    for (let i = 0; i < 400 && x.ext._internals.instantiationsFor(x.open('h.hxx')).length; i++) await new Promise(r => setTimeout(r, 10));
+    assert.deepEqual(x.ext._internals.instantiationsFor(x.open('h.hxx')), []);
+    assert.ok(x.state.messages.warning.some(m => /could not instantiate Box<Nope>::get/.test(m)), x.state.messages.warning.join('\n'));
+    assert.match(await x.settledLens('h.hxx', 1), /^\$\(warning\) Box<Nope>(?:::get)? does not compile: 'Nope' was not declared in this scope · click to choose types$/);
+  } finally { ce.restore(); }
+});
+
+test('choosing types while a compile runs: that compile stops, and one with the types follows', async () => {
+  const dir = makeProject({ 'h.hxx': 'template <class T> T f(T x) { return x; }\n' });
+  const real = global.fetch;
+  const bodies = [];
+  global.fetch = (url, init) => new Promise((resolve, reject) => {
+    const body = JSON.parse(init.body);
+    bodies.push(body);
+    init.signal.addEventListener('abort', () => { const e = new Error('aborted'); e.name = 'AbortError'; reject(e); });
+    const reply = { code: 0, asm: body.source.includes('f<long>') ? asmFor(['long f<long>(long)', 1]) : [] };
+    setTimeout(() => resolve({ ok: true, status: 200, json: async () => reply, text: async () => JSON.stringify(reply) }), 40);
+  });
+  try {
+    const x = start(dir, { settings: { 'asmLens.autoInstantiateTemplates': false } });
+    const running = x.state.commands.get('asmLens.analyzeFile')(x.vscode.Uri.file(x.at('h.hxx')));
+    await new Promise(r => setTimeout(r, 10));
+    await x.instantiate('h.hxx', 1, 'long');
+    await running;
+    for (let i = 0; i < 300 && !/instructions/.test(await x.lensAt('h.hxx', 1)); i++) await new Promise(r => setTimeout(r, 10));
+    assert.equal(await x.lensAt('h.hxx', 1), '$(symbol-numeric) 2 instructions · f<long> · g152 · -O2');
+  } finally { global.fetch = real; }
 });

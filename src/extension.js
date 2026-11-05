@@ -352,9 +352,12 @@ function activate(context) {
           if (noOwnResult) return analyzeThis(`$(play) ${noCode} · click to analyze this file`);
         }
         const offBy = !result && !inlined && !wasSkipped ? sourceInfo(document).conditions[line] : undefined;
-        if (!result && !inlined && !wasSkipped && template && !offBy) return chooseTypes('$(info) Template: no code yet · click to choose types');
+        if (!result && !inlined && !wasSkipped && template && !offBy) {
+          const trouble = templateTrouble(document, templates.get(sym));
+          return chooseTypes(trouble ? `$(warning) ${trouble.expr} does not compile: ${oneLine(trouble.message)} · click to choose types` : '$(info) Template: click to choose its types');
+        }
         if (!result && !inlined && !wasSkipped && !offBy) return new vscode.CodeLens(sym.range, { ...noCodeLens(document, line, analysis), command: 'asmLens.showOutput' });
-        const instantiation = template && result ? instantiationOf(result.name) : '';
+        const instantiation = template && result ? shortened(instantiationOf(result.name)) : '';
         const needed = result ? (analysis.retargeted || []).find(k => k.key === key && line >= k.startLine && line <= k.endLine) : undefined;
         const title = results.length > 1
           ? `$(symbol-numeric) ${results.length} ${template || /</.test(results[0].name) ? 'instantiations' : 'versions'} · ${results.map(r => r.count).join(' / ')} instructions · ${analysis.compilerLabel}${viaRoot}`
@@ -364,7 +367,7 @@ function activate(context) {
               ? `$(symbol-numeric) ${inlined.count} ${inlined.users.length ? `inlined instructions · used in ${inlined.users.length} function(s)` : 'instructions'}${viaRoot}`
               : wasSkipped
                 ? `$(warning) Not compiled · ${oneLine(why) || 'this function has compile errors (missing include?)'} · ${analysis.compilerLabel}`
-                : `$(info) Not compiled · inside ${offBy}, which is off${analysis.compiledAs ? ` in ${analysis.compiledAs}` : ''} · ${analysis.compilerLabel}`;
+                : `$(info) Not compiled · inside ${offBy}, which is off${offWhere(own || analysis)} · ${analysis.compilerLabel}`;
         return new vscode.CodeLens(sym.range, {
           title,
           command: 'asmLens.showAssembly',
@@ -640,6 +643,27 @@ function activate(context) {
 function oneLine(message) {
   const s = String(message || '').split('\n')[0].trim();
   return s.length > 90 ? `${s.slice(0, 89)}…` : s;
+}
+
+// A long type name, short enough for a CodeLens: the assembly view has it in full.
+function shortened(name) {
+  return name.length > 48 ? `${name.slice(0, 47)}…` : name;
+}
+
+// Where a function was found switched off: the compile commands tried.
+function offWhere(analysis) {
+  if (analysis.triedCompilations > 1) return ` in all ${analysis.triedCompilations} compile commands tried`;
+  return analysis.compiledAs ? ` in ${analysis.compiledAs}` : '';
+}
+
+// Why a template has no code, when it was tried: types chosen, or the ones it was compiled for by itself.
+const choiceTrouble = new Map();
+const autoTrouble = new Map();
+function templateTrouble(document, target) {
+  if (!target) return undefined;
+  const name = scan.templateName(target.label);
+  const list = [...(choiceTrouble.get(fileKey(document)) || []), ...(autoTrouble.get(fileKey(document)) || [])];
+  return list.find(k => k.name === name) || list.find(k => name.startsWith(`${k.name}::`) || k.name.startsWith(`${name}::`));
 }
 
 // The CodeLens of a function that is not a template, not switched off, and has no code
@@ -919,7 +943,8 @@ function codeFor(document, sym, { template = false } = {}) {
   const key = docPathKey(document);
   const all = analysesFor(document);
   const own = lastAnalysis.get(fileKey(document));
-  const same = all.filter(a => a.compilerId === all[0].compilerId);
+  // Older results of the same compiler, and other builds of this very file (32-bit with another compiler, say).
+  const same = all.filter(a => a.compilerId === all[0].compilerId || a.otherBuild);
   const ordered = template && same.includes(own) && instantiationsFor(document).length ? [own, ...same.filter(a => a !== own)] : same;
   // A function that does not compile now is not shown with the code it used to have.
   const first = ordered[0];
@@ -943,7 +968,7 @@ function analysisAt(document, line) {
   const key = docPathKey(document);
   const hasLine = a => a.lineIndex.get(key)?.get(line)?.length > 0
     || (key === a.rootPathKey && a.functions.some(f => f.sourceRange && f.sourceRange.start.line <= line && line <= f.sourceRange.end.line));
-  return all.filter(a => a.compilerId === all[0].compilerId).find(hasLine) || all[0];
+  return all.filter(a => a.compilerId === all[0].compilerId || a.otherBuild).find(hasLine) || all[0];
 }
 
 function functionAtSignature(document, position, analysis, key) {
@@ -1087,6 +1112,14 @@ async function manageInstantiations(uri) {
   else codeLensEmitter?.fire();
 }
 
+// Which chosen types did not compile in this run: settled when all compiles have run.
+function noteFailedInstantiations(document, failed) {
+  const job = jobContext.getStore();
+  if (job?.failedRuns) job.failedRuns.push(failed);
+  else return dropFailedInstantiations(document, failed);
+  return undefined;
+}
+
 // Removes instantiation requests that did not compile and tells the user why.
 async function dropFailedInstantiations(document, failed) {
   if (!failed.length) return;
@@ -1102,10 +1135,13 @@ async function dropFailedInstantiations(document, failed) {
     if (narrow(it)) {
       outputChannel.appendLine(`  ${describeInstantiation(it)} does not compile as a whole (${f.message || 'compile error'}); compiling only ${it.member}.`);
       vscode.window.showInformationMessage(`Asm Lens: ${it.expr} does not compile as a whole for these types, so only ${it.member} is compiled. See the Asm Lens output.`);
-      rerunAfter.add(fileKey(document));
+      userRerun.add(fileKey(document));
       continue;
     }
     outputChannel.appendLine(`  instantiation failed and was removed: ${describeInstantiation(it)}: ${f.message || 'compile error'}`);
+    const trouble = choiceTrouble.get(fileKey(document)) || [];
+    trouble.push({ name: scan.templateName(it.expr), expr: it.expr, message: f.message || 'compile error' });
+    choiceTrouble.set(fileKey(document), trouble);
     vscode.window.showWarningMessage(`Asm Lens: could not instantiate ${describeInstantiation(it)}${f.message ? `: ${f.message}` : ''}. It was removed; see the Asm Lens output for details.`);
   }
 }
@@ -1263,7 +1299,9 @@ async function analyzeDocument(document, { auto = false, quiet = false } = {}) {
   const key = fileKey(document);
   if (auto && Date.now() < rateLimitedUntil) return;
   if (analysisBusy.has(key)) {
-    if (auto) runningJobs.get(key)?.cancel('rerun');
+    // A request (types just chosen, say) must not vanish in a compile that is already running.
+    if (!auto) userRerun.add(key);
+    runningJobs.get(key)?.cancel('rerun');
     return;
   }
   if (!LANGS.includes(document.languageId)) {
@@ -1279,9 +1317,11 @@ async function analyzeDocument(document, { auto = false, quiet = false } = {}) {
     analysisBusy.delete(key);
     codeLensEmitter?.fire();
     await refreshStatusBar();
-    if (rerunAfter.delete(key)) analyzeDocument(document, { auto: true });
+    if (userRerun.delete(key)) { rerunAfter.delete(key); analyzeDocument(document); }
+    else if (rerunAfter.delete(key)) analyzeDocument(document, { auto: true });
   }
 }
+const userRerun = new Set();
 
 // The functions of `document` with no code in any of `analyses`.
 function functionsWithoutCode(document, analyses) {
@@ -1300,16 +1340,37 @@ function functionsWithoutCode(document, analyses) {
 const extraKey = (key, i) => `${key}\n#${i}`;
 function dropExtras(key) { for (const k of [...lastAnalysis.keys()]) if (k.startsWith(`${key}\n#`)) lastAnalysis.delete(k); }
 
-// The way that worked best for a header, per file: automatic analyses go straight to it.
+// The ways that worked best for a file: automatic analyses go straight to them.
 const bestCompilation = new Map();
 
-// A file is first compiled the plain way, which is all most need. A header with functions
-// that lack code (errors, #if, types only its includers know) may need what its includers
-// have: it is also compiled with the preprocessor lines before its #include and, with
-// compile_commands.json, with the entry of each file that includes it, until every function
-// has code. The best result is the main one, and others fill in what it lacks. Functions that
-// still have none are called from added lines, which shows their code if they compile at all.
+// Compiles a file in every way that may give its functions code, and combines the results.
 async function analyzeWithContext(document) {
+  const job = jobContext.getStore();
+  if (job) job.failedRuns = [];
+  await compileAllWays(document);
+  if (job && !job.cancelled) await settleFailedInstantiations(document, job);
+}
+
+// A chosen type counts as failed only if it failed in every compile that worked: the first one may
+// simply lack what the file including this one has. An automatic analysis drops nothing: the text may be half typed.
+async function settleFailedInstantiations(document, job) {
+  const runs = job.failedRuns;
+  if (!runs.length) return;
+  const failed = runs[0].filter(f => runs.every(r => r.some(x => x.index === f.index)));
+  if (job.auto) {
+    const list = instantiationsFor(document);
+    choiceTrouble.set(fileKey(document), failed.filter(f => list[f.index]).map(f => ({ name: scan.templateName(list[f.index].expr), expr: list[f.index].expr, message: f.message })));
+    return;
+  }
+  await dropFailedInstantiations(document, failed);
+}
+
+// A file is first compiled the plain way, which is all most need. A file with functions that
+// lack code (errors, #if, types its includers know) may need more: it is also compiled with each
+// entry of compile_commands.json that fits (a file can have a 32-bit and a 64-bit one), and the way
+// the files including it see it. The best result is the main one, and others fill in what it lacks.
+// Functions that still have none are called from added lines, which shows their code if they compile at all.
+async function compileAllWays(document) {
   const isC = /^(?:c|cpp|objective-c|objective-cpp)$/.test(document.languageId) && document.uri.scheme === 'file';
   if (!isC) {
     const outcome = await runAnalysis(document);
@@ -1318,62 +1379,103 @@ async function analyzeWithContext(document) {
   }
   const key = fileKey(document);
   const job = jobContext.getStore();
-  const isHeader = HEADER_RE.test(document.fileName);
   const known = job?.auto ? bestCompilation.get(key) : undefined;
-  if (!job?.auto) { bestCompilation.delete(key); dropExtras(key); }
+  if (!job?.auto) {
+    bestCompilation.delete(key);
+    dropExtras(key);
+    choiceTrouble.delete(key);
+    autoTrouble.delete(key);
+  }
   const previous = lastAnalysis.get(key);
-  let context = known ? await includerContext(document, known) : undefined;
+  let context = known?.main ? await includerContext(document, known.main.from, known.main.entry) : undefined;
   const first = await runAnalysis(document, { context });
   if (first?.stopped) return;
-  if (known && !first?.error) lastAnalysis.get(key).compiledAs = path.basename(known);
   // A server or network failure says nothing about the file: another compile would not help.
   if (first?.error && !first.error.compileFailed) return reportFailure(first.error);
   const made = !first?.error && lastAnalysis.get(key) !== previous ? lastAnalysis.get(key) : undefined;
-  const results = made ? [made] : [];
-  let best = made;
-  if (isHeader && known === undefined && (first?.error || functionsWithoutCode(document, results).length)) {
-    for (const attempt of await otherCompilations(document)) {
-      outputChannel.appendLine(`  compiling ${path.basename(document.fileName)} again as ${path.basename(attempt.from)} sees it`);
+  const runs = made ? [{ analysis: made, attempt: context }] : [];
+  let tried = made || first?.error ? 1 : 0;
+  const describe = (analysis, attempt) => { if (attempt) analysis.compiledAs = attempt.label; };
+  if (made) describe(made, context);
+  const covered = () => functionsWithoutCode(document, runs.map(r => r.analysis));
+  const without = run => functionsWithoutCode(document, [run.analysis]);
+  if (known) {
+    // The other builds that gave code last time: their results must stay up to date as well.
+    for (const old of known.extras) {
+      const attempt = await includerContext(document, old.from, old.entry);
       const outcome = await runAnalysis(document, { context: attempt });
-      if (outcome?.stopped) { if (best) lastAnalysis.set(key, best); return; }
+      if (outcome?.stopped) { if (made) lastAnalysis.set(key, made); return; }
+      if (outcome?.error) continue;
+      describe(lastAnalysis.get(key), attempt);
+      runs.push({ analysis: lastAnalysis.get(key), attempt });
+    }
+  } else if (first?.error || first?.failedChoices || covered().length) {
+    const remote = (await resolveSettings(document)).mode !== 'local';
+    let fruitless = 0, left = covered().length;
+    for (const attempt of await otherCompilations(document, { max: remote ? 4 : 8 })) {
+      outputChannel.appendLine(`  compiling ${path.basename(document.fileName)} again as ${attempt.label} sees it`);
+      const outcome = await runAnalysis(document, { context: attempt });
+      if (outcome?.stopped) { if (runs.length) lastAnalysis.set(key, runs.reduce((p, r) => (without(r).length < without(p).length ? r : p)).analysis); return; }
+      tried++;
       if (outcome?.error) {
         outputChannel.appendLine(`  that did not compile: ${oneLine(outcome.error.message)}`);
         if (!outcome.error.compileFailed) break;     // the server or the network: no use asking again now
         continue;
       }
-      const made2 = lastAnalysis.get(key);
-      made2.compiledAs = path.basename(attempt.from);
-      results.push(made2);
-      if (!best || functionsWithoutCode(document, [made2]).length < functionsWithoutCode(document, [best]).length) { best = made2; context = attempt; bestCompilation.set(key, attempt.from); }
-      if (!functionsWithoutCode(document, results).length) break;
+      describe(lastAnalysis.get(key), attempt);
+      runs.push({ analysis: lastAnalysis.get(key), attempt });
+      const now = covered().length;
+      if (!now && !outcome?.failedChoices) break;
+      // Compiler Explorer is shared: not on and on when nothing changes.
+      fruitless = now < left ? 0 : fruitless + 1;
+      left = now;
+      if (remote && fruitless >= 2) break;
     }
-    // Nothing better: the plain way, without looking again on every edit.
-    if (!bestCompilation.has(key)) bestCompilation.set(key, null);
   }
-  if (best) {
-    lastAnalysis.set(key, best);
-    results.filter(a => a !== best).filter(a => functionsWithoutCode(document, [best]).some(d => !functionsWithoutCode(document, [a]).includes(d)))
-      .forEach((a, i) => lastAnalysis.set(extraKey(key, i), a));
-    const missing = functionsWithoutCode(document, results).filter(d => !d.templated && !d.macroLike && sourceInfo(document).conditions[d.nameLine ?? d.startLine] === undefined);
-    const failed = [...(best.skipped || []), ...(best.unkept || [])];
-    const unknown = missing.filter(d => !failed.some(k => d.nameLine >= k.startLine && d.nameLine <= k.endLine));
-    if (unknown.length && !(job?.auto && callsUseless.has(key))) {
-      const outcome = await runAnalysis(document, { context, calls: unknown });
-      if (outcome?.stopped) { lastAnalysis.set(key, best); return; }
-      const called = !outcome?.error ? lastAnalysis.get(key) : best;
-      if (called !== best && functionsWithoutCode(document, [called]).length < functionsWithoutCode(document, [best]).length) {
-        called.compiledAs = best.compiledAs;
-        best = called;
-      } else {
-        lastAnalysis.set(key, best);
-        callsUseless.add(key);
-      }
-    }
-    logFunctionsWithoutCode(document, [...lastAnalysisOf(key)]);
-    codeLensEmitter?.fire();
+  if (!runs.length) {
+    if (first?.error) reportFailure(first.error);
     return;
   }
-  if (first?.error) reportFailure(first.error);
+  // The result with most code is the main one, and those with code it lacks stay next to it.
+  let best = runs[0];
+  for (const r of runs) if (without(r).length < without(best).length) best = r;
+  lastAnalysis.set(key, best.analysis);
+  best.analysis.otherBuild = false;
+  const usesDatabase = (await resolveSettings(document)).compileCommands?.length > 0;
+  best.analysis.triedCompilations = usesDatabase ? tried : 0;
+  let lacking = without(best);
+  const extras = [];
+  for (const r of runs) {
+    if (r === best) continue;
+    const mine = without(r);
+    const adds = lacking.filter(d => !mine.includes(d));
+    if (!adds.length) continue;
+    lacking = lacking.filter(d => mine.includes(d));
+    r.analysis.otherBuild = true;
+    r.analysis.timestamp = best.analysis.timestamp - 1 - extras.length;     // the main result decides first
+    lastAnalysis.set(extraKey(key, extras.length), r.analysis);
+    extras.push(r);
+  }
+  bestCompilation.set(key, { main: best.attempt, extras: extras.map(r => r.attempt).filter(Boolean) });
+  context = best.attempt;
+  const failed = [...(best.analysis.skipped || []), ...(best.analysis.unkept || [])];
+  const unknown = lacking.filter(d => !d.templated && !d.macroLike && sourceInfo(document).conditions[d.nameLine ?? d.startLine] === undefined
+    && !failed.some(k => d.nameLine >= k.startLine && d.nameLine <= k.endLine));
+  if (unknown.length && !(job?.auto && callsUseless.has(key))) {
+    const outcome = await runAnalysis(document, { context, calls: unknown });
+    if (outcome?.stopped) { lastAnalysis.set(key, best.analysis); return; }
+    const called = !outcome?.error ? lastAnalysis.get(key) : best.analysis;
+    if (called !== best.analysis && functionsWithoutCode(document, [called]).length < without(best).length) {
+      called.compiledAs = best.analysis.compiledAs;
+      called.triedCompilations = best.analysis.triedCompilations;
+      best = { analysis: called, attempt: best.attempt };
+    } else {
+      lastAnalysis.set(key, best.analysis);
+      callsUseless.add(key);
+    }
+  }
+  logFunctionsWithoutCode(document, lastAnalysisOf(key));
+  codeLensEmitter?.fire();
 }
 
 // Automatic analyses do not compile again with calls where that found nothing.
@@ -1383,6 +1485,12 @@ function lastAnalysisOf(key) {
   return [...lastAnalysis.entries()].filter(([k]) => k === key || k.startsWith(`${key}\n#`)).map(([, a]) => a);
 }
 
+function sourceTemplate(document, def) {
+  const { text, defs } = sourceInfo(document);
+  const target = scan.templateTargetAt(text, def.nameLine ?? def.startLine, defs, def);
+  return target && !target.unsupported ? target : undefined;
+}
+
 // What the Asm Lens output says about functions that have no code in the end.
 function logFunctionsWithoutCode(document, analyses) {
   const { conditions } = sourceInfo(document);
@@ -1390,7 +1498,8 @@ function logFunctionsWithoutCode(document, analyses) {
   for (const d of functionsWithoutCode(document, analyses)) {
     const line = d.nameLine ?? d.startLine;
     const failed = [...(main.skipped || []), ...(main.unkept || [])].find(k => line >= k.startLine && line <= k.endLine);
-    const reason = d.templated ? 'a template with no types that compile yet'
+    const trouble = d.templated ? templateTrouble(document, sourceTemplate(document, d)) : undefined;
+    const reason = d.templated ? (trouble ? `${trouble.expr} does not compile: ${trouble.message}. Click its CodeLens to choose other types.` : 'no types yet. Click its CodeLens to choose them.')
       : conditions[line] ? `inside ${conditions[line]}, which is off`
         : failed ? `the compiler says: ${failed.message || 'compile error'}`
           : d.macroLike ? 'it looks like a macro call, so it was not kept'
@@ -1407,17 +1516,15 @@ function reportFailure(e) {
   if (!job?.quiet) vscode.window.showErrorMessage(`Asm Lens: ${message}`);
 }
 
-// How `file` sees `document`: the preprocessor lines before its #include (through other
-// headers too), the folders those lines need, and its entry in compile_commands.json if it has one.
-async function includerContext(document, file) {
+// How `file` sees `document`: the preprocessor lines before its #include (through other headers
+// too), the includes after it (for types), the folders those lines need, and `entry`, the
+// entry of compile_commands.json to compile with if there is one.
+async function includerContext(document, file, entry) {
   const target = path.basename(document.uri.fsPath);
   const readFile = p => {
     const open = (vscode.workspace.textDocuments || []).find(d => d.uri.scheme === 'file' && normPath(d.uri.fsPath) === normPath(p));
     return open ? Promise.resolve(open.getText()) : fs.readFile(p, 'utf8').catch(() => undefined);
   };
-  const resolved = await resolveSettings(document);
-  const db = resolved.compileCommands?.length ? await compileCommands.loadDatabases(resolved.compileCommands) : undefined;
-  const entry = db?.byFile.get(normPath(file));
   const dirs = entry ? flagsLib.includeDirsOf(flagsLib.compileFlagsOf(entry), entry.directory) : [];
   const follow = async (name, dir) => {
     for (const base of [dir, ...dirs]) {
@@ -1427,56 +1534,87 @@ async function includerContext(document, file) {
     }
     return undefined;
   };
-  const text = await readFile(file);
+  const text = normPath(file) === docPathKey(document) ? undefined : await readFile(file);
   const found = text === undefined ? undefined : await scan.includeContext(text, target, { follow, dir: path.dirname(file) });
-  return { text: found?.text || '', dirs: found?.dirs || [], from: file, entryFile: entry ? file : undefined };
+  const after = [];
+  for (const line of found?.after || []) {
+    const inc = /^\s*#\s*include\s*["<]([^">]+)[">]/.exec(line);
+    // One that includes this file too would define everything twice.
+    if (inc && await reachesDocument(document, inc[1], [path.dirname(file), ...dirs], dirs)) continue;
+    after.push(line);
+  }
+  const target32 = entry ? flagsLib.targetFlags(flagsLib.compileFlagsOf(entry)) : [];
+  return {
+    text: found?.text || '', dirs: found?.dirs || [], after, from: file, entry,
+    label: [path.basename(file), ...target32].join(' ')
+  };
 }
 
-// The other ways to compile `document`: as the files including it see it, best first. Analyzed
-// files, then files of compile_commands.json, else one found in the workspace. Without
-// new lines in front and without flags of its own, a way is the same as compiling it alone.
-const includerSearches = new Map();
-async function otherCompilations(document, { max = 4 } = {}) {
-  const pathKey = docPathKey(document);
-  const files = [...analyzedFiles.entries()]
-    .filter(([root, e]) => root !== fileKey(document) && !root.includes('\n#') && e.deps.has(pathKey) && e.uri.scheme === 'file')
-    .sort((a, b) => b[1].stamp - a[1].stamp).map(([, e]) => e.uri.fsPath);
-  const resolved = await resolveSettings(document);
-  if (resolved.compileCommands?.length) {
-    const db = await compileCommands.loadDatabases(resolved.compileCommands);
-    for (const e of await compileCommands.includersOf(db, document.uri.fsPath)) files.push(e.file);
+async function reachesDocument(document, name, places, dirs) {
+  for (const base of places) {
+    const p = path.resolve(base, name);
+    if (normPath(p) === docPathKey(document) || await compileCommands.reaches(p, document.uri.fsPath, dirs)) return true;
   }
-  if (!files.length && vscode.workspace.findFiles) {
+  return false;
+}
+
+// The other ways to compile `document`, best first: every entry of compile_commands.json for it
+// (another build of the same file), and as the files including it see it: analyzed files, those of
+// the database, else one found in the workspace. A way that is the same as compiling it plainly is left out.
+const includerSearches = new Map();
+async function otherCompilations(document, { max = 8 } = {}) {
+  const own = document.uri.fsPath;
+  const pathKey = docPathKey(document);
+  const resolved = await resolveSettings(document);
+  const db = resolved.compileCommands?.length ? await compileCommands.loadDatabases(resolved.compileCommands) : undefined;
+  const candidates = [];
+  const analyzed = [...analyzedFiles.entries()]
+    .filter(([root, e]) => root !== fileKey(document) && e.deps.has(pathKey) && e.uri.scheme === 'file')
+    .sort((a, b) => b[1].stamp - a[1].stamp).map(([, e]) => e.uri.fsPath);
+  for (const file of analyzed) {
+    const list = db ? compileCommands.entriesOf(db, file) : [];
+    if (list.length) for (const entry of list) candidates.push({ file, entry }); else candidates.push({ file });
+  }
+  if (db) {
+    for (const entry of compileCommands.entriesOf(db, own)) candidates.push({ file: own, entry });
+    for (const entry of await compileCommands.includersOf(db, own)) candidates.push({ file: entry.file, entry });
+  }
+  if (!candidates.length && HEADER_RE.test(document.fileName) && vscode.workspace.findFiles) {
     if (!includerSearches.has(pathKey)) {
       includerSearches.set(pathKey, (async () => {
-        const target = path.basename(document.uri.fsPath).toLowerCase();
+        const target = path.basename(own).toLowerCase();
         const uris = await vscode.workspace.findFiles('**/*.{c,cc,cpp,cxx,c++,C,m,mm}', '**/{node_modules,.git}/**', 300);
         for (const uri of uris) {
           if (uri.scheme !== 'file') continue;
           const text = await fs.readFile(uri.fsPath, 'utf8').catch(() => undefined);
           if (text !== undefined && text.toLowerCase().includes(target)) {
             const seen = await includerContext(document, uri.fsPath);
-            if (/\S/.test(seen.text)) return uri.fsPath;
+            if (/\S/.test(seen.text) || seen.after.length) return uri.fsPath;
           }
         }
         return undefined;
       })().catch(() => undefined));
     }
     const found = await includerSearches.get(pathKey);
-    if (found) files.push(found);
+    if (found) candidates.push({ file: found });
   }
-  const out = [];
-  const seen = new Set();
-  for (const file of files) {
-    if (out.length >= max) break;
-    const attempt = await includerContext(document, file);
-    const flags = attempt.entryFile ? flagsLib.compileFlagsOf((await compileCommands.loadDatabases(resolved.compileCommands)).byFile.get(normPath(file))).join(' ') : '';
-    const id = `${attempt.text}\n${flags}`;
-    if (seen.has(id) || (!attempt.entryFile && !/\S/.test(attempt.text))) continue;
+  const flagsOf = e => (e ? flagsLib.compileFlagsOf(e).join(' ') : '');
+  const usual = db ? (await compileCommands.entryFor(db, own, { includedBy: includersOf(document) }))?.entry : undefined;
+  const seen = new Set([`\n\n${flagsOf(usual)}`]);
+  const hasTemplates = sourceInfo(document).templated.length > 0;
+  const fresh = [], repeats = [];
+  const builds = new Set(usual ? [compileCommands.buildOf(usual)] : []);
+  for (const { file, entry } of candidates) {
+    const attempt = await includerContext(document, file, entry);
+    const id = `${attempt.text}\n${attempt.after.join('\n')}\n${flagsOf(entry)}`;
+    if (seen.has(id)) continue;
+    if (!entry && !/\S/.test(attempt.text) && !(attempt.after.length && hasTemplates)) continue;
     seen.add(id);
-    out.push(attempt);
+    // Another build first: it is what can turn on what this one has off.
+    const build = entry ? compileCommands.buildOf(entry) : '';
+    if (entry && !builds.has(build)) { builds.add(build); fresh.push(attempt); } else repeats.push(attempt);
   }
-  return out;
+  return [...fresh, ...repeats].slice(0, max);
 }
 
 // What compile_commands.json says about `document`, for a compile on a server: the
@@ -1486,8 +1624,8 @@ async function databaseFlags(document, resolved, context) {
   if (!resolved.compileCommands?.length) return { flags: '', dirs: [] };
   const db = await compileCommands.loadDatabases(resolved.compileCommands);
   for (const e of db.errors) outputChannel.appendLine(`compile_commands: ${e}`);
-  const given = context?.entryFile ? db.byFile.get(normPath(context.entryFile)) : undefined;
-  const match = given ? { entry: given, reason: `the entry of ${path.basename(given.file)}, which includes it` } : await compileCommands.entryFor(db, document.uri.fsPath, { includedBy: includersOf(document) });
+  const given = context?.entry;
+  const match = given ? { entry: given, reason: `the entry of ${path.basename(given.file)}` } : await compileCommands.entryFor(db, document.uri.fsPath, { includedBy: includersOf(document) });
   if (!match) return { flags: '', dirs: [] };
   const portable = flagsLib.portableFlags(match.entry);
   outputChannel.appendLine(`  compile_commands: ${match.reason}: ${portable.flags || '(no flags to use here)'}`);
@@ -1528,12 +1666,12 @@ async function runAnalysis(document, { context, calls } = {}) {
     // MSVC does not know __attribute__((used)): functions are kept by taking their address (clang-cl knows it).
     const marksKey = `${document.uri.toString()}\n${compilerId}\n${flags}`;
     const marks = marksRejected.has(marksKey) ? 'none' : msvcStyle && !/clang/i.test(`${compilerId} ${resolved.active.name || ''}`) ? 'address' : 'attribute';
-    const prepared = prepareCSource(document, { marks, compiler: compilerId, calls });
+    const prepared = prepareCSource(document, { marks, compiler: compilerId, calls, context });
     report('finding local headers…');
     const includeBundle = await collectLocalIncludes(document, [...resolved.includePaths, ...database.dirs, ...(context?.dirs || [])], {
       maxFiles: resolved.maxIncludeFiles, buildFolders: resolved.buildFolders,
       excludePaths: resolved.excludePaths, uploadSystemHeaders: resolved.uploadSystemHeaders,
-      contextText: context?.text
+      contextText: [context?.text, ...(context?.after || [])].filter(Boolean).join('\n')
     });
     const maxAttempts = Math.max(1, Number(settings.get('maxRecoveryAttempts', 12)));
     const recoverErrors = settings.get('skipFailingFunctions', true);
@@ -1561,7 +1699,7 @@ async function runAnalysis(document, { context, calls } = {}) {
         marksRejected.add(marksKey);
       }
     }
-    rememberRejected(document, compilerId, prepared, compiled.failedLines);
+    rememberRejected(document, compilerId, prepared, compiled.failedMessages, context);
     const { data, effectiveFlags } = compiled;
     const asmRows = Array.isArray(data.asm) ? data.asm : [];
     const rootPathKey = docPathKey(document);
@@ -1608,9 +1746,10 @@ async function runAnalysis(document, { context, calls } = {}) {
     for (const k of compiled.unkept || []) outputChannel.appendLine(`  not kept (fails when it is emitted): ${k.name} at line ${k.startLine + 1}: ${k.message}`);
     for (const u of includeBundle.unresolved) outputChannel.appendLine(`  not found: #include "${u.name}" (from ${u.from})`);
     if (includeBundle.truncated) outputChannel.appendLine('  include discovery stopped at the asmLens.maxIncludeFiles limit.');
-    await dropFailedInstantiations(document, compiled.failedInstantiations);
-    if (!functions.length && prepared.isHeader) return reportHeaderWithoutCode(document, compiled.skipped.length);
+    noteFailedInstantiations(document, compiled.failedInstantiations);
+    if (!functions.length && prepared.isHeader) { reportHeaderWithoutCode(document, compiled.skipped.length); return { failedChoices: compiled.failedInstantiations.length > 0 }; }
     tell(`Asm Lens: found ${functions.length} emitted function bodies${includeBundle.pathMap.length ? `; uploaded ${includeBundle.pathMap.length} local header(s)` : ''}${notes.length ? ` (${notes.join('; ')}; see the Asm Lens output)` : ''}.`);
+    return { failedChoices: compiled.failedInstantiations.length > 0 };
   } catch (e) {
     if (e.name === 'Cancelled' || jobContext.getStore()?.cancelled) {
       const reason = jobContext.getStore()?.cancelReason;
@@ -1641,7 +1780,7 @@ function reportHeaderWithoutCode(document, skipped = 0) {
 // made automatically (with the types the code uses, else suggested ones; a line
 // that does not compile is dropped silently), calls of friend functions, then
 // the marks' lines come after the file's last line, from `firstLine` on (-1: none).
-function prepareCSource(document, { marks = 'attribute', compiler = '', calls } = {}) {
+function prepareCSource(document, { marks = 'attribute', compiler = '', calls, context } = {}) {
   const original = document.getText();
   const isHeader = HEADER_RE.test(document.fileName);
   const isCpp = /cpp/.test(document.languageId);
@@ -1649,13 +1788,15 @@ function prepareCSource(document, { marks = 'attribute', compiler = '', calls } 
   const unused = isHeader || config().get('emitUnusedFunctions', true);
   const defs = isCpp ? scan.scanDefinitions(original) : undefined;
   const autos = isCpp && unused && config().get('autoInstantiateTemplates', true)
-    ? scan.autoInstantiations(original, { defs, manual: insts, contexts: includerTexts(document), rejected: jobContext.getStore()?.auto ? autoRejected.get(`${fileKey(document)}\n${compiler}`) : undefined })
+    ? scan.autoInstantiations(original, { defs, manual: insts, contexts: includerTexts(document), rejected: jobContext.getStore()?.auto ? autoRejected.get(`${fileKey(document)}\n${compiler}\n${context?.from || ''}`) : undefined })
     : [];
   if (autos.length) outputChannel?.appendLine(`  templates compiled for: ${autos.map(it => it.expr).join(', ')}`);
   const requests = [...insts, ...autos];
   const called = calls ? scan.callLines(calls, { c: !isCpp }) : [];
   const friends = [...(isCpp ? scan.friendUseLines(original, requests, defs) : []), ...called];
-  const withInsts = text => scan.appendInstantiations(text, requests, friends).text;
+  // Before them: what the types they name need.
+  const before = requests.length ? [...scan.includesForTypes(requests), ...(context?.after || [])] : [];
+  const withInsts = text => scan.appendInstantiations(text, requests, friends, before).text;
   const plain = withInsts(original);
   const keep = marks !== 'none' && unused;
   let kept;
@@ -1676,19 +1817,27 @@ function prepareCSource(document, { marks = 'attribute', compiler = '', calls } 
   }
   const base = original.endsWith('\n') ? original : `${original}\n`;
   const appended = requests.length || friends.length || (kept !== undefined && marks === 'address');
-  return { isHeader, firstLine: appended ? (base.match(/\n/g) || []).length : -1, instCount: insts.length, requests, callTargets: called.targets, kept, plain };
+  return { isHeader, firstLine: appended ? (base.match(/\n/g) || []).length + before.length : -1, instCount: insts.length, requests, callTargets: called.targets, kept, plain };
 }
 
-// Automatic instantiations that did not compile, per file and compiler: automatic
-// analyses leave them out, so that typing does not cost two compiles each time. An
-// analysis the user asks for tries them again.
+// Automatic instantiations that did not compile, per file, compiler and way of compiling:
+// automatic analyses leave them out, so that typing does not cost two compiles each time. An
+// analysis the user asks for tries them again. The message is what the CodeLens says.
 const autoRejected = new Map();
-function rememberRejected(document, compiler, prepared, failedLines) {
-  const key = `${fileKey(document)}\n${compiler}`;
+function rememberRejected(document, compiler, prepared, failedMessages, context) {
+  const key = `${fileKey(document)}\n${compiler}\n${context?.from || ''}`;
   if (autoRejected.size > 200) autoRejected.clear();
   const known = jobContext.getStore()?.auto ? [...(autoRejected.get(key) || [])] : [];
-  const failed = [...failedLines].map(l => prepared.requests[l - prepared.firstLine]).filter((it, i) => it && [...failedLines][i] - prepared.firstLine >= prepared.instCount).map(it => it.expr);
-  autoRejected.set(key, new Set([...known, ...failed]));
+  const failed = [...failedMessages].map(([l, message]) => ({ it: prepared.requests[l - prepared.firstLine], index: l - prepared.firstLine, message }))
+    .filter(x => x.it && x.index >= prepared.instCount);
+  autoRejected.set(key, new Set([...known, ...failed.map(x => x.it.expr)]));
+  const trouble = autoTrouble.get(fileKey(document)) || [];
+  // The newest message: a later compile has more of what the type needs, so it says more.
+  for (const x of failed) {
+    const known = trouble.find(k => k.expr === x.it.expr);
+    if (known) known.message = x.message; else trouble.push({ name: scan.templateName(x.it.expr), expr: x.it.expr, message: x.message });
+  }
+  autoTrouble.set(fileKey(document), trouble);
 }
 
 // The text of the analyzed files that include `document`, newest first: they show which types its templates are used with.
@@ -1925,20 +2074,19 @@ function errorsOnly(err) {
 // (without syntax flags) and where they came from. The entry of
 // compile_commands.json when one fits (the file's own, that of a file including
 // it, or one in the nearest folder), else the settings.
-async function localCompilePlan(document, resolved, baseDir, entryFile) {
+async function localCompilePlan(document, resolved, baseDir, entry) {
   const fileDir = path.dirname(document.uri.fsPath);
   if (resolved.compileCommands && resolved.compileCommands.length) {
     const db = await compileCommands.loadDatabases(resolved.compileCommands);
     for (const e of db.errors) outputChannel.appendLine(`compile_commands: ${e}`);
-    const given = entryFile ? db.byFile.get(normPath(entryFile)) : undefined;
-    const match = given ? { entry: given, reason: `the entry of ${path.basename(given.file)}, which includes it` } : await compileCommands.entryFor(db, document.uri.fsPath, { includedBy: includersOf(document) });
+    const match = entry ? { entry, reason: `the entry of ${path.basename(entry.file)}` } : await compileCommands.entryFor(db, document.uri.fsPath, { includedBy: includersOf(document) });
     if (match) {
       const { args, syntax } = flagsLib.stripSyntaxArgs([...await withoutOwnForcedInclude(document, match.entry), ...splitArgs(resolved.activeExtraFlags)]);
       return {
         compiler: flagsLib.entryCompiler(match.entry),
         cwd: match.entry.directory,
         args, syntax, fromDatabase: true,
-        display: 'compile_commands.json',
+        display: ['compile_commands.json', ...flagsLib.targetFlags(args)].join(' '),
         description: `compile_commands.json: ${match.reason} (${match.entry.file}, from ${match.entry.database})`
       };
     }
@@ -2035,7 +2183,7 @@ async function analyzeLocal(document, resolved, settings, { context, calls } = {
   const maxAttempts = Math.max(1, Number(settings.get('maxRecoveryAttempts', 12)));
   const recoverErrors = settings.get('skipFailingFunctions', true);
   const lang = resolved.language === 'c' ? 'c' : 'c++';
-  const plan = await localCompilePlan(document, resolved, baseDir, context?.entryFile);
+  const plan = await localCompilePlan(document, resolved, baseDir, context?.entry);
   const { compiler, cwd } = plan;
   const info = await compilerInfo(compiler, cwd, timeoutMs);
   if (info.kind === 'msvc') {
@@ -2052,12 +2200,13 @@ async function analyzeLocal(document, resolved, settings, { context, calls } = {
   await fs.rm(stubDir, { recursive: true, force: true });
   const stubbed = [];
   const skipped = [];
-  const prepared = prepareCSource(document, { compiler, calls });
+  const prepared = prepareCSource(document, { compiler, calls, context });
   let source = prepared.kept ?? prepared.plain;
   let plainSource = prepared.plain;
   let keptHeader = prepared.kept !== undefined;
   const failedInstantiations = [];
   const failedLines = new Set();
+  const failedMessages = new Map();
   const unkept = [];
   const retargeted = [];
   let marksDropped;
@@ -2108,10 +2257,13 @@ async function analyzeLocal(document, resolved, settings, { context, calls } = {
     }
     // A requested template instantiation that does not compile is dropped.
     if (!progressed) {
-      const message = firstErrorMessage(err);
+      const first = firstErrorMessage(err);
+      const lineErrors = errorLinesIn(err, isMain);
       for (const l of instantiationLinesIn(err, prepared.firstLine, isMain, prepared.instCount)) {
         if (failedLines.has(l)) continue;
         failedLines.add(l);
+        const message = lineErrors.get(l) || first;
+        failedMessages.set(l, message);
         source = blankLine(source, l);
         plainSource = blankLine(plainSource, l);
         if (l - prepared.firstLine < prepared.instCount) failedInstantiations.push({ index: l - prepared.firstLine, message });
@@ -2158,7 +2310,7 @@ async function analyzeLocal(document, resolved, settings, { context, calls } = {
     }
   }
 
-  rememberRejected(document, compiler, prepared, failedLines);
+  rememberRejected(document, compiler, prepared, failedMessages, context);
   // Demangle names (if c++filt exists) so they match source function names.
   report('reading the assembly…');
   const macho = isMachO(asm);
@@ -2181,7 +2333,7 @@ async function analyzeLocal(document, resolved, settings, { context, calls } = {
     callTargets: prepared.callTargets,
     marksDropped,
     stubbed,
-    includes: await localIncludes(`${context?.text || ''}\n${document.getText()}`, fileDir, flagsLib.includeDirsOf(args, cwd))
+    includes: await localIncludes(`${context?.text || ''}\n${(context?.after || []).join('\n')}\n${document.getText()}`, fileDir, flagsLib.includeDirsOf(args, cwd))
   });
   const ms = Date.now() - started;
   outputChannel.appendLine(`Local compile of ${document.fileName} took ${ms} ms; found ${result.functions.length} emitted function(s).`);
@@ -2191,9 +2343,10 @@ async function analyzeLocal(document, resolved, settings, { context, calls } = {
   for (const n of stubbed) outputChannel.appendLine(`  missing header treated as empty: ${n}`);
   for (const k of skipped) outputChannel.appendLine(`  skipped (does not compile): ${k.name || '(declaration)'} at line ${k.startLine + 1}-${k.endLine + 1}${k.message ? `: ${k.message}` : ''}`);
   for (const k of unkept) outputChannel.appendLine(`  not kept (fails when it is emitted): ${k.name} at line ${k.startLine + 1}: ${k.message}`);
-  await dropFailedInstantiations(document, failedInstantiations);
-  if (!result.functions.length && prepared.isHeader) return reportHeaderWithoutCode(document, skipped.length);
+  noteFailedInstantiations(document, failedInstantiations);
+  if (!result.functions.length && prepared.isHeader) { reportHeaderWithoutCode(document, skipped.length); return { failedChoices: failedInstantiations.length > 0 }; }
   tell(`Asm Lens (local): found ${result.functions.length} emitted function bodies in ${ms} ms${stubbed.length || skipped.length ? ' (see the Asm Lens output)' : ''}.`);
+  return { failedChoices: failedInstantiations.length > 0 };
 }
 
 // ---------------------------------------------------------------------------
@@ -2406,6 +2559,7 @@ async function compileWithRecovery(opts) {
   const skipped = [];
   const failedInstantiations = [];
   const failedLines = new Set();
+  const failedMessages = new Map();
   const removedFlags = [];
   const unkept = [];
   const retargeted = [];
@@ -2419,7 +2573,7 @@ async function compileWithRecovery(opts) {
     const data = await postCompile({ ...opts, source, files, flags });
     if (data.code === undefined || data.code === 0) {
       if (attempt > 1) outputChannel.appendLine(`Compiled after ${attempt - 1} recovery step(s).`);
-      return { data, effectiveFlags: flags, skipped, stubbed, failedInstantiations, removedFlags, failedLines, unkept, retargeted };
+      return { data, effectiveFlags: flags, skipped, stubbed, failedInstantiations, removedFlags, failedLines, failedMessages, unkept, retargeted };
     }
     lastErr = stderrText(data) || `Compiler exited with code ${data.code}`;
 
@@ -2459,10 +2613,13 @@ async function compileWithRecovery(opts) {
     }
 
     // 2. A requested template instantiation that does not compile -> drop it.
-    const message = firstErrorMessage(lastErr);
+    const firstMessage = firstErrorMessage(lastErr);
+    const lineErrors = errorLinesIn(lastErr, isRemoteMain);
     for (const l of instantiationLinesIn(lastErr, opts.instFirstLine ?? -1, isRemoteMain, opts.instCount ?? 0)) {
       if (failedLines.has(l)) continue;
       failedLines.add(l);
+      const message = lineErrors.get(l) || firstMessage;
+      failedMessages.set(l, message);
       source = blankLine(source, l);
       if (plainSource !== undefined) plainSource = blankLine(plainSource, l);
       if (l - opts.instFirstLine < (opts.instCount ?? Infinity)) failedInstantiations.push({ index: l - opts.instFirstLine, message });

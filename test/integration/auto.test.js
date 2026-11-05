@@ -160,8 +160,47 @@ async function werror(config) {
   assert.match(await x.lensAt('h.hxx', 3) || '', CODE);
 }
 
+// Two builds of the same file; what each has off, the other shows. Real -m32 and -m64 where they work.
+async function twoBuilds(config, flagA, flagB, macroA, macroB) {
+  const header = `#pragma once\nstatic inline int both(int x) { return x + 1; }\n#ifdef ${macroA}\nstatic inline long only_a(long x) { return x + 2; }\n#endif\n#ifdef ${macroB}\nstatic inline long long only_b(long long x) { return x + 3; }\n#endif\n#if defined(${macroB})\nstatic inline int same(int x) { return x + 6; }\n#else\nstatic inline int same(int x) { return x + 7; }\n#endif\n#ifdef NEVER_DEFINED\nstatic inline int never(int x) { return x; }\n#endif\n`;
+  const entry = flag => ({ directory: '.', file: 'u.cpp', command: `${config.cc || 'g++'} ${flag} -O2 -c u.cpp -o u.o` });
+  const x = start(makeProject({
+    'arch.hxx': header,
+    'u.cpp': '#include "arch.hxx"\nint u(int x) { return both(x); }\n',
+    'compile_commands.json': JSON.stringify([entry(flagA), entry(flagB)])
+  }, { ...config.json, compileCommands: 'compile_commands.json' }));
+  assert.deepEqual((await x.analyze('arch.hxx')).error, [], x.state.outputLines.join('\n'));
+  const lenses = main(await x.lenses('arch.hxx'));
+  const at = l => lenses.find(k => k.line === l)?.title || '';
+  for (const line of [2, 4, 7, 10, 12]) assert.match(at(line), CODE, `line ${line}: ${at(line)}\n${x.state.outputLines.slice(-14).join('\n')}`);
+  assert.match(at(15), /Not compiled · inside #ifdef NEVER_DEFINED, which is off in all \d+ compile commands tried/);
+}
+
+// Types chosen by hand that need what the .cpp includes, or a standard header nobody included.
+async function chosenTypes(config) {
+  const types = '#pragma once\nstruct Point { int x, y; Point operator+(const Point& o) const { return {x + o.x, y + o.y}; } };\n';
+  const tmpl = '#pragma once\n#include <cstddef>\ntemplate <typename T>\nT dot(const T* a, std::size_t n) { T s{}; for (std::size_t i = 0; i < n; ++i) s = s + a[i]; return s; }\ntemplate <typename C>\nauto count(const C& c) { return c.size(); }\ntemplate <typename T>\nstruct Box {\n  T v;\n  T get() const { return v; }\n  template <typename U> U conv() const { return static_cast<U>(1); }\n};\ntemplate <typename T>\nstruct NeedsType { typename T::value_type first(const T& c) const { return *c.begin(); } };\n';
+  const x = start(makeProject({ 'tmpl.hxx': tmpl, 'types.h': types, 'u.cpp': '#include "tmpl.hxx"\n#include "types.h"\nint u() { Box<Point> b{}; return b.get().x; }\n' }, config));
+  const lens = async l => main(await x.settled('tmpl.hxx')).find(k => k.line === l)?.title || '';
+  assert.deepEqual((await x.analyze('u.cpp')).error, [], x.state.outputLines.join('\n'));
+  await x.settled('tmpl.hxx');
+  assert.match(await lens(10), /^\$\(symbol-numeric\).*Box<Point>/, `the type the .cpp uses: ${await lens(10)}`);
+  assert.match(await lens(11), CODE, `a member template of it: ${await lens(11)}`);
+  assert.match(await lens(14), /^\$\(warning\) NeedsType<int> does not compile: .* · click to choose types$/, await lens(14));
+  // A lens sits on the first line of the definition: `template <...>` for these two.
+  for (const [line, at, type, name] of [[6, 5, 'std::vector<int>', 'count'], [4, 3, 'Point', 'dot'], [14, 14, 'std::vector<int>', 'NeedsType']]) {
+    assert.deepEqual((await x.instantiate('tmpl.hxx', line, type)).warning, [], `${name}<${type}>\n${x.state.outputLines.slice(-10).join('\n')}`);
+    assert.match(await lens(at), CODE, `${name}<${type}>: ${await lens(at)}\n${x.state.outputLines.slice(-10).join('\n')}`);
+    assert.ok((await lens(at)).includes(name) || !x.ext._internals.analysesFor(x.open('tmpl.hxx')).every(a => a.functions.every(f => !/^"?\?/.test(f.name))), await lens(at));
+  }
+  assert.deepEqual(x.ext._internals.instantiationsFor(x.open('tmpl.hxx')).map(i => i.expr).sort(), ['NeedsType<std::vector<int>>', 'count<std::vector<int>>', 'dot<Point>']);
+}
+
 for (const cc of localCompilers()) {
   const config = { mode: 'local', compiler: cc, flags: '-O2 -std=c++20' };
+  test(`local ${cc}: two builds of a file in compile_commands.json`, () => twoBuilds({ cc, json: { mode: 'local' } }, '-DBUILD_A', '-DBUILD_B', 'BUILD_A', 'BUILD_B'));
+  if (process.platform === 'linux' && process.arch === 'x64') test(`local ${cc}: real -m32 and -m64 builds`, () => twoBuilds({ cc, json: { mode: 'local' } }, '-m32', '-m64', '__i386__', '__x86_64__'));
+  test(`local ${cc}: chosen types that need the .cpp's includes or a standard header`, () => chosenTypes(config));
   test(`local ${cc}: a forced include that already includes the header is left out`, () => forcedInclude(cc));
   test(`local ${cc}: -Wall -Werror does not stop a header`, () => werror({ mode: 'local', compiler: cc, flags: '-O2 -std=c++17 -Wall -Wextra -Werror' }));
   test(`local ${cc}: types in capitals, macros around the signature`, () => realWorld(config));
@@ -179,6 +218,8 @@ for (const id of ['g152', 'clang2010', 'vcpp_v19_latest_x64']) {
   const msvc = /^vcpp/.test(id);
   const remote = fn => async () => { const ce = installFetch(); try { await fn(); } finally { ce.restore(); } };
   test(`remote ${id} (Compiler Explorer): types in capitals, macros around the signature`, remote(() => realWorld(config)));
+  test(`remote ${id} (Compiler Explorer): two builds of a file in compile_commands.json`, remote(() => twoBuilds({ json: { compilers: [{ id, name: id }] } }, '-DBUILD_A', '-DBUILD_B', 'BUILD_A', 'BUILD_B')));
+  test(`remote ${id} (Compiler Explorer): chosen types that need the .cpp's includes or a standard header`, remote(() => chosenTypes(config)));
   if (!msvc) test(`remote ${id} (Compiler Explorer): one function that cannot be emitted costs only that function`, remote(() => emitted(config)));
   test(`remote ${id} (Compiler Explorer): a header takes the flags of each file in compile_commands.json that includes it`, remote(() => database({ compilers: [{ id, name: id }] })));
   test(`remote ${id} (Compiler Explorer): static inline functions in a header show code without a click`, remote(() => staticInline(config, { msvc })));

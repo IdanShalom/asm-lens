@@ -548,13 +548,14 @@ test('includeContext: the preprocessor lines before an #include, closed, through
   const cpp = ['#pragma once', '#define A 1', 'int code_is_left_out;', '#ifdef A', '#include <vector>', '#define MULTI \\', '  2', '#include "sub/x.hxx"', '#endif', '#define AFTER'].join('\n');
   assert.deepEqual(await scan.includeContext(cpp, 'x.hxx', { dir: '/p' }), {
     text: ['#define A 1', '#ifdef A', '#include <vector>', '#define MULTI \\\n  2', '#endif'].join('\n'),
-    dirs: ['/p']
+    dirs: ['/p'], after: []
   });
+  assert.deepEqual((await scan.includeContext('#include "x.hxx"\n#include "types.h"\n#ifdef Q\n#include "off.h"\n#endif\nusing namespace app;\nint f();\n', 'x.hxx', { dir: '/p' })).after, ['#include "types.h"', 'using namespace app;'], 'what the types it is used with need');
   assert.equal(await scan.includeContext(cpp, 'y.hxx', { dir: '/p' }), undefined);
   const follow = async (name, dir) => (name === 'mid.h' ? { text: '#define M\n#include "x.hxx"\n', dir: `${dir}/inc` } : undefined);
   assert.deepEqual(await scan.includeContext('#define T\n#include "other.h"\n#include "mid.h"\n', 'x.hxx', { follow, dir: '/p' }), {
     text: ['#define T', '#include "other.h"', '#define M'].join('\n'),
-    dirs: ['/p', '/p/inc']
+    dirs: ['/p', '/p/inc'], after: []
   });
 });
 
@@ -619,4 +620,25 @@ test('scanDefinitions: what follows code the preprocessor splits, digit separato
   assert.deepEqual(names('TEST(a, b)\n{\n}\nFoo::Foo(int x)\n  noexcept\n{\n}\n'), ['TEST', 'Foo::Foo'], 'not a macro line: the function itself');
   const marks = scan.keepHeaderFunctions('static inline int f(int x) {\n#ifdef FAST\n  if (x) {\n#else\n  if (x > 1) {\n#endif\n    return 1;\n  }\n  return 0;\n}\nstruct S { int m() const { return 1; } };\n', { all: false });
   assert.equal((marks.match(/__attribute__\(\(used\)\)/g) || []).length, 2, 'and they are kept');
+});
+
+test('includesForTypes: what a chosen type needs', () => {
+  const lines = it => scan.includesForTypes([{ expr: it }]);
+  assert.deepEqual(lines('count<std::vector<int>>'), ['#include <vector>']);
+  assert.deepEqual(lines('Box<std::array<int, 3>>'), ['#include <array>']);
+  assert.deepEqual(lines('Box<std::map<std::string, int>>'), ['#include <map>', '#include <string>']);
+  assert.deepEqual(lines('Box<uint32_t>'), ['#include <cstdint>']);
+  assert.deepEqual(lines('Box<size_t>'), ['#include <cstddef>']);
+  assert.deepEqual(lines('Box<int>'), []);
+});
+
+test('autoInstantiations: a member template of a class whose types were chosen uses those types', () => {
+  const src = 'template <class T> struct Box { T get() const { return T{}; } template <class U> U conv() const { return U{}; } };\n';
+  assert.deepEqual(scan.autoInstantiations(src, { manual: [{ kind: 'class', expr: 'Box<float>' }] }).map(it => it.expr), ['Box<float>::conv<int>']);
+});
+
+test('appendInstantiations: lines the requests need come before them, and requests start after those', () => {
+  const r = scan.appendInstantiations('int a;\n', [{ kind: 'class', expr: 'B<int>' }], [], ['#include <x>']);
+  assert.equal(r.text, 'int a;\n#include <x>\ntemplate class B<int>;\n');
+  assert.equal(r.firstLine, 2);
 });

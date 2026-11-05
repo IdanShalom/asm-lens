@@ -772,9 +772,9 @@ function templateTargetAt(text, line, defs = scanDefinitions(text), known) {
 // Source lines that request the instantiations, appended after the file's own
 // text so its line numbers do not change. `firstLine` is the 0-based line of the
 // first request; request i is on line firstLine + i.
-function appendInstantiations(text, list, extraLines = []) {
+function appendInstantiations(text, list, extraLines = [], before = []) {
   if ((!list || !list.length) && !extraLines.length) return { text, firstLine: -1 };
-  const base = text.endsWith('\n') ? text : `${text}\n`;
+  const base = `${text.endsWith('\n') ? text : `${text}\n`}${before.length ? `${before.join('\n')}\n` : ''}`;
   const firstLine = (base.match(/\n/g) || []).length;
   const lines = (list || []).map((it, i) => it.kind === 'class'
     ? `template ${it.keyword || 'class'} ${it.expr};`
@@ -819,12 +819,36 @@ function templateUsesIn(text, name, defs = scanDefinitions(text), m = maskCode(t
   return out;
 }
 
+// A template without its arguments: Box<int>::conv<float> is Box::conv.
+function templateName(s) {
+  return splitQualified(s).map(p => p.replace(/<[\s\S]*$/, '').trim()).join('::');
+}
+
+const STD_HEADERS = {
+  array: 'array', vector: 'vector', string: 'string', wstring: 'string', u8string: 'string', u16string: 'string', u32string: 'string', string_view: 'string_view',
+  map: 'map', multimap: 'map', set: 'set', multiset: 'set', unordered_map: 'unordered_map', unordered_multimap: 'unordered_map', unordered_set: 'unordered_set', unordered_multiset: 'unordered_set',
+  list: 'list', forward_list: 'forward_list', deque: 'deque', queue: 'queue', priority_queue: 'queue', stack: 'stack', pair: 'utility', tuple: 'tuple', optional: 'optional', variant: 'variant', any: 'any',
+  unique_ptr: 'memory', shared_ptr: 'memory', weak_ptr: 'memory', function: 'functional', reference_wrapper: 'functional', complex: 'complex', bitset: 'bitset', span: 'span', atomic: 'atomic', valarray: 'valarray'
+};
+
+// Includes for the types named in requests: someone who types std::vector<int> should
+// not have to care whether the header includes <vector>.
+function includesForTypes(requests) {
+  const headers = new Set();
+  for (const it of requests || []) {
+    for (const m of String(it.expr).matchAll(/\bstd::(\w+)/g)) if (STD_HEADERS[m[1]]) headers.add(STD_HEADERS[m[1]]);
+    if (/\b(?:std::)?u?int(?:8|16|32|64|_least\d+|_fast\d+|max|ptr)_t\b/.test(it.expr)) headers.add('cstdint');
+    if (/\b(?:std::)?(?:size_t|ptrdiff_t|nullptr_t|byte)\b/.test(it.expr)) headers.add('cstddef');
+  }
+  return [...headers].map(h => `#include <${h}>`);
+}
+
 // Instantiations to compile without being asked, so that a template shows its
 // code at once: for each template, the arguments written where it is used
 // (`contexts`: this file and the files including it), else the suggested ones.
 // Templates with requests of their own (`manual`) are left to those.
 function autoInstantiations(text, { defs = scanDefinitions(text), manual = [], contexts = [], rejected = new Set(), max = 30, maxPerTemplate = 3 } = {}) {
-  const withoutArgs = s => splitQualified(s).map(p => p.replace(/<[\s\S]*$/, '').trim()).join('::');
+  const withoutArgs = templateName;
   const asked = new Set(manual.map(it => withoutArgs(it.expr)));
   // A member asked for on its own (Mixed<int>::get) means its class does not compile as a whole.
   for (const it of manual) {
@@ -843,7 +867,18 @@ function autoInstantiations(text, { defs = scanDefinitions(text), manual = [], c
     const target = templateTargetAt(text, d.nameLine ?? d.startLine, defs, d);
     if (!target || target.unsupported || !target.prompts.length) continue;
     const name = withoutArgs(target.label);
-    if (seen.has(target.label) || [...asked].some(a => name === a || name.startsWith(`${a}::`))) continue;
+    if (seen.has(target.label) || asked.has(name)) continue;
+    // A member of a class whose types were chosen: those types, and for a member template its own ones.
+    const under = [...asked].find(a => name.startsWith(`${a}::`));
+    if (under) {
+      const chosen = manual.find(it => it.kind === 'class' && withoutArgs(it.expr) === under);
+      const args = chosen && /<([\s\S]*)>$/.exec(splitQualified(chosen.expr).pop() || '')?.[1];
+      if (args === undefined || args === null || target.prompts.length < 2) continue;
+      seen.add(target.label);
+      const it = target.make([args, ...target.prompts.slice(1).map(p => p.suggestion)]);
+      if (it.kind !== 'class' && !taken.has(it.expr) && !rejected.has(it.expr)) { taken.add(it.expr); out.push(it); }
+      continue;
+    }
     seen.add(target.label);
     const first = target.prompts[0];
     // The arguments of a partial specialization are its own (T of Box<T*>), not those written where it is used.
@@ -983,6 +1018,20 @@ async function includeContext(text, target, { follow, dir, depth = 0 } = {}) {
   const kept = [];
   let open = 0;
   const closeAll = () => [...kept, ...Array(Math.max(open, 0)).fill('#endif')];
+  // After the #include: the other includes and `using namespace`, for the types a template is
+  // used with (the file usually includes those later). Only those that always apply.
+  const laterLines = from => {
+    const out = [];
+    let level = open;
+    for (let k = from; k < lines.length; k++) {
+      const l = lines[k];
+      if (/^\s*#\s*(?:if|ifdef|ifndef)\b/.test(l)) level++;
+      else if (/^\s*#\s*endif\b/.test(l)) level--;
+      else if (level === open && /^\s*#\s*include\b/.test(l)) out.push(l.trim());
+      else if (level === open && /^\s*using\s+namespace\s+[\w:]+\s*;/.test(l)) out.push(l.trim());
+    }
+    return out;
+  };
   for (let i = 0; i < lines.length; i++) {
     let line = lines[i];
     if (!/^\s*#/.test(line)) continue;
@@ -992,12 +1041,12 @@ async function includeContext(text, target, { follow, dir, depth = 0 } = {}) {
     const inc = /^\s*#\s*include\s*(["<])([^">\n]+)[">]/.exec(line);
     if (inc) {
       const name = inc[2].trim();
-      if (name.replace(/\\/g, '/').split('/').pop().toLowerCase() === target.toLowerCase()) return { text: closeAll().join('\n'), dirs: dir ? [dir] : [] };
+      if (name.replace(/\\/g, '/').split('/').pop().toLowerCase() === target.toLowerCase()) return { text: closeAll().join('\n'), dirs: dir ? [dir] : [], after: laterLines(i + 1) };
       if (inc[1] === '"' && follow && depth < 8) {
         const inner = await follow(name, dir);
         if (inner) {
           const sub = await includeContext(inner.text, target, { follow, dir: inner.dir, depth: depth + 1 });
-          if (sub) return { text: [...kept, sub.text, ...Array(Math.max(open, 0)).fill('#endif')].filter(Boolean).join('\n'), dirs: [...new Set([...(dir ? [dir] : []), ...sub.dirs])] };
+          if (sub) return { text: [...kept, sub.text, ...Array(Math.max(open, 0)).fill('#endif')].filter(Boolean).join('\n'), dirs: [...new Set([...(dir ? [dir] : []), ...sub.dirs])], after: [...sub.after, ...laterLines(i + 1)] };
         }
       }
       kept.push(line);
@@ -1014,6 +1063,6 @@ async function includeContext(text, target, { follow, dir, depth = 0 } = {}) {
 module.exports = {
   maskCode, classifyFunctionSegment, blankEnclosingDeclaration,
   scanDefinitions, guessCFunctions, keepHeaderFunctions, keepByAddress, templateTargetAt, appendInstantiations,
-  autoInstantiations, templateUsesIn, friendUseLines, callLines, conditionAt, conditionsByLine, includeContext,
+  autoInstantiations, templateUsesIn, templateName, includesForTypes, friendUseLines, callLines, conditionAt, conditionsByLine, includeContext,
   defaultTemplateArgs, splitQualified, splitTemplatePrefixes, lineLocator, classifyHead
 };

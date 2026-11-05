@@ -147,9 +147,10 @@ turns this off.
 the header by itself, once for each saved version (not with `"reanalyzeOn": "never"`). A header with functions that
 lack code (compile errors, an `#if` that is off, templates without types) is also compiled the way the files
 including it see it: with the preprocessor lines before its `#include`, and with their entries in
-`compile_commands.json`, directly or through other headers. Files that were analyzed come first, then those of the
-database, else one found in the workspace. The best result is the main one, and the others fill in what it lacks, so
-a function behind `-DFEATURE_A` and one behind `-DFEATURE_B` can both show code.
+`compile_commands.json`, directly or through other headers. A file listed more than once (a 32-bit and a 64-bit build,
+in one database or several) is compiled with each entry, a `.cpp` as well. The best result is the main one, and the
+others fill in what it lacks, so a function behind `-m32` or `-DFEATURE_A` and one behind `-m64` or `-DFEATURE_B` can
+both show code. The CodeLens names the target (`compile_commands.json -m32`).
 
 ### compile_commands.json
 
@@ -387,9 +388,13 @@ mode, where your own compiler and system headers are used.
   file itself is analyzed. Click the CodeLens.
 - **"No separate code in user.cpp (inlined or not used)"**: that `.cpp` has no code to attribute to this
   function, and the header has not been compiled by itself (`"reanalyzeOn": "never"`). Click the CodeLens.
-- **"Template: no code yet"**: it does not compile with the types tried. Click the CodeLens to choose its types.
-- **"Not compiled · inside #ifdef X, which is off"**: no file that includes this one turns it on, in the files
-  analyzed or in `compile_commands.json`. Add the define to `"defines"` in `.asm-lens.json`.
+- **"Box<int> does not compile: ..."**: the types tried, with the compiler's message. Click the CodeLens to choose others.
+  A type you choose can come from the standard library (`std::vector<int>`, its header is added) or from any header the
+  `.cpp` including this file includes.
+- **"Template: click to choose its types"**: it has not been compiled with any types yet.
+- **"Not compiled · inside #ifdef X, which is off in all 3 compile commands tried"**: none of them turns it on. Every
+  entry of `compile_commands.json` for the file or for a file including it is tried, so a 32-bit and a 64-bit entry
+  both count. Add the define to `"defines"` in `.asm-lens.json` if you want it on anyway.
 - **"Not compiled · ..."** with a compiler's message: it does not compile here, even with what comes before the
   `#include`. The other functions are not affected.
 - **"for -mavx2 (not in your flags)"**: a SIMD helper needs that feature, so it was compiled for it, to show its code.
@@ -452,7 +457,7 @@ There are no runtime dependencies and no build step: the extension is plain Java
 Every push builds the `.vsix` on GitHub Actions (tests on Windows, Linux and macOS first); it is attached to
 the workflow run.
 
-To release, set the new version in `package.json` and push a matching tag such as `v0.8.5`. That creates a
+To release, set the new version in `package.json` and push a matching tag such as `v0.8.6`. That creates a
 GitHub release with the `.vsix` and publishes it to the Visual Studio Marketplace with
 [Trusted Publishing](https://code.visualstudio.com/api/working-with-extensions/publishing-extension), so no
 token is stored. It needs a policy for this repository and `build-vsix.yml` on the publisher's Trusted

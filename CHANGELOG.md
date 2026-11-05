@@ -1,8 +1,16 @@
 # Changelog
 
-## 0.8.5
+## 0.8.6
 
 ### New
+- **Every build of a file counts.** A file listed more than once in `compile_commands.json` (a 32-bit and a 64-bit build,
+  in one database or several) is compiled with each entry, a `.cpp` too, and the results are combined, so code behind
+  `#ifdef __x86_64__` and behind `#ifdef __i386__` both show. The CodeLens names the target.
+- **A chosen type stays chosen until it really fails.** `std::vector<int>` brings its header along. A type from a header
+  the `.cpp` includes after this one works: those includes and its `using namespace` lines come before the request.
+  The type is removed only if it fails in every compilation, and the CodeLens then gives the compiler's message.
+- A template that does not compile with the types tried says so, with the reason: *Box<int> does not compile: ...*
+- A member template of a class whose types you chose uses those types.
 - **`compile_commands.json` decides for headers too.** A header takes the compile command of each file in the database
   that includes it, also through other headers, until its functions have code: one behind `-DFEATURE_A` and one
   behind `-DFEATURE_B` can both show it. In remote mode the entry's defines, include folders, standard and target
@@ -28,6 +36,8 @@
   server's operators can tell its traffic apart.
 
 ### Fixes
+- Choosing types while a compile was running saved them but compiled nothing. That compile now stops and a new one starts.
+- An automatic analysis of half-typed text could remove a type you had chosen.
 - **`static inline` functions showed no code when their type was in capitals** (`U32`, `BOOL`, `DWORD`): such a type
   was taken for a macro, and the function was not kept. Inline functions and methods too, with every compiler.
 - **A macro after the parameters hid the function** (`int f(int x) NOEXCEPT {`, `__THROW`, `ATTR(1)`), and `EXPORT(int)
