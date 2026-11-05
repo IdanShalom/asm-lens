@@ -106,11 +106,11 @@ async function classTemplates(config) {
   // A partial specialization compiles itself, not the primary template.
   assert.deepEqual((await x.instantiate('stack.h', STACK.deref, 'int')).warning, []);
   assert.match(await x.lensAt('stack.h', STACK.deref) || '', ONE, x.describe('stack.h'));
-  // A class that does not compile as a whole for the type: the clicked member still does.
+  // A class that does not compile as a whole for the type: the clicked member still does, and the one at fault says why.
   await x.instantiate('stack.h', STACK.get, 'int');
-  for (let i = 0; i < 1500 && !ONE.test(await x.lensAt('stack.h', STACK.get) || ''); i++) await new Promise(r => setTimeout(r, 20));
   assert.match(await x.lensAt('stack.h', STACK.get) || '', ONE, x.state.outputLines.slice(-12).join('\n'));
-  assert.ok(x.ext._internals.instantiationsFor(x.open('stack.h')).some(i => i.kind === 'address' && i.expr === 'Mixed<int>::get'));
+  assert.match(await x.lensAt('stack.h', STACK.get + 1) || '', /^\$\(warning\) Mixed<int>::length does not compile: /);
+  assert.ok(x.ext._internals.instantiationsFor(x.open('stack.h')).some(i => i.kind === 'class' && i.expr === 'Mixed<int>'));
 }
 
 for (const cc of localCompilers()) {

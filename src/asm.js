@@ -601,7 +601,7 @@ function errorLinesIn(errText, isMainFile) {
   let last = '', feature;
   for (const raw of errText.split(/\r?\n/)) {
     const error = /^(.+?):(\d+)(?::\d+)?:\s*(?:fatal )?error:\s*(.*)$/.exec(raw) || /^(.+?)\((\d+)(?:,\d+)?\)\s*:\s*(?:fatal )?error\s+[A-Z]+\d+\s*:\s*(.*)$/.exec(raw);
-    const note = error ? undefined : /^(.+?):(\d+)(?::\d+)?:\s*(?:note:\s*(?:called from here|.*\brequested here)|.*\brequired from here)/.exec(raw) || /^(.+?)\((\d+)(?:,\d+)?\)\s*:\s*note:\s*see reference to/.exec(raw);
+    const note = error ? undefined : /^(.+?):(\d+)(?::\d+)?:\s*(?:note:\s*(?:called from here|.*\brequested here)|.*\brequired from here)/.exec(raw) || /^(.+?)\((\d+)(?:,\d+)?\)\s*:\s*note:\s*see (?:the first )?reference to/.exec(raw);
     if (error) { last = error[3].trim(); feature = featureNeeded(error[1], last); }
     const hit = error || note;
     if (!hit || !isMainFile(hit[1].trim())) continue;

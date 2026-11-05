@@ -139,9 +139,11 @@ file is not changed, and if the marked copy does not compile, the file is compil
 **Templates without being asked.** A template has no code until it has types, so the copy that is compiled
 also instantiates each template, after the end of the file: with the types written where it is used, in the file
 or in an analyzed file that includes it (`Box<long>`), otherwise `int` (`1` for a number). The CodeLens names the
-types (`3 instructions · Box<long>`). A line that does not compile is dropped, and that template asks for its
-types when clicked. Types you chose with **Instantiate…** replace these. `asmLens.autoInstantiateTemplates`
-turns this off.
+types (`3 instructions · Box<long>`). A class is compiled as a whole (`template struct Box<long>;`). If that fails, each
+member gets its own line (`&Box<long>::get`), so a member that does not compile for those types says so itself and costs
+the others nothing. An overloaded template is first asked for plainly (`&Box<int>::get<int>`, which is enough when SFINAE
+leaves one) and selected by its type only if that fails. Types you chose with **Instantiate…** replace these.
+`asmLens.autoInstantiateTemplates` turns this off.
 
 **Headers and the files that include them.** Opening a header after analyzing a file that includes it compiles
 the header by itself, once for each saved version (not with `"reanalyzeOn": "never"`). A header with functions that
@@ -457,7 +459,7 @@ There are no runtime dependencies and no build step: the extension is plain Java
 Every push builds the `.vsix` on GitHub Actions (tests on Windows, Linux and macOS first); it is attached to
 the workflow run.
 
-To release, set the new version in `package.json` and push a matching tag such as `v0.8.6`. That creates a
+To release, set the new version in `package.json` and push a matching tag such as `v0.8.7`. That creates a
 GitHub release with the `.vsix` and publishes it to the Visual Studio Marketplace with
 [Trusted Publishing](https://code.visualstudio.com/api/working-with-extensions/publishing-extension), so no
 token is stored. It needs a policy for this repository and `build-vsix.yml` on the publisher's Trusted

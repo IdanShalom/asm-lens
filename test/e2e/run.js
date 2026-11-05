@@ -47,6 +47,8 @@ async function main() {
   fs.writeFileSync(path.join(builds, 'compile_commands.json'), JSON.stringify([entry('-DBUILD_A'), entry('-DBUILD_B')]));
   fs.writeFileSync(path.join(builds, '.asm-lens.json'), JSON.stringify({ mode: 'local', compileCommands: 'compile_commands.json' }));
 
+  fs.cpSync(path.join(__dirname, '..', 'fixtures', 'templates'), path.join(project, 'templates'), { recursive: true });
+
   const result = path.join(tmp, 'result.json');
   const env = { ...process.env, ASM_LENS_E2E_RESULT: result };
   for (const k of Object.keys(env)) if (/^(?:ELECTRON_RUN_AS_NODE|VSCODE_)/.test(k)) delete env[k];

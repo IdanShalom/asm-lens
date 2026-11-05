@@ -473,7 +473,10 @@ test('keepByAddress: a prototype next to the definition is an overload too', () 
 test('templateTargetAt: an overloaded function template is selected by its type', () => {
   const src = 'template <class T> T pick(T a) { return a; }\ntemplate <class T> T pick(T a, T b) { return b; }\n';
   assert.deepEqual(scan.templateTargetAt(src, 1).make(['int']), { kind: 'address', expr: 'pick<int>', cast: 'int (*)(int a, int b)' });
-  assert.equal(scan.appendInstantiations('', [scan.templateTargetAt(src, 0).make(['long'])]).text.trim(), 'auto __asm_lens_inst_0 = static_cast<long (*)(long a)>(&pick<long>);');
+  // The plain form first: explicit arguments often leave one overload, and the cast is copied from the source.
+  const { text, lines } = scan.appendInstantiations('', [scan.templateTargetAt(src, 0).make(['long'])]);
+  assert.equal(text.trim(), 'auto __asm_lens_inst_0 = &pick<long>;');
+  assert.equal(lines[0].fallback, 'auto __asm_lens_inst_0 = static_cast<long (*)(long a)>(&pick<long>);');
 });
 
 test('templateUsesIn: arguments where a template is used, not inside templates or template heads', () => {
@@ -505,7 +508,7 @@ test('autoInstantiations: the types used, else suggested ones; what was asked fo
     ['Box<float>', 'Box<long>', 'Box<int*>', 'Arr<char, 8>', 'twice<double>', 'ns::Q<short>']);
   assert.deepEqual(exprs({ manual: [{ kind: 'class', expr: 'Box<char>' }] }), ['Arr<int, 1>', 'twice<int>', 'ns::Q<int>'], 'requests of its own: that template is left alone');
   assert.equal(exprs({ max: 2 }).length, 2);
-  assert.deepEqual(exprs({ rejected: new Set(['Box<int>', 'twice<int>']) }), ['Box<int>::In', 'Box<int*>', 'Arr<int, 1>', 'ns::Q<int>'], 'those known not to compile are left out');
+  assert.deepEqual(exprs({ rejected: new Set(['Box<int>', 'twice<int>']) }), ['Box<int>', 'Box<int*>', 'Arr<int, 1>', 'ns::Q<int>'], 'a function template known not to compile is left out; a class stays, since its members may');
   assert.deepEqual(scan.autoInstantiations(header, { manual: [{ kind: 'address', expr: 'Arr<int, 1>::a' }] }).map(it => it.expr).includes('Arr<int, 1>'), false, 'its class does not compile as a whole');
   assert.ok(scan.autoInstantiations(header, { manual: [{ kind: 'address', expr: 'Box<int>::conv<float>' }] }).some(it => it.expr === 'Box<int>'), 'a member template asked for says nothing about the class');
   const written = 'template <class T> struct W { T w() const { return T{}; } };\ntemplate struct W<int>;\nextern template struct W<char>;\nW<char> c;\n';
@@ -641,4 +644,76 @@ test('appendInstantiations: lines the requests need come before them, and reques
   const r = scan.appendInstantiations('int a;\n', [{ kind: 'class', expr: 'B<int>' }], [], ['#include <x>']);
   assert.equal(r.text, 'int a;\n#include <x>\ntemplate class B<int>;\n');
   assert.equal(r.firstLine, 2);
+});
+
+// ---------------------------------------------------------------------------
+// 0.8.7: the plainest form that keeps what worked
+
+const REQUEST_SOURCE = [
+  'namespace ns {',
+  'template <typename T> struct Box {',
+  '  Box() : v() { }',
+  '  explicit Box(T value) : v(value) { }',
+  '  ~Box() { }',
+  '  T get() const { return v; }',
+  '  static T make() { return T{}; }',
+  '  T& at(int) { return v; }',
+  '  const T& at(int) const { return v; }',
+  '  operator T() const { return v; }',
+  '  T outside(T a) const;',
+  '  template <typename U> U conv() const { return U{}; }',
+  '  friend T peek(const Box& b) { return b.v; }',
+  '  struct In { T i() const { return T{}; } };',
+  '  T v;',
+  '};',
+  'template <typename T> T Box<T>::outside(T a) const { return a; }',
+  '}'
+].join('\n');
+
+test('instantiationLines: what compiles as a whole today is still exactly one `template struct` line', () => {
+  const lines = scan.instantiationLines([{ kind: 'class', expr: 'ns::Box<S>', keyword: 'struct', member: 'ns::Box<S>::get' }], { text: REQUEST_SOURCE });
+  assert.deepEqual(lines.map(l => l.text), ['template struct ns::Box<S>;']);
+  assert.deepEqual(scan.appendInstantiations('x', [{ kind: 'address', expr: 'f<int>' }, { kind: 'class', expr: 'B<int>', keyword: 'struct' }]).text, 'x\nauto __asm_lens_inst_0 = &f<int>;\ntemplate struct B<int>;\n');
+});
+
+test('instantiationLines: when the class does not compile as a whole, a plain line per member', () => {
+  const [whole] = scan.instantiationLines([{ kind: 'class', expr: 'ns::Box<S>', keyword: 'struct', member: 'ns::Box<S>::get' }], { text: REQUEST_SOURCE });
+  assert.deepEqual(whole.members.map(m => m.text), [
+    'namespace ns { void __asm_lens_inst_0_0(void* __asm_lens_at) { ::new (__asm_lens_at) ns::Box<S>(); } }',
+    'namespace ns { void __asm_lens_inst_0_1(void* __asm_lens_at, S value) { ::new (__asm_lens_at) ns::Box<S>(value); } }',
+    'namespace ns { void __asm_lens_inst_0_2(ns::Box<S>* __asm_lens_at) { __asm_lens_at->~Box(); } }',
+    'auto __asm_lens_inst_0_3 = &ns::Box<S>::get;',
+    'auto __asm_lens_inst_0_4 = &ns::Box<S>::make;',
+    'namespace ns { auto __asm_lens_inst_0_5 = static_cast<S& (ns::Box<S>::*)(int)>(&ns::Box<S>::at); }',
+    'namespace ns { auto __asm_lens_inst_0_6 = static_cast<const S& (ns::Box<S>::*)(int) const>(&ns::Box<S>::at); }',
+    'auto __asm_lens_inst_0_7 = &ns::Box<S>::operator S;',
+    'auto __asm_lens_inst_0_8 = &ns::Box<S>::In::i;',
+    'auto __asm_lens_inst_0_9 = &ns::Box<S>::outside;'
+  ], 'not conv (a template itself) and not peek (a friend)');
+  assert.match(whole.members[3].ifPrivate, /^template <auto P> struct __asm_lens_rob_0_3 \{ static inline auto kept = P; \}; template struct __asm_lens_rob_0_3<&ns::Box<S>::get>;$/);
+  // Known not to compile as a whole: no compile wasted on it by an automatic analysis.
+  const again = scan.instantiationLines([{ kind: 'class', expr: 'ns::Box<S>', keyword: 'struct' }], { text: REQUEST_SOURCE, rejected: new Set(['ns::Box<S>', 'ns::Box<S>::get']) });
+  assert.equal(again[0].text, '#include <new>');
+  assert.ok(!again.some(l => /template struct|::get\b/.test(l.text)));
+  assert.deepEqual(scan.instantiationLines([{ kind: 'class', expr: 'Other<int>' }], { text: REQUEST_SOURCE }).map(l => l.text), ['template class Other<int>;'], 'no members known: only the class');
+});
+
+test('instantiationLines: requests saved by older versions keep their meaning', () => {
+  const lines = scan.instantiationLines([
+    { kind: 'address', expr: 'f<int>' },
+    { kind: 'address', expr: 'g<int>', cast: 'int (*)(int)' },
+    { kind: 'class', expr: 'C<int>' },
+    { kind: 'class', expr: 'D<int>', keyword: 'struct' },
+    { kind: 'class', expr: 'E<int>', keyword: 'union', member: 'E<int>::m' },
+    { kind: 'address', expr: 'Mixed<int>::get' }
+  ], { text: '' });
+  assert.deepEqual(lines.map(l => l.text), ['auto __asm_lens_inst_0 = &f<int>;', 'auto __asm_lens_inst_1 = &g<int>;', 'template class C<int>;', 'template struct D<int>;', 'template union E<int>;', 'auto __asm_lens_inst_5 = &Mixed<int>::get;']);
+  assert.equal(lines[1].fallback, 'auto __asm_lens_inst_1 = static_cast<int (*)(int)>(&g<int>);');
+});
+
+test('templateTargetAt: what is saved for a request has not changed', () => {
+  const src = 'template <class T> struct B { T p() const { return T{}; } };\ntemplate <class T> struct B<T*> { T* q() const { return nullptr; } };\ntemplate <class T> T f(T x) { return x; }\n';
+  assert.deepEqual(scan.templateTargetAt(src, 0).make(['int']), { kind: 'class', expr: 'B<int>', keyword: 'struct', member: 'B<int>::p' });
+  assert.deepEqual(scan.templateTargetAt(src, 1).make(['int']), { kind: 'class', expr: 'B<int*>', keyword: 'struct', member: 'B<int*>::q' });
+  assert.deepEqual(scan.templateTargetAt(src, 2).make(['int']), { kind: 'address', expr: 'f<int>' });
 });

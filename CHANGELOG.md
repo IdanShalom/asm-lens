@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.8.6
+## 0.8.7
 
 ### New
 - **Every build of a file counts.** A file listed more than once in `compile_commands.json` (a 32-bit and a 64-bit build,
@@ -36,6 +36,14 @@
   server's operators can tell its traffic apart.
 
 ### Fixes
+- **A member template overloaded through SFINAE could not be instantiated** when its return type used a macro that is
+  `#undef`'d later in the file: the cast selecting the overload was copied from the source, to a place where the macro no
+  longer exists. The plain `&Box<int>::get<int>` is tried first now, since explicit arguments usually leave one
+  overload, and the cast only if that fails.
+- **One member that does not compile blocked the whole class.** `template struct Box<S>;` compiles every member, so `get` got
+  the error of `broken`. When the class does not compile as a whole, each member now gets its own line (`&Box<S>::get`),
+  constructors and destructors a small call, and the failing member says why on its own CodeLens. The whole class
+  still comes first: only it reaches private members and members defined in other files.
 - Choosing types while a compile was running saved them but compiled nothing. That compile now stops and a new one starts.
 - An automatic analysis of half-typed text could remove a type you had chosen.
 - **`static inline` functions showed no code when their type was in capitals** (`U32`, `BOOL`, `DWORD`): such a type

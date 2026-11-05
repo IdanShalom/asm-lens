@@ -1,0 +1,343 @@
+{
+ "auto/emitted.hxx [analyze]": [
+  3,
+  8,
+  9
+ ],
+ "auto/emitted.hxx [instantiate]": [
+  3,
+  8,
+  9
+ ],
+ "auto/forms.hxx [analyze]": [
+  8,
+  9,
+  10,
+  11,
+  16,
+  17,
+  18,
+  19,
+  20,
+  21,
+  22,
+  23,
+  24,
+  25,
+  27,
+  28,
+  31,
+  32,
+  33,
+  36
+ ],
+ "auto/forms.hxx [instantiate]": [
+  8,
+  9,
+  10,
+  11,
+  16,
+  17,
+  18,
+  19,
+  20,
+  21,
+  22,
+  23,
+  24,
+  25,
+  27,
+  28,
+  31,
+  32,
+  33,
+  36
+ ],
+ "auto/needs.hxx [analyze]": [
+  3,
+  4,
+  6,
+  15,
+  16
+ ],
+ "auto/needs.hxx [instantiate]": [
+  3,
+  4,
+  6,
+  15,
+  16
+ ],
+ "auto/needs_direct.cpp [analyze]": [
+  5
+ ],
+ "auto/needs_direct.cpp [instantiate]": [
+  5
+ ],
+ "auto/needs_indirect.cpp [analyze]": [
+  2
+ ],
+ "auto/needs_indirect.cpp [instantiate]": [
+  2
+ ],
+ "auto/needs_mid.h [analyze]": [],
+ "auto/needs_mid.h [instantiate]": [],
+ "auto/realworld.hxx [analyze]": [
+  11,
+  12,
+  13,
+  14,
+  15,
+  16,
+  18,
+  19,
+  20,
+  22,
+  23,
+  24,
+  25,
+  26,
+  27,
+  28,
+  29
+ ],
+ "auto/realworld.hxx [instantiate]": [
+  11,
+  12,
+  13,
+  14,
+  15,
+  16,
+  18,
+  19,
+  20,
+  22,
+  23,
+  24,
+  25,
+  26,
+  27,
+  28,
+  29
+ ],
+ "auto/sub/types.h [analyze]": [],
+ "auto/sub/types.h [instantiate]": [],
+ "auto/tmpl.hxx [analyze]": [
+  8,
+  9,
+  10,
+  11,
+  12,
+  13,
+  14,
+  15,
+  17,
+  18,
+  19,
+  20,
+  23,
+  27,
+  33,
+  34,
+  35,
+  42,
+  43,
+  49,
+  50,
+  51,
+  55,
+  59,
+  65,
+  68
+ ],
+ "auto/tmpl.hxx [instantiate]": [
+  8,
+  9,
+  10,
+  11,
+  12,
+  13,
+  14,
+  15,
+  17,
+  18,
+  19,
+  20,
+  23,
+  27,
+  33,
+  34,
+  35,
+  42,
+  43,
+  49,
+  50,
+  51,
+  55,
+  59,
+  65,
+  68
+ ],
+ "auto/user.cpp [analyze]": [
+  4
+ ],
+ "auto/user.cpp [instantiate]": [
+  4
+ ],
+ "builds/arch.hxx [analyze]": [
+  2,
+  12
+ ],
+ "builds/arch.hxx [instantiate]": [
+  2,
+  12
+ ],
+ "builds/point.h [analyze]": [
+  2
+ ],
+ "builds/point.h [instantiate]": [
+  2
+ ],
+ "builds/u.cpp [analyze]": [
+  3
+ ],
+ "builds/u.cpp [instantiate]": [
+  3
+ ],
+ "classes/broken.hxx [analyze]": [
+  2,
+  3,
+  8,
+  9
+ ],
+ "classes/broken.hxx [instantiate]": [
+  2,
+  3,
+  8,
+  9
+ ],
+ "classes/counter.cpp [analyze]": [
+  6,
+  7,
+  8,
+  9,
+  15,
+  17,
+  19
+ ],
+ "classes/counter.cpp [instantiate]": [
+  6,
+  7,
+  8,
+  9,
+  15,
+  17,
+  19
+ ],
+ "classes/shapes.cpp [analyze]": [
+  7,
+  9,
+  11
+ ],
+ "classes/shapes.cpp [instantiate]": [
+  7,
+  9,
+  11
+ ],
+ "classes/stack.h [analyze]": [
+  8,
+  9,
+  10,
+  16,
+  22
+ ],
+ "classes/stack.h [instantiate]": [
+  8,
+  9,
+  10,
+  16,
+  22,
+  28
+ ],
+ "classes/use_stack.cpp [analyze]": [
+  2
+ ],
+ "classes/use_stack.cpp [instantiate]": [
+  2
+ ],
+ "db/include/config.h [analyze]": [],
+ "db/include/config.h [instantiate]": [],
+ "db/include/feature.hxx [analyze]": [
+  2
+ ],
+ "db/include/feature.hxx [instantiate]": [
+  2
+ ],
+ "db/include/mid.h [analyze]": [],
+ "db/include/mid.h [instantiate]": [],
+ "db/src/a.cpp [analyze]": [
+  2
+ ],
+ "db/src/a.cpp [instantiate]": [
+  2
+ ],
+ "db/src/b.cpp [analyze]": [
+  2
+ ],
+ "db/src/b.cpp [instantiate]": [
+  2
+ ],
+ "demo/shapes.cpp [analyze]": [
+  7,
+  8,
+  11,
+  17
+ ],
+ "demo/shapes.cpp [instantiate]": [
+  7,
+  8,
+  11,
+  17
+ ],
+ "demo/vec.hpp [analyze]": [
+  4,
+  11
+ ],
+ "demo/vec.hpp [instantiate]": [
+  4,
+  11
+ ],
+ "headers/mathx.hxx [analyze]": [
+  4,
+  7,
+  14,
+  16,
+  21,
+  25,
+  26,
+  32
+ ],
+ "headers/mathx.hxx [instantiate]": [
+  4,
+  7,
+  14,
+  16,
+  21,
+  25,
+  26,
+  32
+ ],
+ "headers/user.cpp [analyze]": [
+  3,
+  5,
+  7,
+  9,
+  11
+ ],
+ "headers/user.cpp [instantiate]": [
+  3,
+  5,
+  7,
+  9,
+  11
+ ]
+}

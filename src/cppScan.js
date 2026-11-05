@@ -734,6 +734,7 @@ function templateTargetAt(text, line, defs = scanDefinitions(text), known) {
     const isOverloaded = overloadedNames(text, defs).has(fnName);
     return {
       label: display(all),
+      isOwnTemplate: true,
       prompts: all.filter(p => p.params !== undefined).map(holder),
       make: args => {
         const expr = build(all, [...args]);
@@ -757,8 +758,11 @@ function templateTargetAt(text, line, defs = scanDefinitions(text), known) {
   if (idx < 0) return undefined;
   const scope = parts.slice(0, idx + 1);
   if (!scope.some(p => p.params !== undefined)) return undefined;
+  const isSpecialization = scope.some(p => p.spec);
   return {
     label: display(scope),
+    isSpecialization,
+    functionName: fnName,
     prompts: scope.filter(p => p.params !== undefined).map(holder),
     make: args => {
       const expr = build(scope, [...args]);
@@ -769,17 +773,98 @@ function templateTargetAt(text, line, defs = scanDefinitions(text), known) {
   };
 }
 
-// Source lines that request the instantiations, appended after the file's own
-// text so its line numbers do not change. `firstLine` is the 0-based line of the
-// first request; request i is on line firstLine + i.
+// The lines for each ordinary member of class template request `it`, for when the class does not
+// compile as a whole: then a member that does not compile for these types costs only itself. The plain
+// `&X<Args>::member`; an overload is selected by its type, constructors and destructors, which have no
+// address, are called, and a private member is named in an explicit instantiation, where
+// access does not count. Members that are templates themselves are requests of their own.
+function memberLines(it, index, text, defs) {
+  const className = templateName(it.expr);
+  const found = [];
+  for (const d of defs) {
+    if (d.kind !== 'function' || !d.templated || d.friend) continue;
+    const target = templateTargetAt(text, d.nameLine ?? d.startLine, defs, d);
+    if (!target || target.unsupported || target.isOwnTemplate) continue;
+    const name = templateName(target.label);
+    if (name !== className && !name.startsWith(`${className}::`)) continue;
+    found.push({ d, target, owner: `${it.expr}${name.slice(className.length)}` });
+  }
+  const count = new Map();
+  for (const m of found) {
+    const key = `${m.owner}::${m.target.functionName}`;
+    count.set(key, (count.get(key) || 0) + 1);
+  }
+  const last = splitQualified(it.expr).pop() || '';
+  const args = /<([\s\S]*)>$/.exec(last)?.[1];
+  const className0 = last.replace(/<[\s\S]*$/, '').trim();
+  return found.map(({ d, target, owner }, j) => {
+    const fn = target.functionName;
+    const shortOwner = (splitQualified(owner).pop() || '').replace(/<[\s\S]*$/, '').trim();
+    // The arguments of a partial specialization are not those of its parameters: its types stay unknown.
+    const prompt = target.prompts.length === 1 && !target.isSpecialization ? target.prompts[0] : undefined;
+    const names = prompt ? parameterNames(prompt.params) : [];
+    const values = prompt && args !== undefined ? splitTopLevel(args).map(v => v.trim()) : [];
+    const map = new Map(names.map((n, k) => [n, values[k]]).filter(([n, v]) => n && v !== undefined));
+    const known = Boolean(prompt) && args !== undefined;
+    const subst = s => s.replace(/\b[A-Za-z_]\w*\b(?!\s*<)/g, w => (w === shortOwner ? owner : w === className0 && shortOwner === className0 ? it.expr : map.get(w) ?? w));
+    const namespaces = d.scopes.filter(s => s.kind === 'namespace').flatMap(s => s.name.split('::')).filter(Boolean);
+    const inScope = body => (namespaces.length ? `${namespaces.map(n => `namespace ${n} {`).join(' ')} ${body} ${namespaces.map(() => '}').join(' ')}` : body);
+    const id = `__asm_lens_inst_${index}_${j}`;
+    // What is inlined into these calls is that member's code, wherever the compiler says the instructions are.
+    if (fn.startsWith('~')) return { text: inScope(`void ${id}(${owner}* __asm_lens_at) { __asm_lens_at->${fn}(); }`), expr: `${owner}::${fn}`, wrapper: id, def: d, owner };
+    if (fn === shortOwner) {
+      const params = namedParameters(d.paramText);
+      if (params.some(p => !p) || !known) return undefined;
+      const list = params.map(p => subst(p.text));
+      return { text: inScope(`void ${id}(${['void* __asm_lens_at', ...list].join(', ')}) { ::new (__asm_lens_at) ${owner}(${params.map(p => p.name).join(', ')}); }`), expr: `${owner}::${fn}`, needsNew: true, wrapper: id, def: d, owner };
+    }
+    const name = /^operator\b/.test(fn) ? subst(fn) : fn;
+    const expr = `${owner}::${name}`;
+    // An overload set has no plain form: only its type says which one is meant.
+    const cast = count.get(`${owner}::${fn}`) > 1 && known ? pointerTypeOf(d, owner, subst) : undefined;
+    if (cast) return { text: inScope(`auto ${id} = static_cast<${cast}>(&${expr});`), expr };
+    const rob = `__asm_lens_rob_${index}_${j}`;
+    return { text: `auto ${id} = &${expr};`, expr, ifPrivate: `template <auto P> struct ${rob} { static inline auto kept = P; }; template struct ${rob}<&${expr}>;` };
+  }).filter(Boolean);
+}
+
+// The lines for requests, each with the request it belongs to. A function template: the plain
+// `&f<Args>` first, which is enough when SFINAE leaves one overload, and `fallback`, its cast
+// (copied from the source, so it may not compile out here), if that fails. A class: `template class
+// X<Args>;`, which reaches private members and those defined in other files, with `members` for when
+// it does not compile. `rejected`: what is known not to compile, which saves automatic analyses a compile.
+function instantiationLines(requests, { text = '', defs = scanDefinitions(text), rejected } = {}) {
+  const lines = [];
+  (requests || []).forEach((it, i) => {
+    if (it.kind !== 'class') {
+      const fallback = it.cast ? `auto __asm_lens_inst_${i} = static_cast<${it.cast}>(&${it.expr});` : undefined;
+      lines.push({ text: `auto __asm_lens_inst_${i} = &${it.expr};`, request: i, expr: it.expr, fallback });
+      return;
+    }
+    const members = memberLines(it, i, text, defs).filter(m => !rejected?.has(m.expr)).map(m => ({ ...m, request: i }));
+    if (!rejected?.has(it.expr)) {
+      lines.push({ text: `template ${it.keyword || 'class'} ${it.expr};`, request: i, expr: it.expr, members });
+      return;
+    }
+    if (members.some(m => m.needsNew)) lines.push({ text: '#include <new>', request: i, expr: it.expr, helper: true });
+    lines.push(...members);
+  });
+  return lines;
+}
+
+// `text` with lines after its last line: `before` (what they need), then `lines`.
+// Returns the text and the 0-based line of the first of `lines`.
+function appendLines(text, lines, before = []) {
+  const base = `${text.endsWith('\n') ? text : `${text}\n`}${before.length ? `${before.join('\n')}\n` : ''}`;
+  return { text: `${base}${lines.join('\n')}\n`, firstLine: (base.match(/\n/g) || []).length };
+}
+
+// Source lines that request the instantiations, appended after the file's own text so
+// its line numbers do not change, from `firstLine` on.
 function appendInstantiations(text, list, extraLines = [], before = []) {
   if ((!list || !list.length) && !extraLines.length) return { text, firstLine: -1 };
-  const base = `${text.endsWith('\n') ? text : `${text}\n`}${before.length ? `${before.join('\n')}\n` : ''}`;
-  const firstLine = (base.match(/\n/g) || []).length;
-  const lines = (list || []).map((it, i) => it.kind === 'class'
-    ? `template ${it.keyword || 'class'} ${it.expr};`
-    : `auto __asm_lens_inst_${i} = ${it.cast ? `static_cast<${it.cast}>(&${it.expr})` : `&${it.expr}`};`);
-  return { text: `${base}${[...lines, ...extraLines].join('\n')}\n`, firstLine };
+  const lines = instantiationLines(list, { text });
+  return { ...appendLines(text, [...lines.map(l => l.text), ...extraLines], before), lines };
 }
 
 // The name in each parameter of a template parameter list ("typename T, int N = 3" -> T, N).
@@ -885,7 +970,7 @@ function autoInstantiations(text, { defs = scanDefinitions(text), manual = [], c
     const uses = first.specialization ? [] : sources.flatMap(s => templateUsesIn(s.text, first.name, s.defs, s.masked)).filter((u, i, all) => all.indexOf(u) === i).slice(0, maxPerTemplate);
     for (const a of uses.length ? uses : [first.suggestion]) {
       const it = target.make([a, ...target.prompts.slice(1).map(p => p.suggestion)]);
-      if (taken.has(it.expr) || out.length >= max || rejected.has(it.expr)) continue;
+      if (taken.has(it.expr) || out.length >= max || (it.kind !== 'class' && rejected.has(it.expr))) continue;
       taken.add(it.expr);
       if (it.kind === 'class' && (written.has(it.expr.replace(/\s+/g, '')) || out.some(o => o.kind === 'class' && it.expr.startsWith(`${o.expr}::`)))) continue;
       out.push(it);
@@ -1063,6 +1148,6 @@ async function includeContext(text, target, { follow, dir, depth = 0 } = {}) {
 module.exports = {
   maskCode, classifyFunctionSegment, blankEnclosingDeclaration,
   scanDefinitions, guessCFunctions, keepHeaderFunctions, keepByAddress, templateTargetAt, appendInstantiations,
-  autoInstantiations, templateUsesIn, templateName, includesForTypes, friendUseLines, callLines, conditionAt, conditionsByLine, includeContext,
+  autoInstantiations, instantiationLines, appendLines, templateUsesIn, templateName, includesForTypes, friendUseLines, callLines, conditionAt, conditionsByLine, includeContext,
   defaultTemplateArgs, splitQualified, splitTemplatePrefixes, lineLocator, classifyHead
 };

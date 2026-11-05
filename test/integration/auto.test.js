@@ -89,7 +89,8 @@ async function needsIncluder(config, root, wrap, { first = false } = {}) {
   for (const line of [NEEDS.px, NEEDS.always, NEEDS.featured]) assert.match(at(line), CODE, `line ${line}: ${at(line)}\n${x.state.outputLines.slice(-14).join('\n')}`);
   assert.match(at(NEEDS.never), /Not compiled · inside #ifdef NEVER_ON/);
   const readable = !x.ext._internals.analysesFor(x.open('needs.hxx')).some(a => a.functions.some(f => /^"?\?/.test(f.name)));
-  for (const line of [NEEDS.get, NEEDS.scaled]) { assert.match(at(line), CODE, at(line)); assert.ok(!readable || at(line).includes(wrap), at(line)); }
+  // Members compile separately when the class cannot: Wrap<Point*> has get(), though its scaled() does not compile.
+  for (const line of [NEEDS.get, NEEDS.scaled]) { assert.match(at(line), CODE, at(line)); assert.ok(!readable || at(line).includes(wrap) || /\d+ instantiations/.test(at(line)), at(line)); }
 }
 
 // Lines of realworld.hxx: types in capitals, macros after the parameters and around the type.
@@ -176,6 +177,31 @@ async function twoBuilds(config, flagA, flagB, macroA, macroB) {
   assert.match(at(15), /Not compiled · inside #ifdef NEVER_DEFINED, which is off in all \d+ compile commands tried/);
 }
 
+// A member template overloaded through SFINAE, with a return type in a macro that is #undef'd later:
+// the plain form works, where a cast copied from the source cannot.
+async function sfinaeMacro(config) {
+  const text = fs.readFileSync(path.join(FIXTURES, 'templates', 'sfinae.hxx'), 'utf8');
+  const x = start(makeProject({ 'sfinae.hxx': text }, config), { settings: { 'asmLens.reanalyzeOn': 'never', 'asmLens.autoInstantiateTemplates': false } });
+  for (const [line, type] of [[6, 'int'], [7, 'long long']]) {
+    const r = await x.instantiate('sfinae.hxx', line, type, type);
+    assert.deepEqual(r.warning, [], x.state.outputLines.slice(-8).join('\n'));
+    assert.match(await x.lensAt('sfinae.hxx', line) || '', CODE, `line ${line}: ${await x.lensAt('sfinae.hxx', line)}\n${x.state.outputLines.slice(-8).join('\n')}`);
+  }
+}
+
+// One member that does not compile for the type must not stop the others.
+async function brokenMember(config) {
+  const text = fs.readFileSync(path.join(FIXTURES, 'templates', 'broken_member.hxx'), 'utf8');
+  const x = start(makeProject({ 'broken_member.hxx': text }, config), { settings: { 'asmLens.reanalyzeOn': 'never', 'asmLens.autoInstantiateTemplates': false } });
+  const r = await x.instantiate('broken_member.hxx', 5, 'S');
+  assert.deepEqual(r.warning, [], x.state.outputLines.slice(-8).join('\n'));
+  const lenses = main(await x.lenses('broken_member.hxx'));
+  const at = l => lenses.find(k => k.line === l)?.title || '';
+  for (const [name, line] of [['default constructor', 2], ['constructor', 3], ['destructor', 4], ['get', 5], ['at', 7], ['const at', 8]]) assert.match(at(line), /^\$\(symbol-numeric\) \d+ /, `${name}: ${at(line)}\n${x.state.outputLines.slice(-10).join('\n')}`);
+  assert.match(at(6), /^\$\(warning\) Box<S>::broken does not compile: .* · click to choose types$/, at(6));
+  assert.deepEqual(x.ext._internals.instantiationsFor(x.open('broken_member.hxx')).map(i => i.expr), ['Box<S>']);
+}
+
 // Types chosen by hand that need what the .cpp includes, or a standard header nobody included.
 async function chosenTypes(config) {
   const types = '#pragma once\nstruct Point { int x, y; Point operator+(const Point& o) const { return {x + o.x, y + o.y}; } };\n';
@@ -188,7 +214,7 @@ async function chosenTypes(config) {
   const readable = () => !x.ext._internals.analysesFor(x.open('tmpl.hxx')).some(a => a.functions.some(f => /^"?\?/.test(f.name)));
   assert.match(await lens(10), readable() ? /^\$\(symbol-numeric\).*Box<Point>/ : CODE, `the type the .cpp uses: ${await lens(10)}`);
   assert.match(await lens(11), CODE, `a member template of it: ${await lens(11)}`);
-  assert.match(await lens(14), /^\$\(warning\) NeedsType<int> does not compile: .* · click to choose types$/, await lens(14));
+  assert.match(await lens(14), /^\$\(warning\) NeedsType<int>(?:::first)? does not compile: .* · click to choose types$/, await lens(14));
   // A lens sits on the first line of the definition: `template <...>` for these two.
   for (const [line, at, type, name] of [[6, 5, 'std::vector<int>', 'count'], [4, 3, 'Point', 'dot'], [14, 14, 'std::vector<int>', 'NeedsType']]) {
     assert.deepEqual((await x.instantiate('tmpl.hxx', line, type)).warning, [], `${name}<${type}>\n${x.state.outputLines.slice(-10).join('\n')}`);
@@ -200,6 +226,8 @@ async function chosenTypes(config) {
 
 for (const cc of localCompilers()) {
   const config = { mode: 'local', compiler: cc, flags: '-O2 -std=c++20' };
+  test(`local ${cc}: a member template overloaded through SFINAE, with a macro that is gone`, () => sfinaeMacro({ mode: 'local', compiler: cc, flags: '-O2 -std=c++17' }));
+  test(`local ${cc}: one member that does not compile costs only itself`, () => brokenMember({ mode: 'local', compiler: cc, flags: '-O2 -std=c++17' }));
   test(`local ${cc}: two builds of a file in compile_commands.json`, () => twoBuilds({ cc, json: { mode: 'local' } }, '-DBUILD_A', '-DBUILD_B', 'BUILD_A', 'BUILD_B'));
   if (process.platform === 'linux' && process.arch === 'x64') test(`local ${cc}: real -m32 and -m64 builds`, () => twoBuilds({ cc, json: { mode: 'local' } }, '-m32', '-m64', '__i386__', '__x86_64__'));
   test(`local ${cc}: chosen types that need the .cpp's includes or a standard header`, () => chosenTypes(config));
@@ -219,6 +247,8 @@ for (const id of ['g152', 'clang2010', 'vcpp_v19_latest_x64']) {
   const config = { flags: '-O2 -std=c++20', compilers: [{ id, name: id }] };
   const msvc = /^vcpp/.test(id);
   const remote = fn => async () => { const ce = installFetch(); try { await fn(); } finally { ce.restore(); } };
+  test(`remote ${id} (Compiler Explorer): a member template overloaded through SFINAE, with a macro that is gone`, remote(() => sfinaeMacro({ flags: '-O2 -std=c++17', compilers: [{ id, name: id }] })));
+  test(`remote ${id} (Compiler Explorer): one member that does not compile costs only itself`, remote(() => brokenMember({ flags: '-O2 -std=c++17', compilers: [{ id, name: id }] })));
   test(`remote ${id} (Compiler Explorer): types in capitals, macros around the signature`, remote(() => realWorld(config)));
   test(`remote ${id} (Compiler Explorer): two builds of a file in compile_commands.json`, remote(() => twoBuilds({ json: { compilers: [{ id, name: id }] } }, '-DBUILD_A', '-DBUILD_B', 'BUILD_A', 'BUILD_B')));
   test(`remote ${id} (Compiler Explorer): chosen types that need the .cpp's includes or a standard header`, remote(() => chosenTypes(config)));

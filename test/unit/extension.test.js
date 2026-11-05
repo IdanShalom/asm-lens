@@ -1212,22 +1212,80 @@ test('nothing but failures: the message says why, not that the header has only d
   } finally { ce.restore(); }
 });
 
-test('a class that does not compile as a whole for the types: only the member that was clicked is compiled', async () => {
+test('a class that does not compile as a whole for the types: the others have code, and the member at fault says why', async () => {
   const dir = makeProject({ 'm.h': 'template <class T> struct M {\n  T v;\n  T get() const { return v; }\n  auto len() const { return v.size(); }\n};\n' });
   const ce = fakeCompilerExplorer(body => {
     const lines = body.source.split('\n');
-    const whole = lines.findIndex(l => l === 'template struct M<int>;');
-    if (whole >= 0) return { code: 1, stderr: err(`<source>:4:30: error: request for member 'size' in 'int'`, `<source>:${whole + 1}:17:   required from here`) };
+    const bad = lines.findIndex(l => l === 'template struct M<int>;' || l.includes('&M<int>::len'));
+    if (bad >= 0) return { code: 1, stderr: err(`<source>:4:30: error: request for member 'size' in 'int'`, `<source>:${bad + 1}:17:   required from here`) };
     return { code: 0, asm: lines.some(l => /= &M<int>::get;/.test(l)) ? asmFor(['M<int>::get() const', 3]) : [] };
   });
   try {
-    const x = start(dir, { settings: { 'asmLens.reanalyzeOn': 'never' } });
+    const x = start(dir, { settings: { 'asmLens.reanalyzeOn': 'never', 'asmLens.autoInstantiateTemplates': false } });
     const msg = await x.instantiate('m.h', 3, 'int');
-    assert.match(msg.info.join(' '), /M<int> does not compile as a whole for these types, so only M<int>::get is compiled/);
     assert.deepEqual(msg.warning, []);
-    for (let i = 0; i < 100 && !/2 instructions/.test(await x.lensAt('m.h', 3) || ''); i++) await new Promise(r => setTimeout(r, 20));
     assert.match(await x.lensAt('m.h', 3), /^\$\(symbol-numeric\) 2 instructions/);
+    assert.match(await x.lensAt('m.h', 4), /^\$\(warning\) M<int>::len does not compile: request for member 'size' in 'int' · click to choose types$/);
+    assert.deepEqual(x.ext._internals.instantiationsFor(x.open('m.h')).map(i => i.expr), ['M<int>'], 'the types stay chosen');
+  } finally { ce.restore(); }
+});
+
+test('a class that compiles as a whole costs one compile, with one line for it: nothing added for those that fail', async () => {
+  const dir = makeProject({ 'm.h': 'template <class T> struct M {\n  T get() const { return T{}; }\n  T other() const { return T{}; }\nprivate:\n  T secret() const { return T{}; }\n};\n' });
+  const ce = fakeCompilerExplorer(body => ({ code: 0, asm: body.source.includes('template struct M<int>;') ? asmFor(['M<int>::get() const', 2], ['M<int>::other() const', 3], ['M<int>::secret() const', 5]) : [] }));
+  try {
+    const x = start(dir, { settings: { 'asmLens.reanalyzeOn': 'never', 'asmLens.autoInstantiateTemplates': false } });
+    await x.instantiate('m.h', 2, 'int');
+    assert.equal(ce.requests.length, 1);
+    assert.equal(ce.requests[0].body.source.split('\n').slice(6).join('|'), 'template struct M<int>;|');
+    for (const line of [2, 3, 5]) assert.match(await x.lensAt('m.h', line), /^\$\(symbol-numeric\) 2 instructions · M<int>/, `line ${line}`);
+  } finally { ce.restore(); }
+});
+
+test('a request saved by an older version, only the member: it still compiles and stays', async () => {
+  const dir = makeProject({ 'm.h': 'template <class T> struct M {\n  T get() const { return T{}; }\n};\n' });
+  const ce = fakeCompilerExplorer(body => ({ code: 0, asm: body.source.includes('auto __asm_lens_inst_0 = &M<int>::get;') ? asmFor(['M<int>::get() const', 2]) : [] }));
+  try {
+    const x = start(dir, { settings: { 'asmLens.reanalyzeOn': 'never' } });
+    x.state.workspaceState.set('asmLens.instantiations', { [require('../../src/asm').normPath(x.at('m.h'))]: [{ kind: 'address', expr: 'M<int>::get' }] });
+    await x.analyze('m.h');
+    assert.match(await x.lensAt('m.h', 2), /^\$\(symbol-numeric\) 2 instructions/);
     assert.deepEqual(x.ext._internals.instantiationsFor(x.open('m.h')), [{ kind: 'address', expr: 'M<int>::get' }]);
+    assert.ok(!ce.requests.some(r => r.body.source.includes('template struct M<int>')), 'its class is known not to compile as a whole');
+  } finally { ce.restore(); }
+});
+
+test('nothing of a request compiles: it is removed, with the reason', async () => {
+  const dir = makeProject({ 'm.h': 'template <class T> struct M {\n  T get() const { return T{}; }\n};\n' });
+  const ce = fakeCompilerExplorer(body => {
+    const lines = body.source.split('\n');
+    const bad = lines.findIndex(l => l.includes('Nope'));
+    return bad >= 0 ? { code: 1, stderr: err(`<source>:${bad + 1}:17: error: 'Nope' was not declared in this scope`) } : { code: 0, asm: [] };
+  });
+  try {
+    const x = start(dir, { settings: { 'asmLens.reanalyzeOn': 'never', 'asmLens.autoInstantiateTemplates': false } });
+    const msg = await x.instantiate('m.h', 2, 'Nope');
+    assert.match(msg.warning[0], /could not instantiate template struct M<Nope>/);
+    assert.deepEqual(x.ext._internals.instantiationsFor(x.open('m.h')), []);
+    assert.match(await x.lensAt('m.h', 2), /does not compile: 'Nope' was not declared in this scope · click to choose types$/);
+  } finally { ce.restore(); }
+});
+
+test('an overloaded template: the plain form first, and the cast only if that does not compile', async () => {
+  const dir = makeProject({ 'p.h': 'template <class T> T pick(T a) { return a; }\ntemplate <class T> T pick(T a, T b) { return b; }\n' });
+  const ce = fakeCompilerExplorer(body => {
+    const lines = body.source.split('\n');
+    const plain = lines.findIndex(l => l === 'auto __asm_lens_inst_0 = &pick<int>;');
+    if (plain >= 0) return { code: 1, stderr: err(`<source>:${plain + 1}:6: error: unable to deduce 'auto' from '& pick<int>'`) };
+    return { code: 0, asm: lines.some(l => l.includes('static_cast<int (*)(int a, int b)>(&pick<int>)')) ? asmFor(['int pick<int>(int, int)', 2]) : [] };
+  });
+  try {
+    const x = start(dir, { settings: { 'asmLens.reanalyzeOn': 'never', 'asmLens.autoInstantiateTemplates': false } });
+    const msg = await x.instantiate('p.h', 2, 'int');
+    assert.deepEqual(msg.warning, []);
+    assert.equal(ce.requests.length, 2);
+    assert.match(await x.lensAt('p.h', 2), /^\$\(symbol-numeric\) 2 instructions · pick<int>/);
+    assert.equal(x.ext._internals.instantiationsFor(x.open('p.h')).length, 1);
   } finally { ce.restore(); }
 });
 
@@ -1773,10 +1831,8 @@ test('a chosen type that does not compile: the lens gives the reason', async () 
   try {
     const x = start(dir, { settings: { 'asmLens.autoInstantiateTemplates': false } });
     await x.instantiate('h.hxx', 1, 'Nope');
-    // The class first, then only the member that was clicked, and only then it is given up.
-    for (let i = 0; i < 400 && x.ext._internals.instantiationsFor(x.open('h.hxx')).length; i++) await new Promise(r => setTimeout(r, 10));
     assert.deepEqual(x.ext._internals.instantiationsFor(x.open('h.hxx')), []);
-    assert.ok(x.state.messages.warning.some(m => /could not instantiate Box<Nope>::get/.test(m)), x.state.messages.warning.join('\n'));
+    assert.ok(x.state.messages.warning.some(m => /could not instantiate template struct Box<Nope>/.test(m)), x.state.messages.warning.join('\n'));
     assert.match(await x.settledLens('h.hxx', 1), /^\$\(warning\) Box<Nope>(?:::get)? does not compile: 'Nope' was not declared in this scope · click to choose types$/);
   } finally { ce.restore(); }
 });
@@ -1801,4 +1857,40 @@ test('choosing types while a compile runs: that compile stops, and one with the 
     for (let i = 0; i < 300 && !/instructions/.test(await x.lensAt('h.hxx', 1)); i++) await new Promise(r => setTimeout(r, 10));
     assert.equal(await x.lensAt('h.hxx', 1), '$(symbol-numeric) 2 instructions · f<long> · g152 · -O2');
   } finally { global.fetch = real; }
+});
+
+test('MSVC names the first line that uses a class for any member\'s error: "see the first reference to" decides who is at fault', async () => {
+  const dir = makeProject({ 'm.h': 'template <class T> struct M {\n  T get() const { return T{}; }\n  T bad() const { return (T)42; }\n};\nstruct S { int a; };\n' }, { compilers: [{ id: 'vcpp_v19_latest_x64', name: 'msvc' }] });
+  const ce = fakeCompilerExplorer(body => {
+    const lines = body.source.split('\n');
+    const whole = lines.indexOf('template struct M<S>;');
+    if (whole >= 0) return { code: 2, stdout: err("<source>(3): error C2440: 'type cast': cannot convert from 'int' to 'T'", `<source>(${whole + 1}): note: see reference to class template instantiation 'M<S>' being compiled`) };
+    const get = lines.findIndex(l => l.includes('&M<S>::get')), bad = lines.findIndex(l => l.includes('&M<S>::bad'));
+    if (bad >= 0) return { code: 2, stdout: err("<source>(3): error C2440: 'type cast': cannot convert from 'int' to 'T'", `<source>(${get + 1}): note: see reference to class template instantiation 'M<S>' being compiled`, "<source>(3): note: while compiling class template member function 'T M<T>::bad(void) const'", `<source>(${bad + 1}): note: see the first reference to 'M<S>::bad'`) };
+    return { code: 0, asm: get >= 0 ? asmFor(['M<S>::get(void)const', 2]) : [] };
+  });
+  try {
+    const x = start(dir, { settings: { 'asmLens.reanalyzeOn': 'never', 'asmLens.autoInstantiateTemplates': false } });
+    await x.instantiate('m.h', 2, 'S');
+    assert.match(await x.lensAt('m.h', 2), /^\$\(symbol-numeric\) 2 instructions/);
+    assert.match(await x.lensAt('m.h', 3), /M<S>::bad does not compile: 'type cast'/);
+  } finally { ce.restore(); }
+});
+
+test('an error in the class itself: all its members go at once, not one per compile', async () => {
+  const members = Array.from({ length: 20 }, (_, i) => `  T m${i}() const { return T{}; }`).join('\n');
+  const dir = makeProject({ 'm.h': `template <class T> struct M {\n  typename T::nothing n;\n${members}\n};\n` });
+  const ce = fakeCompilerExplorer(body => {
+    const lines = body.source.split('\n');
+    const use = lines.findIndex(l => l === 'template struct M<int>;' || l.includes('&M<int>::'));
+    if (use < 0) return { code: 0, asm: [] };
+    return { code: 1, stderr: err("<source>:2:23: error: 'int' cannot be used prior to '::'", `<source>:${use + 1}:17: note: in instantiation of template class 'M<int>' requested here`) };
+  });
+  try {
+    const x = start(dir, { settings: { 'asmLens.reanalyzeOn': 'never', 'asmLens.autoInstantiateTemplates': false } });
+    const msg = await x.instantiate('m.h', 3, 'int');
+    assert.ok(ce.requests.length <= 4, `${ce.requests.length} compiles`);
+    assert.match(msg.warning[0], /could not instantiate template struct M<int>/);
+    assert.deepEqual(x.ext._internals.instantiationsFor(x.open('m.h')), []);
+  } finally { ce.restore(); }
 });

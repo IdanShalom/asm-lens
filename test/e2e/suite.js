@@ -68,7 +68,8 @@ exports.run = async () => {
     const lenses = await settled('needs.hxx');
     for (const line of [3, 4, 6, 15, 16]) assert.match(at(lenses, line), CODE, `line ${line}: ${at(lenses, line)}`);
     assert.match(at(lenses, 9), /Not compiled · inside #ifdef NEVER_ON/);
-    assert.ok(at(lenses, 15).includes('Wrap<long>'), at(lenses, 15));
+    // Wrap<Point*> has get() as well, though its scaled() does not compile: members compile separately then.
+    assert.ok(at(lenses, 16).includes('Wrap<long>'), at(lenses, 16));
   });
 
   await check('types in capitals and macros around the signature show code', async () => {
@@ -109,6 +110,24 @@ exports.run = async () => {
       await running;
       const lenses = await settled('builds/arch.hxx');
       assert.match(at(lenses, 12), /^\$\(symbol-numeric\) \d+ instructions · pick<Point>/, at(lenses, 12));
+    } finally { api.window.showInputBox = realBox; }
+  });
+
+  await check('a member that does not compile costs only itself; an overload through SFINAE works; private members keep their code', async () => {
+    const ext = vscode.extensions.all.find(e => /asm-lens$/i.test(e.id));
+    const api = Module._load('vscode', { filename: path.join(ext.extensionPath, 'src', 'extension.js') }, false);
+    const realBox = api.window.showInputBox;
+    const answers = ['S', 'int', 'int', 'int'];
+    api.window.showInputBox = async () => answers.shift();
+    try {
+      await vscode.commands.executeCommand('asmLens.instantiateTemplate', uriOf('templates/broken_member.hxx'), 4);
+      const lenses = await settled('templates/broken_member.hxx');
+      assert.match(at(lenses, 5), /^\$\(symbol-numeric\) \d+ instructions · Box<S>/, at(lenses, 5));
+      assert.match(at(lenses, 6), /Box<S>::broken does not compile/, at(lenses, 6));
+      await vscode.commands.executeCommand('asmLens.instantiateTemplate', uriOf('templates/sfinae.hxx'), 5);
+      assert.match(at(await settled('templates/sfinae.hxx'), 6), /^\$\(symbol-numeric\) \d+ instructions/);
+      await vscode.commands.executeCommand('asmLens.instantiateTemplate', uriOf('templates/private_member.hxx'), 1);
+      assert.match(at(await settled('templates/private_member.hxx'), 5), /^\$\(symbol-numeric\) \d+ instructions/, 'a private member');
     } finally { api.window.showInputBox = realBox; }
   });
 

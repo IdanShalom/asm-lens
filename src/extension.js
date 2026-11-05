@@ -353,11 +353,11 @@ function activate(context) {
         }
         const offBy = !result && !inlined && !wasSkipped ? sourceInfo(document).conditions[line] : undefined;
         if (!result && !inlined && !wasSkipped && template && !offBy) {
-          const trouble = templateTrouble(document, templates.get(sym));
+          const trouble = templateTrouble(document, templates.get(sym), sym.name);
           return chooseTypes(trouble ? `$(warning) ${trouble.expr} does not compile: ${oneLine(trouble.message)} · click to choose types` : '$(info) Template: click to choose its types');
         }
         if (!result && !inlined && !wasSkipped && !offBy) return new vscode.CodeLens(sym.range, { ...noCodeLens(document, line, analysis), command: 'asmLens.showOutput' });
-        const instantiation = template && result ? shortened(instantiationOf(result.name)) : '';
+        const instantiation = template && result ? shortened(result.instantiation || instantiationOf(result.name)) : '';
         const needed = result ? (analysis.retargeted || []).find(k => k.key === key && line >= k.startLine && line <= k.endLine) : undefined;
         const title = results.length > 1
           ? `$(symbol-numeric) ${results.length} ${template || /</.test(results[0].name) ? 'instantiations' : 'versions'} · ${results.map(r => r.count).join(' / ')} instructions · ${analysis.compilerLabel}${viaRoot}`
@@ -659,11 +659,13 @@ function offWhere(analysis) {
 // Why a template has no code, when it was tried: types chosen, or the ones it was compiled for by itself.
 const choiceTrouble = new Map();
 const autoTrouble = new Map();
-function templateTrouble(document, target) {
+function templateTrouble(document, target, functionName) {
   if (!target) return undefined;
   const name = scan.templateName(target.label);
+  const member = `${name}::${normalizeName(functionName)}`;
   const list = [...(choiceTrouble.get(fileKey(document)) || []), ...(autoTrouble.get(fileKey(document)) || [])];
-  return list.find(k => k.name === name) || list.find(k => name.startsWith(`${k.name}::`) || k.name.startsWith(`${name}::`));
+  // Its own trouble first: another member's error says nothing about this one.
+  return list.find(k => k.name === member) || list.find(k => k.name === name);
 }
 
 // The CodeLens of a function that is not a template, not switched off, and has no code
@@ -1125,25 +1127,62 @@ async function dropFailedInstantiations(document, failed) {
   if (!failed.length) return;
   const list = instantiationsFor(document);
   const bad = new Set(failed.map(f => f.index));
-  // A class as a whole may not compile for these types while the member that was asked for does.
-  const narrow = it => it.kind === 'class' && it.member && !list.some(x => x.expr === it.member);
-  const next = list.flatMap((it, i) => (!bad.has(i) ? [it] : narrow(it) ? [{ kind: 'address', expr: it.member }] : []));
-  await setInstantiations(document, next);
+  await setInstantiations(document, list.filter((it, i) => !bad.has(i)));
   for (const f of failed) {
     const it = list[f.index];
     if (!it) continue;
-    if (narrow(it)) {
-      outputChannel.appendLine(`  ${describeInstantiation(it)} does not compile as a whole (${f.message || 'compile error'}); compiling only ${it.member}.`);
-      vscode.window.showInformationMessage(`Asm Lens: ${it.expr} does not compile as a whole for these types, so only ${it.member} is compiled. See the Asm Lens output.`);
-      userRerun.add(fileKey(document));
-      continue;
-    }
     outputChannel.appendLine(`  instantiation failed and was removed: ${describeInstantiation(it)}: ${f.message || 'compile error'}`);
     const trouble = choiceTrouble.get(fileKey(document)) || [];
     trouble.push({ name: scan.templateName(it.expr), expr: it.expr, message: f.message || 'compile error' });
     choiceTrouble.set(fileKey(document), trouble);
     vscode.window.showWarningMessage(`Asm Lens: could not instantiate ${describeInstantiation(it)}${f.message ? `: ${f.message}` : ''}. It was removed; see the Asm Lens output for details.`);
   }
+}
+
+// What to do with an added line that does not compile. One with another form takes it. A
+// class that does not compile as a whole gives way to a line per member, added at the end. Any
+// other line goes. `failedRequest`: nothing of that request is left to try.
+function nextForm(prepared, state, line, message, classLevel) {
+  const info = state.added.get(line) ?? prepared?.lines?.[line - (prepared?.firstLine ?? 0)];
+  if (!info) return { edits: [[line, '']], dropped: true };
+  // The class itself does not compile for these types: no member will, so not one per compile.
+  if (classLevel && !info.members && (info.ifPrivate !== undefined || info.wrapper || state.added.has(line) || info.member !== undefined)) {
+    const same = [...state.added].filter(([, m]) => m.request === info.request).map(([l]) => l);
+    (prepared?.lines || []).forEach((l, i) => { if (l.request === info.request && !l.members) same.push(i + prepared.firstLine); });
+    const rest = [...new Set([line, ...same])].filter(l => !state.gone.has(l));
+    rest.forEach(l => state.gone.add(l));
+    return { edits: rest.map(l => [l, '']), dropped: true, alsoGone: rest.filter(l => l !== line), failedRequest: info.request };
+  }
+  const other = !state.tried.has(line) && (info.fallback || (/\bprivate\b|\bprotected\b|\binaccessible\b|\bcannot access\b/i.test(message || '') ? info.ifPrivate : undefined));
+  if (other) {
+    state.tried.add(line);
+    return { edits: [[line, other]], dropped: false };
+  }
+  state.gone.add(line);
+  const out = { edits: [[line, '']], dropped: true };
+  if (info.members?.length) {
+    if (info.members.some(m => m.needsNew)) out.edits.push([state.nextLine++, '#include <new>']);
+    for (const m of info.members) {
+      state.added.set(state.nextLine, m);
+      out.edits.push([state.nextLine++, m.text]);
+    }
+    outputChannel?.appendLine(`  ${info.expr} does not compile as a whole (${message || 'compile error'}); compiling its members one by one.`);
+    return out;
+  }
+  if (info.helper) return out;
+  // Whatever else of this request is still there.
+  const left = [...state.added].some(([l, m]) => m.request === info.request && !state.gone.has(l))
+    || (prepared?.lines || []).some((l, i) => l.request === info.request && !l.helper && !state.gone.has(i + prepared.firstLine));
+  if (!left) out.failedRequest = info.request;
+  return out;
+}
+
+function setLine(text, line, value) {
+  if (!value) return blankLine(text, line);
+  const lines = text.split('\n');
+  while (lines.length <= line + 1) lines.push('');
+  lines[line] = value;
+  return lines.join('\n');
 }
 
 // Main-file lines (0-based) at or after `firstLine` that an error points at,
@@ -1154,12 +1193,44 @@ async function dropFailedInstantiations(document, failed) {
 function instantiationLinesIn(errText, firstLine, isMainFile, manual = 0) {
   if (firstLine < 0) return [];
   const lines = new Set();
-  const add = (file, line) => { if (isMainFile(file.trim()) && Number(line) - 1 >= firstLine) lines.add(Number(line) - 1); };
-  for (const m of errText.matchAll(/^(.+?):(\d+)(?::\d+)?:\s*(?:(?:fatal )?error\b|.*\brequired from here\b|note:.*\brequested here\b)/gm)) add(m[1], m[2]);
-  for (const m of errText.matchAll(/^(.+?)\((\d+)(?:,\d+)?\)\s*:\s*(?:(?:fatal )?error\b|note:\s*see reference to)/gm)) add(m[1], m[2]);
+  // Lines whose error is in the class itself, not in one of its members: nothing of it can compile then.
+  const classLevel = new Set();
+  const add = (file, line, ofClass) => {
+    const n = Number(line) - 1;
+    if (!isMainFile(file.trim()) || n < firstLine) return;
+    lines.add(n);
+    if (ofClass) classLevel.add(n);
+  };
+  const rows = errText.split(/\r?\n/);
+  // GCC and Clang.
+  let inClass = false;
+  for (const row of rows) {
+    if (/In instantiation of '/.test(row)) inClass = /In instantiation of '(?:struct|class|union) /.test(row);
+    const m = /^(.+?):(\d+)(?::\d+)?:\s*(?:(?:fatal )?error\b|.*\brequired from here\b|note:.*\brequested here\b)/.exec(row);
+    if (m) add(m[1], m[2], /note: in instantiation of template class\b/.test(row) || (/required from here/.test(row) && inClass));
+  }
+  // MSVC: an error names the exact line with "see the first reference to", if it can; "see reference to
+  // class template instantiation" is only the first line that uses the class, whichever member is at fault.
+  let group;
+  const close = () => {
+    if (!group) return;
+    for (const [file, line] of group.first.length ? group.first : group.classUse) add(file, line, !group.first.length);
+    group = undefined;
+  };
+  for (const row of rows) {
+    const error = /^(.+?)\((\d+)(?:,\d+)?\)\s*:\s*(?:fatal )?error\b/.exec(row);
+    if (error) { close(); group = { first: [], classUse: [] }; add(error[1], error[2]); continue; }
+    const first = /^(.+?)\((\d+)(?:,\d+)?\)\s*:\s*note:\s*see the first reference to/.exec(row);
+    if (first && group) { group.first.push([first[1], first[2]]); continue; }
+    const use = /^(.+?)\((\d+)(?:,\d+)?\)\s*:\s*note:\s*see reference to/.exec(row);
+    if (use && group) group.classUse.push([use[1], use[2]]);
+  }
+  close();
   const all = [...lines];
   const added = all.filter(l => l - firstLine >= manual);
-  return added.length ? added : all;
+  const result = added.length ? added : all;
+  result.classLevel = classLevel;
+  return result;
 }
 
 function blankLine(text, line) {
@@ -1498,7 +1569,7 @@ function logFunctionsWithoutCode(document, analyses) {
   for (const d of functionsWithoutCode(document, analyses)) {
     const line = d.nameLine ?? d.startLine;
     const failed = [...(main.skipped || []), ...(main.unkept || [])].find(k => line >= k.startLine && line <= k.endLine);
-    const trouble = d.templated ? templateTrouble(document, sourceTemplate(document, d)) : undefined;
+    const trouble = d.templated ? templateTrouble(document, sourceTemplate(document, d), d.name) : undefined;
     const reason = d.templated ? (trouble ? `${trouble.expr} does not compile: ${trouble.message}. Click its CodeLens to choose other types.` : 'no types yet. Click its CodeLens to choose them.')
       : conditions[line] ? `inside ${conditions[line]}, which is off`
         : failed ? `the compiler says: ${failed.message || 'compile error'}`
@@ -1677,7 +1748,7 @@ async function runAnalysis(document, { context, calls } = {}) {
     const recoverErrors = settings.get('skipFailingFunctions', true);
     const opts = {
       baseUrl, compilerId, language, timeoutMs, flags, syntax, includeBundle, maxAttempts, recoverErrors, rootFile: document.fileName,
-      instFirstLine: prepared.firstLine, instCount: prepared.instCount, original: prepared.plain,
+      instFirstLine: prepared.firstLine, instCount: prepared.instCount, prepared, original: prepared.plain,
       prefix: context?.text ? `${context.text}\n#line 1\n` : ''
     };
     let compiled, keptFailed = false, marksDropped;
@@ -1699,7 +1770,7 @@ async function runAnalysis(document, { context, calls } = {}) {
         marksRejected.add(marksKey);
       }
     }
-    rememberRejected(document, compilerId, prepared, compiled.failedMessages, context);
+    rememberRejected(document, compilerId, prepared, compiled.failedMessages, context, compiled.requestState);
     const { data, effectiveFlags } = compiled;
     const asmRows = Array.isArray(data.asm) ? data.asm : [];
     const rootPathKey = docPathKey(document);
@@ -1722,6 +1793,7 @@ async function runAnalysis(document, { context, calls } = {}) {
       unkept: compiled.unkept,
       retargeted: compiled.retargeted,
       callTargets: prepared.callTargets,
+      requestLines: prepared.lines,
       marksDropped,
       stubbed: compiled.stubbed
     });
@@ -1787,8 +1859,9 @@ function prepareCSource(document, { marks = 'attribute', compiler = '', calls, c
   const insts = isCpp ? instantiationsFor(document) : [];
   const unused = isHeader || config().get('emitUnusedFunctions', true);
   const defs = isCpp ? scan.scanDefinitions(original) : undefined;
+  const rejected = jobContext.getStore()?.auto ? autoRejected.get(`${fileKey(document)}\n${compiler}\n${context?.from || ''}`) : undefined;
   const autos = isCpp && unused && config().get('autoInstantiateTemplates', true)
-    ? scan.autoInstantiations(original, { defs, manual: insts, contexts: includerTexts(document), rejected: jobContext.getStore()?.auto ? autoRejected.get(`${fileKey(document)}\n${compiler}\n${context?.from || ''}`) : undefined })
+    ? scan.autoInstantiations(original, { defs, manual: insts, contexts: includerTexts(document), rejected })
     : [];
   if (autos.length) outputChannel?.appendLine(`  templates compiled for: ${autos.map(it => it.expr).join(', ')}`);
   const requests = [...insts, ...autos];
@@ -1796,7 +1869,8 @@ function prepareCSource(document, { marks = 'attribute', compiler = '', calls, c
   const friends = [...(isCpp ? scan.friendUseLines(original, requests, defs) : []), ...called];
   // Before them: what the types they name need.
   const before = requests.length ? [...scan.includesForTypes(requests), ...(context?.after || [])] : [];
-  const withInsts = text => scan.appendInstantiations(text, requests, friends, before).text;
+  const lines = scan.instantiationLines(requests, { text: original, defs, rejected });
+  const withInsts = text => (requests.length || friends.length ? scan.appendLines(text, [...lines.map(l => l.text), ...friends], before).text : text);
   const plain = withInsts(original);
   const keep = marks !== 'none' && unused;
   let kept;
@@ -1817,25 +1891,29 @@ function prepareCSource(document, { marks = 'attribute', compiler = '', calls, c
   }
   const base = original.endsWith('\n') ? original : `${original}\n`;
   const appended = requests.length || friends.length || (kept !== undefined && marks === 'address');
-  return { isHeader, firstLine: appended ? (base.match(/\n/g) || []).length + before.length : -1, instCount: insts.length, requests, callTargets: called.targets, kept, plain };
+  return {
+    isHeader, firstLine: appended ? (base.match(/\n/g) || []).length + before.length : -1,
+    lines, manualRequests: insts.length, instCount: lines.filter(l => l.request < insts.length).length,
+    callTargets: called.targets, kept, plain
+  };
 }
 
 // Automatic instantiations that did not compile, per file, compiler and way of compiling:
 // automatic analyses leave them out, so that typing does not cost two compiles each time. An
 // analysis the user asks for tries them again. The message is what the CodeLens says.
 const autoRejected = new Map();
-function rememberRejected(document, compiler, prepared, failedMessages, context) {
+function rememberRejected(document, compiler, prepared, failedMessages, context, state) {
   const key = `${fileKey(document)}\n${compiler}\n${context?.from || ''}`;
   if (autoRejected.size > 200) autoRejected.clear();
   const known = jobContext.getStore()?.auto ? [...(autoRejected.get(key) || [])] : [];
-  const failed = [...failedMessages].map(([l, message]) => ({ it: prepared.requests[l - prepared.firstLine], index: l - prepared.firstLine, message }))
-    .filter(x => x.it && x.index >= prepared.instCount);
-  autoRejected.set(key, new Set([...known, ...failed.map(x => x.it.expr)]));
+  const failed = [...failedMessages].map(([l, message]) => ({ it: state?.added.get(l) ?? prepared.lines[l - prepared.firstLine], message })).filter(x => x.it && !x.it.helper);
+  // A chosen type stays requested, but a class that does not compile as a whole need not be tried on every edit.
+  autoRejected.set(key, new Set([...known, ...failed.filter(x => x.it.members || x.it.request >= prepared.manualRequests || state?.added.has(x.it)).map(x => x.it.expr)]));
   const trouble = autoTrouble.get(fileKey(document)) || [];
   // The newest message: a later compile has more of what the type needs, so it says more.
   for (const x of failed) {
-    const known = trouble.find(k => k.expr === x.it.expr);
-    if (known) known.message = x.message; else trouble.push({ name: scan.templateName(x.it.expr), expr: x.it.expr, message: x.message });
+    const had = trouble.find(k => k.expr === x.it.expr);
+    if (had) had.message = x.message; else trouble.push({ name: scan.templateName(x.it.expr), expr: x.it.expr, message: x.message });
   }
   autoTrouble.set(fileKey(document), trouble);
 }
@@ -1902,6 +1980,16 @@ function noteUnmarked(off, key, unkept, retargeted) {
   for (const k of off.functions) { const known = retargeted.findIndex(x => x.startLine === k.startLine); if (known >= 0) retargeted.splice(known, 1); }
 }
 
+// The constructor or destructor a request line calls, if `fn` is that line and the call was
+// inlined (a body that still calls it is not its code: the member has a function of its own then).
+function wrappedMember(fn, lines) {
+  const id = /__asm_lens_inst_\d+_\d+/.exec(fn.name)?.[0];
+  const line = id && lines ? lines.flatMap(l => [l, ...(l.members || [])]).find(l => l.wrapper === id) : undefined;
+  if (!line) return undefined;
+  const name = scan.splitQualified(line.def.name).pop().replace(/^~/, '');
+  return fn.instructionRows.some(r => /\bcall\b|\bjmp\b|\bb\b|\bbl\b/.test(String(r.text)) && String(r.text).includes(name)) ? undefined : line;
+}
+
 // The function a __asm_lens_call_N line calls, if `fn` is that line and the call was inlined:
 // compilers may credit a short inlined body to the caller's line, so its lines do not tell.
 // A body that still calls the function is not that function's code.
@@ -1934,11 +2022,12 @@ async function recordAnalysis(document, o) {
     : await vscode.commands.executeCommand('vscode.executeDocumentSymbolProvider', document.uri)) || [];
   const allSourceFunctions = sourceFunctionsOf(document, symbols);
   const matched = functions.map(fn => {
-    const called = calledFunction(fn, o.callTargets);
+    const wrapped = wrappedMember(fn, o.requestLines);
+    const called = wrapped?.def || calledFunction(fn, o.callTargets);
     const symbol = called
       ? allSourceFunctions.find(s => s.range && s.range.start.line <= (called.nameLine ?? called.startLine) && (called.nameLine ?? called.startLine) <= s.range.end.line)
       : matchSourceSymbol(fn.name, allSourceFunctions, fn, rootPathKey, { requireName: o.requireName });
-    return { ...fn, sourceName: symbol?.name || fn.name, sourceRange: symbol?.range, sourceSelection: symbol?.selectionRange };
+    return { ...fn, instantiation: wrapped?.owner, sourceName: symbol?.name || fn.name, sourceRange: symbol?.range, sourceSelection: symbol?.selectionRange };
   });
   let deps = o.deps;
   if (!deps) { deps = new Set([rootPathKey]); for (const f of functions) for (const k of f.fileKeys) deps.add(k); for (const k of (o.includes || new Map()).keys()) deps.add(k); }
@@ -2207,6 +2296,7 @@ async function analyzeLocal(document, resolved, settings, { context, calls } = {
   const failedInstantiations = [];
   const failedLines = new Set();
   const failedMessages = new Map();
+  const requestState = { tried: new Set(), gone: new Set(), added: new Map(), nextLine: source.split('\n').length - 1 };
   const unkept = [];
   const retargeted = [];
   let marksDropped;
@@ -2259,14 +2349,15 @@ async function analyzeLocal(document, resolved, settings, { context, calls } = {
     if (!progressed) {
       const first = firstErrorMessage(err);
       const lineErrors = errorLinesIn(err, isMain);
-      for (const l of instantiationLinesIn(err, prepared.firstLine, isMain, prepared.instCount)) {
+      const hit = instantiationLinesIn(err, prepared.firstLine, isMain, prepared.instCount);
+      for (const l of hit) {
         if (failedLines.has(l)) continue;
-        failedLines.add(l);
         const message = lineErrors.get(l) || first;
-        failedMessages.set(l, message);
-        source = blankLine(source, l);
-        plainSource = blankLine(plainSource, l);
-        if (l - prepared.firstLine < prepared.instCount) failedInstantiations.push({ index: l - prepared.firstLine, message });
+        const step = nextForm(prepared, requestState, l, message, hit.classLevel?.has(l));
+        for (const [line, value] of step.edits) { source = setLine(source, line, value); plainSource = setLine(plainSource, line, value); }
+        if (step.dropped) { failedLines.add(l); failedMessages.set(l, message); }
+        for (const other of step.alsoGone || []) { failedLines.add(other); failedMessages.set(other, message); }
+        if (step.failedRequest !== undefined && step.failedRequest < prepared.manualRequests) failedInstantiations.push({ index: step.failedRequest, message });
         progressed = true;
       }
     }
@@ -2310,7 +2401,7 @@ async function analyzeLocal(document, resolved, settings, { context, calls } = {
     }
   }
 
-  rememberRejected(document, compiler, prepared, failedMessages, context);
+  rememberRejected(document, compiler, prepared, failedMessages, context, requestState);
   // Demangle names (if c++filt exists) so they match source function names.
   report('reading the assembly…');
   const macho = isMachO(asm);
@@ -2331,6 +2422,7 @@ async function analyzeLocal(document, resolved, settings, { context, calls } = {
     unkept,
     retargeted,
     callTargets: prepared.callTargets,
+    requestLines: prepared.lines,
     marksDropped,
     stubbed,
     includes: await localIncludes(`${context?.text || ''}\n${(context?.after || []).join('\n')}\n${document.getText()}`, fileDir, flagsLib.includeDirsOf(args, cwd))
@@ -2560,6 +2652,7 @@ async function compileWithRecovery(opts) {
   const failedInstantiations = [];
   const failedLines = new Set();
   const failedMessages = new Map();
+  const requestState = { tried: new Set(), gone: new Set(), added: new Map(), nextLine: String(opts.source).split('\n').length - 1 };
   const removedFlags = [];
   const unkept = [];
   const retargeted = [];
@@ -2573,7 +2666,7 @@ async function compileWithRecovery(opts) {
     const data = await postCompile({ ...opts, source, files, flags });
     if (data.code === undefined || data.code === 0) {
       if (attempt > 1) outputChannel.appendLine(`Compiled after ${attempt - 1} recovery step(s).`);
-      return { data, effectiveFlags: flags, skipped, stubbed, failedInstantiations, removedFlags, failedLines, failedMessages, unkept, retargeted };
+      return { data, effectiveFlags: flags, skipped, stubbed, failedInstantiations, removedFlags, failedLines, failedMessages, unkept, retargeted, requestState };
     }
     lastErr = stderrText(data) || `Compiler exited with code ${data.code}`;
 
@@ -2615,14 +2708,18 @@ async function compileWithRecovery(opts) {
     // 2. A requested template instantiation that does not compile -> drop it.
     const firstMessage = firstErrorMessage(lastErr);
     const lineErrors = errorLinesIn(lastErr, isRemoteMain);
-    for (const l of instantiationLinesIn(lastErr, opts.instFirstLine ?? -1, isRemoteMain, opts.instCount ?? 0)) {
+    const hit = instantiationLinesIn(lastErr, opts.instFirstLine ?? -1, isRemoteMain, opts.instCount ?? 0);
+    for (const l of hit) {
       if (failedLines.has(l)) continue;
-      failedLines.add(l);
       const message = lineErrors.get(l) || firstMessage;
-      failedMessages.set(l, message);
-      source = blankLine(source, l);
-      if (plainSource !== undefined) plainSource = blankLine(plainSource, l);
-      if (l - opts.instFirstLine < (opts.instCount ?? Infinity)) failedInstantiations.push({ index: l - opts.instFirstLine, message });
+      const step = nextForm(opts.prepared, requestState, l, message, hit.classLevel?.has(l));
+      for (const [line, value] of step.edits) {
+        source = setLine(source, line, value);
+        if (plainSource !== undefined) plainSource = setLine(plainSource, line, value);
+      }
+      if (step.dropped) { failedLines.add(l); failedMessages.set(l, message); }
+      for (const other of step.alsoGone || []) { failedLines.add(other); failedMessages.set(other, message); }
+      if (step.failedRequest !== undefined && step.failedRequest < (opts.prepared?.manualRequests ?? 0)) failedInstantiations.push({ index: step.failedRequest, message });
       progressed = true;
     }
     if (progressed) continue;
