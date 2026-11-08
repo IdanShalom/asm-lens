@@ -26,14 +26,15 @@ function localCompilers() {
 }
 
 const COUNT = /^\$\(symbol-numeric\) \d+ instructions · /;
-const NOT_INSTANTIATED = /^\$\(info\) No code emitted: template not instantiated/;
+const NOT_INSTANTIATED = /^\$\((?:info|warning)\) (?:Template: click to choose its types|.* does not compile: .* · click to choose types)/;
 
 // Header lines (1-based) of mathx.hxx
 const L = { square: 4, clamp: 7, addInts: 14, mulInts: 16, cube: 21, push: 25, get: 26, twice: 32 };
 
+// Choosing types by hand; test/integration/auto.test.js has what happens without being asked.
 async function headerScenario(t, config) {
   const dir = makeProject({ 'mathx.hxx': fixture('headers', 'mathx.hxx'), 'user.cpp': fixture('headers', 'user.cpp') }, config);
-  const x = start(dir);
+  const x = start(dir, { settings: { 'asmLens.autoInstantiateTemplates': false, 'asmLens.reanalyzeOn': 'never' } });
 
   // 1. The header on its own: non-template functions are emitted, templates wait for instantiation.
   const alone = await x.analyze('mathx.hxx');
@@ -41,7 +42,7 @@ async function headerScenario(t, config) {
   assert.match(alone.info[0], /found 4 emitted function bodies/);
   for (const line of [L.addInts, L.mulInts, L.push, L.get]) assert.match(await x.lensAt('mathx.hxx', line), COUNT, `line ${line}`);
   for (const line of [L.square, L.clamp, L.cube, L.twice]) assert.match(await x.lensAt('mathx.hxx', line), NOT_INSTANTIATED, `line ${line}`);
-  const instantiateLenses = (await x.lenses('mathx.hxx')).filter(l => l.command === 'asmLens.instantiateTemplate').map(l => l.line);
+  const instantiateLenses = (await x.lenses('mathx.hxx')).filter(l => l.title.endsWith('Instantiate…')).map(l => l.line);
   assert.deepEqual(instantiateLenses, [L.square, L.clamp, L.cube, L.twice]);
 
   // 2. Live instantiation with chosen types; a type that does not exist is dropped with the compiler's message.
@@ -74,7 +75,7 @@ async function headerScenario(t, config) {
     // Instantiated in step 2: the header's own result stays.
     if (line === L.square || line === L.twice) { assert.match(lens, COUNT, `line ${line}`); assert.ok(!lens.includes('via'), lens); continue; }
     // Inlined into the .cpp's functions (GCC, Clang), or kept as functions of their own too (MSVC: "2 instantiations").
-    assert.match(lens, mapped ? /^\$\(symbol-numeric\) (?:\d+ instantiations · [\d /]+ |\d+ (?:inlined )?)instructions.* · via user\.cpp$/ : /No code emitted.* · via user\.cpp$/, `line ${line}\n${x.describe('mathx.hxx')}`);
+    assert.match(lens, mapped ? /^\$\(symbol-numeric\) (?:\d+ instantiations · [\d /]+ |\d+ (?:inlined )?)instructions.* · via user\.cpp$/ : /No separate code in user\.cpp \(inlined or not used\)/, `line ${line}\n${x.describe('mathx.hxx')}`);
   }
   assert.ok(withCode >= 2, `inlined template code should show in the header\n${x.describe('mathx.hxx')}`);
   // Functions user.cpp does not use keep what step 1 found.
@@ -94,7 +95,7 @@ async function headerScenario(t, config) {
 // functions whose demangled names start with the return type.
 async function unoptimizedScenario(t, config) {
   const dir = makeProject({ 'mathx.hxx': fixture('headers', 'mathx.hxx'), 'user.cpp': fixture('headers', 'user.cpp') }, config);
-  const x = start(dir);
+  const x = start(dir, { settings: { 'asmLens.reanalyzeOn': 'never' } });
   assert.deepEqual((await x.analyze('user.cpp')).error, []);
   assert.match(await x.lensAt('mathx.hxx', L.square), /^\$\(symbol-numeric\) 2 instantiations · \d+ \/ \d+ instructions · .* via user\.cpp$/, x.describe('mathx.hxx'));
   for (const line of [L.clamp, L.cube, L.twice]) assert.match(await x.lensAt('mathx.hxx', line), /^\$\(symbol-numeric\) \d+ instructions · .* via user\.cpp$/, `line ${line}`);

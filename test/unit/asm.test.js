@@ -465,3 +465,71 @@ test('findAllFunctionResults: copies with the same name and code are shown once;
   const differs = [f('P::P()', 1, ['mov eax, 1', 'ret']), f('P::P()', 1, ['jmp P::P()'])];
   assert.equal(asm.findAllFunctionResults(sym('P', 1, 1), differs, 'R', 'R').length, 2, 'different code: both shown');
 });
+
+test('partOf: cold and split pieces in every demangler form; other clones are functions of their own', () => {
+  for (const [piece, parent] of [['run(int) (.cold)', 'run(int)'], ['run(int) [clone .cold]', 'run(int)'], ['run(int) [clone .cold.12]', 'run(int)'], ['run(int) (.cold.3)', 'run(int)'], ['run(int) (.part.0)', 'run(int)'], ['run(int) [clone .part.1]', 'run(int)'], ['main.cold', 'main'], ['foo.part.2', 'foo']]) {
+    assert.equal(asm.partOf(piece), parent, piece);
+  }
+  for (const other of ['run(int) (.isra.0)', 'run(int) [clone .constprop.0]', 'run(int)', 'participant.part', 'cold']) assert.equal(asm.partOf(other), undefined, other);
+  const rows = ['run(int):', '        mov eax, 1', '        ret', 'run(int) (.cold):', '        ud2'].map(text => ({ text }));
+  assert.deepEqual(asm.mergeFunctionParts(asm.parseFunctions(rows, () => undefined)).map(f => [f.name, f.count]), [['run(int)', 3]]);
+});
+
+test('isLibrarySymbol: looks at the function\'s own name, not its return type or parameters', () => {
+  for (const n of ['bool std::vector<int,std::allocator<int> >::empty(void)const', 'std::vector<int, std::allocator<int>>::size() const', 'unsigned __int64 std::vector<int,std::allocator<int> >::size(void)const', '__gnu_cxx::__normal_iterator<int*>::base() const', 'std::__1::vector<int>::empty() const']) assert.equal(asm.isLibrarySymbol(n), true, n);
+  for (const n of ['int size(std::vector<int> const &)', 'std::string greet(std::string const&)', 'std::vector<int> make_vec(int)', 'Stack<int>::size() const', 'unsigned __int64 Stack<int>::size(void)const', 'main']) assert.equal(asm.isLibrarySymbol(n), false, n);
+});
+
+test('library code with no lines in this file is not this file\'s function of the same name', () => {
+  const sym = { name: 'empty', range: range(9, 9) };
+  const lib = { name: 'bool std::vector<int,std::allocator<int> >::empty(void)const', fileKeys: new Set(), instructionRows: [{ text: 'ret' }], count: 1 };
+  const mine = { name: 'bool Stack<int>::empty(void)const', fileKeys: new Set(), instructionRows: [{ text: 'ret' }], count: 1 };
+  assert.equal(asm.matchSourceSymbol(lib.name, [sym], lib, 'R'), undefined);
+  assert.equal(asm.matchSourceSymbol(mine.name, [sym], mine, 'R'), sym, 'without line info the name still decides');
+  assert.equal(asm.findFunctionResult({ name: 'empty' }, [lib]), undefined);
+  assert.equal(asm.findFunctionResult({ name: 'empty' }, [lib, mine]), mine);
+});
+
+test('instantiationOf: what a function was instantiated for', () => {
+  const { instantiationOf } = require('../../src/asm');
+  assert.equal(instantiationOf('Box<int>::get() const'), 'Box<int>');
+  assert.equal(instantiationOf('Box<int>::conv<float>() const'), 'Box<int>::conv<float>');
+  assert.equal(instantiationOf('int tfree<int>(int)'), 'tfree<int>');
+  assert.equal(instantiationOf('std::vector<int> f<int>(int)'), 'f<int>');
+  assert.equal(instantiationOf('Box<int>::operator+(Box<int> const&) const'), 'Box<int>');
+  assert.equal(instantiationOf('Box<int>::Box<int>(void)'), 'Box<int>');
+  assert.equal(instantiationOf('ns::Pair<int, char>::key() const'), 'ns::Pair<int, char>');
+  assert.equal(instantiationOf('operator-(Box<int> const&, Box<int> const&)'), '');
+  assert.equal(instantiationOf('plain(int)'), '');
+  assert.equal(instantiationOf('bool operator< <int>(Box<int> const&)'), '');
+});
+
+test('errorLinesIn: where an error is, and the lines that led to it', () => {
+  const { errorLinesIn } = require('../../src/asm');
+  const isMain = f => f === '<source>';
+  const gcc = errorLinesIn([
+    "/x/avx2intrin.h:119:1: error: inlining failed in call to 'always_inline' '_mm256_add_epi32': target specific option mismatch",
+    '  119 | _mm256_add_epi32 (__m256i __A, __m256i __B)',
+    '<source>:3:26: note: called from here',
+    "<source>:9:5: error: 'x' was not declared in this scope",
+    '<source>:12:1: note: declared here'
+  ].join('\n'), isMain);
+  assert.deepEqual([...gcc], [[2, "inlining failed in call to 'always_inline' '_mm256_add_epi32': target specific option mismatch"], [8, "'x' was not declared in this scope"]]);
+  const msvc = errorLinesIn("<source>(4): error C2228: left of '.x'\n<source>(20): note: see reference to class template instantiation 'A<int>' being compiled\n", isMain);
+  assert.deepEqual([...msvc], [[3, "left of '.x'"], [19, "left of '.x'"]]);
+  const clang = errorLinesIn("<source>:2:10: error: always_inline function requires target feature\n<source>:7:3: note: in instantiation of function template specialization 'f<int>' requested here\n", isMain);
+  assert.deepEqual([...clang.keys()], [1, 6]);
+  const gccFeature = errorLinesIn("/x/avx2intrin.h:119:1: error: inlining failed in call to 'always_inline' 'a': target specific option mismatch\n<source>:3:26: note: called from here\n", isMain);
+  assert.equal(gccFeature.features.get(2), 'avx2');
+  const clangFeature = errorLinesIn("<source>:3:10: error: always_inline function '_mm256_add_epi32' requires target feature 'avx2', but would be inlined into function 'add8' that is compiled without support for 'avx2'\n", isMain);
+  assert.equal(clangFeature.features.get(2), 'avx2');
+  assert.equal(errorLinesIn("<source>:3:10: error: 'x' was not declared\n", isMain).features.size, 0);
+});
+
+test('findAllFunctionResults: a symbol that starts on another line than the one matched during the analysis', () => {
+  const { findAllFunctionResults } = require('../../src/asm');
+  const range = (a, b) => ({ start: { line: a }, end: { line: b } });
+  const fn = { name: 'f(int)', sourceName: 'f', sourceRange: range(4, 6), instructionRows: [{ text: 'ret', ref: { key: 'k', line: 5 } }], rows: [], count: 1, fileKeys: new Set(['k']) };
+  assert.equal(findAllFunctionResults({ name: 'f', range: range(5, 6) }, [fn], 'k', 'k').length, 1, 'same name, same place');
+  assert.equal(findAllFunctionResults({ name: 'f', range: range(20, 22) }, [fn], 'k', 'k').length, 0, 'an overload elsewhere is not it');
+});

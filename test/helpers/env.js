@@ -45,7 +45,7 @@ function fixture(...parts) { return fs.readFileSync(path.join(FIXTURES, ...parts
 // The extension activated in a mock VS Code whose workspace is `dir`.
 function start(dir, options = {}) {
   // A generous timeout: the first run of a compiler on a fresh CI machine can be slow.
-  const ctx = loadExtension({ workspaceFolders: [dir], ...options, settings: { 'asmLens.requestTimeoutMs': 120000, ...(options.settings || {}) } });
+  const ctx = loadExtension({ workspaceFolders: [dir], ...options, settings: { 'asmLens.requestTimeoutMs': 120000, 'asmLens.confirmRemoteUpload': false, ...(options.settings || {}) } });
   const at = rel => path.join(dir, rel);
   return {
     ...ctx,
@@ -73,7 +73,23 @@ function start(dir, options = {}) {
     // Title of the main (count) lens on 1-based `line`.
     async lensAt(rel, line) {
       const all = await this.lenses(rel);
-      return all.find(l => l.line === line && l.command !== 'asmLens.instantiateTemplate')?.title;
+      return all.find(l => l.line === line && !l.title.endsWith('Instantiate…'))?.title;
+    },
+    // Looks at the file like the editor does until nothing is compiling any more (a header compiles by itself).
+    async settled(rel) {
+      for (let i = 0; i < 6000; i++) {
+        const all = await this.lenses(rel);
+        if (!all.some(l => /Analyzing|Updating/.test(l.title))) {
+          await new Promise(r => setTimeout(r, 30));
+          const again = await this.lenses(rel);
+          if (!again.some(l => /Analyzing|Updating/.test(l.title))) return again;
+        }
+        await new Promise(r => setTimeout(r, 20));
+      }
+      throw new Error(`${rel} is still being analyzed`);
+    },
+    async settledLens(rel, line) {
+      return (await this.settled(rel)).find(l => l.line === line && !l.title.endsWith('Instantiate…'))?.title;
     },
     analysis(rel) { return ctx.ext._internals.analysisFor(ctx.vscode._openDocument(at(rel))); },
     // Edits like the editor does: replaces text from (line, char) to (endLine, endChar), 0-based, and fires the change event.
@@ -83,6 +99,7 @@ function start(dir, options = {}) {
       const before = lines.slice(0, line).join('\n') + (line ? '\n' : '') + lines[line].slice(0, char);
       const after = lines[endLine].slice(endChar) + (endLine + 1 < lines.length ? '\n' + lines.slice(endLine + 1).join('\n') : '');
       doc.setText(before + text + after);
+      doc.isDirty = true;
       ctx.state.changeListener({ document: doc, contentChanges: [{ range: new ctx.vscode.Range(line, char, endLine, endChar), text }] });
       return doc;
     },

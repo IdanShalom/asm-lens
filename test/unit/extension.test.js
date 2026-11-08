@@ -129,7 +129,7 @@ test('remote: missing headers become empty files and failing functions are skipp
     assert.match(msg.info[0], /found 1 emitted function bodies \(1 quoted include\(s\) not found; 1 header\(s\) replaced by empty files; 1 function\/declaration\(s\) skipped/);
     assert.equal(ce.requests.length, 3);
     assert.match(ce.requests[1].body.options.userArguments, /-I\./);
-    assert.equal(await x.lensAt('a.cpp', 2), '$(symbol-numeric) 2 instructions · g152 · -O2 -I.');
+    assert.equal(await x.lensAt('a.cpp', 2), '$(symbol-numeric) 2 instructions · g152 · -O2');
     assert.match(await x.lensAt('a.cpp', 3), /Not compiled/);
   } finally { ce.restore(); }
 });
@@ -156,13 +156,13 @@ test('remote: local headers are uploaded with their layout; analyzing a .cpp giv
     { text: '        ret', source: { file: null, line: 3 } }
   ] }));
   try {
-    const x = start(dir);
+    const x = start(dir, { settings: { 'asmLens.reanalyzeOn': 'never' } });
     await x.analyze('src/main.cpp');
     const body = ce.requests[0].body;
     assert.deepEqual(body.files.map(f => f.filename).sort(), ['asm_lens/include/util.hpp', 'asm_lens/src/.asm_lens_keep']);
     assert.match(body.options.userArguments, /-Iasm_lens\/src/);
     assert.equal(await x.lensAt('include/util.hpp', 2), '$(symbol-numeric) 1 inlined instructions · used in 1 function(s) · via main.cpp');
-    assert.equal(await x.lensAt('include/util.hpp', 3), '$(play) Not used by main.cpp · click to analyze this file');
+    assert.equal(await x.lensAt('include/util.hpp', 3), '$(play) No separate code in main.cpp (inlined or not used) · click to analyze this file');
     const hover = x.state.hoverProviders[0].provider.provideHover(x.open('include/util.hpp'), new x.vscode.Position(1, 30));
     assert.match(hover.contents.value, /Line 2.*1 instruction/s);
   } finally { ce.restore(); }
@@ -193,9 +193,9 @@ test('header: rejected __attribute__((used)) lines are reverted one by one; plai
   try {
     const x = start(dir);
     await x.analyze('h.hpp');
-    assert.equal(ce.requests.length, 2);
-    assert.match(ce.requests[1].body.source, /^__attribute__\(\(used\)\) inline int a\(\)/);
-    assert.match(ce.requests[1].body.source, /\ninline int b\(\)/);
+    assert.equal(ce.requests.length, 3, 'marked; as written (compiles); marked without the line in error');
+    assert.match(ce.requests[2].body.source, /^__attribute__\(\(used\)\) inline int a\(\)/);
+    assert.match(ce.requests[2].body.source, /\ninline int b\(\)/);
   } finally { ce.restore(); }
 });
 
@@ -205,9 +205,9 @@ test('header without code: a message that points at Instantiate…', async () =>
   try {
     const x = start(dir);
     const msg = await x.analyze('t.hpp');
-    assert.match(msg.info[0], /emitted no code: its functions are templates\. Click "Instantiate…"/);
+    assert.match(msg.info[0], /emitted no code: none of its templates compiled with the types tried\. Click "Instantiate…"/);
     const lenses = await x.lenses('t.hpp');
-    assert.deepEqual(lenses.map(l => l.title), ['$(info) No code emitted: template not instantiated · g152', '$(symbol-type-parameter) Instantiate…']);
+    assert.deepEqual(lenses.map(l => l.title), ['$(info) Template: click to choose its types', '$(symbol-type-parameter) Instantiate…']);
   } finally { ce.restore(); }
 });
 
@@ -223,20 +223,21 @@ test('instantiate: requests are appended, remembered per file, deduplicated, fai
     return { code: 0, asm: out };
   });
   try {
-    const x = start(dir);
+    const x = start(dir, { settings: { 'asmLens.autoInstantiateTemplates': false } });
     await x.instantiate('m.hxx', 5, 'int');
     await x.instantiate('m.hxx', 5, 'int');
     await x.instantiate('m.hxx', 32, 'long');
     const failed = await x.instantiate('m.hxx', 21, 'Nope');
     assert.match(failed.warning[0], /could not instantiate mx::cube<Nope>: 'Nope' was not declared in this scope/);
     const doc = x.open('m.hxx');
-    assert.deepEqual(x.ext._internals.instantiationsFor(doc), [{ kind: 'address', expr: 'square<int>' }, { kind: 'class', expr: 'mx::Box<long>', keyword: 'struct' }]);
-    const src = ce.requests.at(-1).body.source.split('\n');
+    assert.deepEqual(x.ext._internals.instantiationsFor(doc), [{ kind: 'address', expr: 'square<int>' }, { kind: 'class', expr: 'mx::Box<long>', keyword: 'struct', member: 'mx::Box<long>::twice' }]);
+    // Not the last compile: functions this fake compiler gives no code for are called from added lines then.
+    const src = ce.requests.filter(r => !r.body.source.includes('__asm_lens_call_')).at(-1).body.source.split('\n');
     assert.equal(src[34], 'auto __asm_lens_inst_0 = &square<int>;');
     assert.equal(src[35], 'template struct mx::Box<long>;');
     assert.equal(src.length, fixture('headers', 'mathx.hxx').split('\n').length + 3);
-    assert.equal(await x.lensAt('m.hxx', 4), '$(symbol-numeric) 2 instructions · g152 · -O2');
-    assert.equal(await x.lensAt('m.hxx', 32), '$(symbol-numeric) 2 instructions · g152 · -O2');
+    assert.equal(await x.lensAt('m.hxx', 4), '$(symbol-numeric) 2 instructions · square<int> · g152 · -O2');
+    assert.equal(await x.lensAt('m.hxx', 32), '$(symbol-numeric) 2 instructions · mx::Box<long> · g152 · -O2');
     const top = (await x.lenses('m.hxx')).find(l => l.command === 'asmLens.manageInstantiations');
     assert.equal(top.title, '$(symbol-type-parameter) Instantiated: square<int>, template struct mx::Box<long> · edit');
     // The input box suggests the arguments used last time.
@@ -331,11 +332,14 @@ test('editing while a compile runs cancels it; the next one starts after the pau
     const x = start(dir, { settings: { 'asmLens.reanalyzeDelayMs': 200 } });
     await x.analyze('a.cpp');
     x.edit('a.cpp', 0, 17, 0, 18, '2');
-    await new Promise(r => setTimeout(r, 250));      // the background compile has started
+    // Waits by what happened, not for a fixed time: a busy machine can run timers late.
+    const until = async n => { for (let i = 0; i < 1000 && calls.length < n; i++) await new Promise(r => setTimeout(r, 10)); };
+    await until(2);                                   // the background compile has started
     assert.equal(calls.length, 2);
     x.edit('a.cpp', 0, 17, 0, 18, '3');               // ... and is now outdated
     assert.equal(calls[1].aborted, true);
-    await new Promise(r => setTimeout(r, 700));
+    assert.equal(calls.length, 2, 'not before the pause');
+    await until(3);
     assert.equal(calls.length, 3);
     assert.match(calls[2].body.source, /return 3;/);
     assert.equal(x.state.messages.error.length, 0);
@@ -437,7 +441,7 @@ test('collectLocalIncludes: search order, recursion, system headers, excludes, l
 
 test('header with an MSVC compiler on Compiler Explorer: no __attribute__((used)) (MSVC does not know it)', async () => {
   const dir = makeProject({ 'h.hpp': 'inline int a() { return 1; }\n' }, { compilers: [{ id: 'vcpp_v19_latest_x64', name: 'x64 msvc v19.latest' }] });
-  const ce = fakeCompilerExplorer(() => ({ code: 0, asm: [] }));
+  const ce = fakeCompilerExplorer(() => ({ code: 0, asm: asmFor(['int a(void)', 1]) }));
   try {
     const x = start(dir);
     await x.analyze('h.hpp');
@@ -739,14 +743,14 @@ test('header with MSVC: functions are kept by taking their address; lines that d
   const dir = makeProject({ 'h.hpp': 'inline int a() { return 1; }\ninline int b(int) { return 2; }\ninline int b(double) { return 3; }\n' }, { compilers: [{ id: 'vcpp_v19_latest_x64', name: 'x64 msvc' }] });
   const ce = fakeCompilerExplorer(body => {
     const lines = body.source.split('\n');
-    const bad = lines.findIndex(l => /= &b;/.test(l));
-    if (bad >= 0) return { code: 2, stderr: err(`<source>(${bad + 1}): error C3535: cannot deduce type for 'auto' from 'overloaded-function'`) };
+    const bad = lines.findIndex(l => /static_cast<int \(\*\)\(double\)>/.test(l));
+    if (bad >= 0) return { code: 2, stderr: err(`<source>(${bad + 1}): error C2440: 'static_cast': cannot convert`) };
     return { code: 0, asm: [{ text: 'int a(void) PROC' }, { text: '        mov eax, 1', source: { file: null, line: 1 } }, { text: '        ret 0', source: { file: null, line: 1 } }, { text: 'int a(void) ENDP' }] };
   });
   try {
     const x = start(dir);
     const msg = await x.analyze('h.hpp');
-    assert.equal(ce.requests[0].body.source.split('\n').slice(3).join('|'), 'auto __asm_lens_keep_0 = &a;|auto __asm_lens_keep_1 = &b;|auto __asm_lens_keep_2 = &b;|');
+    assert.equal(ce.requests[0].body.source.split('\n').slice(3).join('|'), 'auto __asm_lens_keep_0 = &a;|auto __asm_lens_keep_1 = static_cast<int (*)(int)>(&b);|auto __asm_lens_keep_2 = static_cast<int (*)(double)>(&b);|');
     assert.ok(!/__attribute__/.test(ce.requests[0].body.source));
     assert.deepEqual(msg.warning, [], 'no "could not instantiate" for our own lines');
     assert.equal(await x.lensAt('h.hpp', 1), '$(symbol-numeric) 2 instructions · x64 msvc · /O2 /EHsc');
@@ -1061,7 +1065,7 @@ test('header: a .cpp analyzed later does not hide what the header\'s own analysi
     assert.equal(x.analysis('m.hxx').rootPath, x.at('u.cpp'), 'the newest analysis still decides');
     assert.equal(await x.lensAt('m.hxx', 2), '$(symbol-numeric) 1 inlined instructions · used in 1 function(s) · via u.cpp', 'what the .cpp used');
     assert.equal(await x.lensAt('m.hxx', 3), '$(symbol-numeric) 2 instructions · g152 · -O2', 'not used by the .cpp: the header\'s own result');
-    assert.equal(await x.lensAt('m.hxx', 4), '$(symbol-numeric) 2 instructions · g152 · -O2', 'a requested instantiation stays');
+    assert.equal(await x.lensAt('m.hxx', 4), '$(symbol-numeric) 2 instructions · t<int> · g152 · -O2', 'a requested instantiation stays');
     // The assembly view, the hover and the cursor use the same result.
     const lens = (await x.lenses('m.hxx')).find(l => l.line === 3 && l.command === 'asmLens.showAssembly');
     await x.state.commands.get('asmLens.showAssembly')(...lens.args);
@@ -1084,8 +1088,10 @@ test('header seen only through a .cpp: lenses offer to analyze it, and saved ins
   try {
     const x = start(dir, noWatch);
     await x.analyze('u.cpp');
-    assert.equal(await x.lensAt('m.hxx', 3), '$(play) Not used by u.cpp · click to analyze this file');
-    assert.equal(await x.lensAt('m.hxx', 4), '$(info) No code emitted: template not instantiated · g152 · via u.cpp', 'nothing requested: this is true');
+    assert.equal(await x.lensAt('m.hxx', 3), '$(play) No separate code in u.cpp (inlined or not used) · click to analyze this file');
+    assert.equal(await x.lensAt('m.hxx', 4), '$(info) No separate code in u.cpp (inlined or not used) · click to choose types', 'it may be inlined there, so not "not instantiated"');
+    const choose = (await x.lenses('m.hxx')).find(l => l.line === 4 && l.command === 'asmLens.instantiateTemplate' && /choose types/.test(l.title));
+    assert.equal(choose.args[1], 3, 'clicking it asks for the types of this template');
     // Instantiations saved in an earlier session: nothing has compiled them yet.
     x.state.workspaceState.set('asmLens.instantiations', { [require('../../src/asm').normPath(x.at('m.hxx'))]: [{ kind: 'address', expr: 't<int>' }] });
     assert.equal(await x.lensAt('m.hxx', 4), '$(play) Instantiations not compiled yet · click to analyze this file');
@@ -1093,7 +1099,7 @@ test('header seen only through a .cpp: lenses offer to analyze it, and saved ins
     assert.equal(click.args[0].fsPath, x.at('m.hxx'));
     await x.state.commands.get('asmLens.analyzeFile')(...click.args);
     assert.equal(await x.lensAt('m.hxx', 3), '$(symbol-numeric) 2 instructions · g152 · -O2');
-    assert.equal(await x.lensAt('m.hxx', 4), '$(symbol-numeric) 2 instructions · g152 · -O2');
+    assert.equal(await x.lensAt('m.hxx', 4), '$(symbol-numeric) 2 instructions · t<int> · g152 · -O2');
   } finally { ce.restore(); }
 });
 
@@ -1111,7 +1117,854 @@ test('header: older results fill gaps only for the same compiler, and never for 
     assert.match(await x.lensAt('m.hxx', 3), /^\$\(warning\) Not compiled/);
     newest.skipped = [];
     own.compilerId = 'another-compiler';
-    assert.equal(await x.lensAt('m.hxx', 3), '$(play) Not used by u.cpp · click to analyze this file');
+    assert.equal(await x.lensAt('m.hxx', 3), '$(play) No separate code in u.cpp (inlined or not used) · click to analyze this file');
     assert.equal(x.ext._internals.analysisAt(x.open('m.hxx'), 2).rootPath, x.at('u.cpp'));
+  } finally { ce.restore(); }
+});
+
+// ---------------------------------------------------------------------------
+// 0.8.3: requests say who is asking
+
+test('every request to Compiler Explorer identifies the extension, as sent on the wire', async () => {
+  const http = require('http');
+  const seen = [];
+  const server = http.createServer((req, res) => {
+    req.resume();
+    req.on('end', () => {
+      seen.push({ path: req.url, agent: req.headers['user-agent'], accept: req.headers.accept, type: req.headers['content-type'] });
+      const json = req.url.startsWith('/api/languages') ? [{ id: 'rust', defaultCompiler: 'r_default' }]
+        : req.url.startsWith('/api/compilers/') ? [{ id: 'r2', name: 'Rust 2' }]
+          : { code: 0, asm: [{ text: 'example::sq:' }, { text: '        ret', source: { file: null, line: 1 } }] };
+      res.setHeader('Content-Type', 'application/json');
+      res.end(JSON.stringify(json));
+    });
+  });
+  await new Promise(r => server.listen(0, '127.0.0.1', r));
+  try {
+    const dir = makeProject({ 'c.rs': 'pub fn sq() {}\n' });
+    const x = start(dir, { settings: { 'asmLens.baseUrl': `http://127.0.0.1:${server.address().port}`, 'asmLens.reanalyzeOn': 'never' } });
+    assert.deepEqual((await x.analyze('c.rs')).error, []);
+    x.state.quickPickAnswers.push(() => undefined);
+    await x.state.commands.get('asmLens.selectCompiler')();
+    const paths = seen.map(s => s.path.split('?')[0]);
+    assert.ok(paths.includes('/api/languages'), paths.join());
+    assert.ok(paths.includes('/api/compiler/r_default/compile'), paths.join());
+    assert.ok(paths.includes('/api/compilers/rust'), paths.join());
+    const expected = `asm-lens/${require('../../package.json').version} (+https://github.com/IdanShalom/asm-lens)`;
+    for (const s of seen) {
+      assert.equal(s.agent, expected, s.path);
+      assert.equal(s.accept, 'application/json', s.path);
+    }
+    assert.equal(seen.find(s => s.path.endsWith('/compile')).type, 'application/json');
+  } finally { server.close(); }
+});
+
+// ---------------------------------------------------------------------------
+// One function that does not compile costs only that function
+
+const BROKEN = '#pragma once\nstatic inline int good(int a) { return a; }\nstatic inline int bad(Missing* m) { return m->v; }\nclass T { public: int member() const { return 1; } };\n';
+const hasBad = source => /Missing\* m/.test(source);
+const goodRows = () => asmFor(['good(int)', 2], ['T::member() const', 4]);
+
+test('header with a function that does not compile: the others keep their code (GCC, Clang)', async () => {
+  const dir = makeProject({ 'b.hxx': BROKEN });
+  const ce = fakeCompilerExplorer(body => hasBad(body.source)
+    ? { code: 1, stderr: err("<source>:3:30: error: 'Missing' has not been declared") }
+    : { code: 0, asm: /__attribute__\(\(used\)\) static inline int good/.test(body.source) ? goodRows() : [] });
+  try {
+    const x = start(dir);
+    const msg = await x.analyze('b.hxx');
+    assert.deepEqual(msg.error, []);
+    assert.match(await x.lensAt('b.hxx', 2), /^\$\(symbol-numeric\) 2 instructions/);
+    assert.match(await x.lensAt('b.hxx', 3), /^\$\(warning\) Not compiled/);
+    assert.match(await x.lensAt('b.hxx', 4), /^\$\(symbol-numeric\) 2 instructions/);
+    const sources = ce.requests.map(r => r.body.source);
+    assert.equal(sources.length, 3, 'marked; as written (fails too); marked without the bad function');
+    assert.ok(!/__attribute__/.test(sources[1]), 'as written');
+    assert.ok(/__attribute__/.test(sources[2]) && !hasBad(sources[2]));
+    assert.equal(x.analysis('b.hxx').skipped[0].name, 'bad');
+  } finally { ce.restore(); }
+});
+
+test('header with a function that does not compile: the others keep their code (MSVC)', async () => {
+  const dir = makeProject({ 'b.hxx': BROKEN }, { compilers: [{ id: 'vcpp_v19_latest_x64', name: 'x64 msvc' }] });
+  const ce = fakeCompilerExplorer(body => hasBad(body.source)
+    ? { code: 2, stdout: err("<source>(3): error C2061: syntax error: identifier 'Missing'") }
+    : { code: 0, asm: /__asm_lens_keep/.test(body.source) ? goodRows() : [] });
+  try {
+    const x = start(dir);
+    await x.analyze('b.hxx');
+    assert.match(await x.lensAt('b.hxx', 2), /^\$\(symbol-numeric\) 2 instructions/);
+    assert.match(await x.lensAt('b.hxx', 3), /^\$\(warning\) Not compiled/);
+    assert.match(ce.requests.at(-1).body.source, /= &good;/);
+    assert.ok(!/= &bad;/.test(ce.requests.at(-1).body.source), 'the bad function was blanked, so nothing refers to it');
+  } finally { ce.restore(); }
+});
+
+test('nothing but failures: the message says why, not that the header has only declarations', async () => {
+  const dir = makeProject({ 'b.hxx': '#pragma once\nstatic inline int bad(Missing* m) { return m->v; }\n' });
+  const ce = fakeCompilerExplorer(body => hasBad(body.source) ? { code: 1, stderr: err("<source>:2:30: error: 'Missing' has not been declared") } : { code: 0, asm: [] });
+  try {
+    const x = start(dir);
+    const msg = await x.analyze('b.hxx');
+    assert.match(msg.info.join(' '), /1 function\(s\) do not compile on their own/);
+    assert.ok(!/only has declarations/.test(msg.info.join(' ')));
+  } finally { ce.restore(); }
+});
+
+test('a class that does not compile as a whole for the types: the others have code, and the member at fault says why', async () => {
+  const dir = makeProject({ 'm.h': 'template <class T> struct M {\n  T v;\n  T get() const { return v; }\n  auto len() const { return v.size(); }\n};\n' });
+  const ce = fakeCompilerExplorer(body => {
+    const lines = body.source.split('\n');
+    const bad = lines.findIndex(l => l === 'template struct M<int>;' || l.includes('&M<int>::len'));
+    if (bad >= 0) return { code: 1, stderr: err(`<source>:4:30: error: request for member 'size' in 'int'`, `<source>:${bad + 1}:17:   required from here`) };
+    return { code: 0, asm: lines.some(l => /= &M<int>::get;/.test(l)) ? asmFor(['M<int>::get() const', 3]) : [] };
+  });
+  try {
+    const x = start(dir, { settings: { 'asmLens.reanalyzeOn': 'never', 'asmLens.autoInstantiateTemplates': false } });
+    const msg = await x.instantiate('m.h', 3, 'int');
+    assert.deepEqual(msg.warning, []);
+    assert.match(await x.lensAt('m.h', 3), /^\$\(symbol-numeric\) 2 instructions/);
+    assert.match(await x.lensAt('m.h', 4), /^\$\(warning\) M<int>::len does not compile: request for member 'size' in 'int' · click to choose types$/);
+    assert.deepEqual(x.ext._internals.instantiationsFor(x.open('m.h')).map(i => i.expr), ['M<int>'], 'the types stay chosen');
+  } finally { ce.restore(); }
+});
+
+test('a class that compiles as a whole costs one compile, with one line for it: nothing added for those that fail', async () => {
+  const dir = makeProject({ 'm.h': 'template <class T> struct M {\n  T get() const { return T{}; }\n  T other() const { return T{}; }\nprivate:\n  T secret() const { return T{}; }\n};\n' });
+  const ce = fakeCompilerExplorer(body => ({ code: 0, asm: body.source.includes('template struct M<int>;') ? asmFor(['M<int>::get() const', 2], ['M<int>::other() const', 3], ['M<int>::secret() const', 5]) : [] }));
+  try {
+    const x = start(dir, { settings: { 'asmLens.reanalyzeOn': 'never', 'asmLens.autoInstantiateTemplates': false } });
+    await x.instantiate('m.h', 2, 'int');
+    assert.equal(ce.requests.length, 1);
+    assert.equal(ce.requests[0].body.source.split('\n').slice(6).join('|'), 'template struct M<int>;|');
+    for (const line of [2, 3, 5]) assert.match(await x.lensAt('m.h', line), /^\$\(symbol-numeric\) 2 instructions · M<int>/, `line ${line}`);
+  } finally { ce.restore(); }
+});
+
+test('a request saved by an older version, only the member: it still compiles and stays', async () => {
+  const dir = makeProject({ 'm.h': 'template <class T> struct M {\n  T get() const { return T{}; }\n};\n' });
+  const ce = fakeCompilerExplorer(body => ({ code: 0, asm: body.source.includes('auto __asm_lens_inst_0 = &M<int>::get;') ? asmFor(['M<int>::get() const', 2]) : [] }));
+  try {
+    const x = start(dir, { settings: { 'asmLens.reanalyzeOn': 'never' } });
+    x.state.workspaceState.set('asmLens.instantiations', { [require('../../src/asm').normPath(x.at('m.h'))]: [{ kind: 'address', expr: 'M<int>::get' }] });
+    await x.analyze('m.h');
+    assert.match(await x.lensAt('m.h', 2), /^\$\(symbol-numeric\) 2 instructions/);
+    assert.deepEqual(x.ext._internals.instantiationsFor(x.open('m.h')), [{ kind: 'address', expr: 'M<int>::get' }]);
+    assert.ok(!ce.requests.some(r => r.body.source.includes('template struct M<int>')), 'its class is known not to compile as a whole');
+  } finally { ce.restore(); }
+});
+
+test('nothing of a request compiles: it is removed, with the reason', async () => {
+  const dir = makeProject({ 'm.h': 'template <class T> struct M {\n  T get() const { return T{}; }\n};\n' });
+  const ce = fakeCompilerExplorer(body => {
+    const lines = body.source.split('\n');
+    const bad = lines.findIndex(l => l.includes('Nope'));
+    return bad >= 0 ? { code: 1, stderr: err(`<source>:${bad + 1}:17: error: 'Nope' was not declared in this scope`) } : { code: 0, asm: [] };
+  });
+  try {
+    const x = start(dir, { settings: { 'asmLens.reanalyzeOn': 'never', 'asmLens.autoInstantiateTemplates': false } });
+    const msg = await x.instantiate('m.h', 2, 'Nope');
+    assert.match(msg.warning[0], /could not instantiate template struct M<Nope>/);
+    assert.deepEqual(x.ext._internals.instantiationsFor(x.open('m.h')), []);
+    assert.match(await x.lensAt('m.h', 2), /does not compile: 'Nope' was not declared in this scope · click to choose types$/);
+  } finally { ce.restore(); }
+});
+
+test('an overloaded template: the plain form first, and the cast only if that does not compile', async () => {
+  const dir = makeProject({ 'p.h': 'template <class T> T pick(T a) { return a; }\ntemplate <class T> T pick(T a, T b) { return b; }\n' });
+  const ce = fakeCompilerExplorer(body => {
+    const lines = body.source.split('\n');
+    const plain = lines.findIndex(l => l === 'auto __asm_lens_inst_0 = &pick<int>;');
+    if (plain >= 0) return { code: 1, stderr: err(`<source>:${plain + 1}:6: error: unable to deduce 'auto' from '& pick<int>'`) };
+    return { code: 0, asm: lines.some(l => l.includes('static_cast<int (*)(int a, int b)>(&pick<int>)')) ? asmFor(['int pick<int>(int, int)', 2]) : [] };
+  });
+  try {
+    const x = start(dir, { settings: { 'asmLens.reanalyzeOn': 'never', 'asmLens.autoInstantiateTemplates': false } });
+    const msg = await x.instantiate('p.h', 2, 'int');
+    assert.deepEqual(msg.warning, []);
+    assert.equal(ce.requests.length, 2);
+    assert.match(await x.lensAt('p.h', 2), /^\$\(symbol-numeric\) 2 instructions · pick<int>/);
+    assert.equal(x.ext._internals.instantiationsFor(x.open('p.h')).length, 1);
+  } finally { ce.restore(); }
+});
+
+// ---------------------------------------------------------------------------
+// Asking before code leaves the machine
+
+const compiles = ce => ce.requests.filter(r => /\/compile$/.test(r.url)).length;
+const ASK = { 'asmLens.confirmRemoteUpload': true, 'asmLens.reanalyzeOn': 'never' };
+const oneFn = () => ({ code: 0, asm: asmFor(['f()', 1]) });
+
+test('remote: nothing is sent until the user agrees; Cancel sends nothing', async () => {
+  const dir = makeProject({ 'a.cpp': 'int f() { return 1; }\n' });
+  const ce = fakeCompilerExplorer(oneFn);
+  try {
+    const x = start(dir, { settings: ASK });
+    await x.analyze('a.cpp');
+    assert.equal(compiles(ce), 0);
+    assert.equal(x.state.dialogs.length, 1);
+    assert.equal(x.state.dialogs[0].message, 'Send your code to godbolt.org?');
+    assert.match(x.state.dialogs[0].detail, /the file you analyze and the local headers it needs/);
+    assert.deepEqual(x.state.dialogs[0].items, ['Send', "Send, Don't Show Again", 'Use Local Compiler']);
+    assert.equal(await x.lensAt('a.cpp', 1), '$(play) Analyze with Asm Lens');
+  } finally { ce.restore(); }
+});
+
+test('remote: "Send" holds for this session and asks again after a restart', async () => {
+  const dir = makeProject({ 'a.cpp': 'int f() { return 1; }\n', 'b.cpp': 'int f() { return 2; }\n' });
+  const ce = fakeCompilerExplorer(oneFn);
+  try {
+    const x = start(dir, { settings: ASK });
+    x.state.dialogAnswers.push('Send');
+    await x.analyze('a.cpp');
+    await x.analyze('b.cpp');
+    assert.equal(compiles(ce), 2);
+    assert.equal(x.state.dialogs.length, 1, 'asked once');
+    const restarted = start(dir, { settings: ASK });
+    await restarted.analyze('a.cpp');
+    assert.equal(restarted.state.dialogs.length, 1, 'a new session asks again');
+  } finally { ce.restore(); }
+});
+
+test('remote: "Don\'t Show Again" is remembered per server, so a project pointing elsewhere asks again', async () => {
+  const dir = makeProject({ 'a.cpp': 'int f() { return 1; }\n', 'other/c.cpp': 'int f() { return 3; }\n' });
+  const ce = fakeCompilerExplorer(oneFn);
+  try {
+    const x = start(dir, { settings: ASK });
+    x.state.dialogAnswers.push("Send, Don't Show Again");
+    await x.analyze('a.cpp');
+    assert.deepEqual(x.state.globalState.get('asmLens.trustedUploadHosts'), ['godbolt.org']);
+    x.open('a.cpp').setText('int f() { return 9; }\n');
+    await x.analyze('a.cpp');
+    assert.equal(x.state.dialogs.length, 1, 'not asked again for this server');
+    assert.equal(compiles(ce), 2);
+    require('fs').writeFileSync(x.at('other/.asm-lens.json'), JSON.stringify({ baseUrl: 'https://compile.example.net', compilers: [{ id: 'g1' }] }));
+    await x.analyze('other/c.cpp');
+    assert.equal(x.state.dialogs.length, 2, 'another server asks');
+    assert.equal(x.state.dialogs[1].message, 'Send your code to compile.example.net?');
+    assert.equal(compiles(ce), 2, 'and nothing went there');
+  } finally { ce.restore(); }
+});
+
+test('remote: automatic analyses never ask and never send', async () => {
+  const dir = makeProject({ 'a.cpp': 'int f() { return 1; }\n' });
+  const ce = fakeCompilerExplorer(oneFn);
+  try {
+    const x = start(dir, { settings: ASK });
+    await x.ext._internals.analyzeDocument(x.open('a.cpp'), { auto: true });
+    assert.equal(x.state.dialogs.length, 0);
+    assert.equal(compiles(ce), 0);
+  } finally { ce.restore(); }
+});
+
+test('other languages ask too; local mode and the setting do not', async () => {
+  const dir = makeProject({ 'p.py': 'def f():\n    return 1\n' }, { compilers: [{ id: 'python314', language: 'python' }] });
+  const ce = fakeCompilerExplorer(() => ({ code: 0, asm: [] }));
+  try {
+    const x = start(dir, { settings: ASK });
+    await x.analyze('p.py');
+    assert.equal(x.state.dialogs.length, 1);
+    assert.equal(compiles(ce), 0);
+    const off = start(dir, { settings: { 'asmLens.confirmRemoteUpload': false } });
+    assert.equal(await off.ext._internals.mayUpload(off.open('p.py')), true);
+    const local = start(makeProject({ 'a.cpp': '' }, { mode: 'local' }), { settings: ASK });
+    assert.equal(await local.ext._internals.mayUpload(local.open('a.cpp')), true);
+    assert.equal(local.state.dialogs.length, 0);
+  } finally { ce.restore(); }
+});
+
+test('"Use Local Compiler": sets local mode without a project file, and opens the project file with one', async () => {
+  const ce = fakeCompilerExplorer(oneFn);
+  try {
+    const x = start(makeProject({ 'a.cpp': 'int f() { return 1; }\n' }), { settings: ASK });
+    x.state.dialogAnswers.push('Use Local Compiler');
+    assert.equal(await x.ext._internals.mayUpload(x.open('a.cpp')), true);
+    assert.equal(x.vscode.workspace.getConfiguration('asmLens').get('mode'), 'local');
+    assert.equal((await x.ext._internals.resolveSettings(x.open('a.cpp'))).mode, 'local');
+    const y = start(makeProject({ 'a.cpp': 'int f() { return 1; }\n' }, { compilers: ['g152'] }), { settings: ASK });
+    y.state.dialogAnswers.push('Use Local Compiler');
+    assert.equal(await y.ext._internals.mayUpload(y.open('a.cpp')), false, 'the project file decides, so nothing is sent');
+    assert.match(y.state.messages.info.join(' '), /set "mode": "local" in \.asm-lens\.json/);
+    assert.equal(compiles(ce), 0);
+  } finally { ce.restore(); }
+});
+
+// ---------------------------------------------------------------------------
+// 0.8.4: a header compiles by itself; compiling again with what comes before its #include
+
+const AUTO_HEADER = '#pragma once\nstatic inline int spare(int x) { return x + 1; }\nstatic inline int spare2(int x) { return x + 2; }\ntemplate <typename T> struct Box { T get() const { return T{}; } };\n';
+const AUTO_USER = '#include "m.hxx"\nint u() { Box<long> b; return (int)b.get(); }\n';
+function autoReply(body) {
+  if (body.source.includes('int u()')) return { code: 0, asm: asmFor(['u()', 2]) };
+  const out = [...asmFor(['spare(int)', 2]), ...asmFor(['spare2(int)', 3])];
+  if (body.source.includes('template struct Box<long>;')) out.push(...asmFor(['Box<long>::get() const', 4]));
+  return { code: 0, asm: out };
+}
+
+test('a header known through a .cpp compiles by itself when it is looked at, once, with the types the .cpp uses', async () => {
+  const dir = makeProject({ 'm.hxx': AUTO_HEADER, 'u.cpp': AUTO_USER });
+  const ce = fakeCompilerExplorer(autoReply);
+  try {
+    const x = start(dir);
+    await x.analyze('u.cpp');
+    assert.equal(ce.requests.length, 1, 'opening nothing compiles nothing');
+    const lenses = await x.settled('m.hxx');
+    assert.equal(ce.requests.length, 2);
+    assert.match(ce.requests[1].body.source, /^template struct Box<long>;$/m);
+    assert.equal(lenses.find(l => l.line === 2).title, '$(symbol-numeric) 2 instructions · g152 · -O2');
+    assert.equal(lenses.find(l => l.line === 3).title, '$(symbol-numeric) 2 instructions · g152 · -O2');
+    assert.equal(lenses.find(l => l.line === 4 && !l.title.endsWith('Instantiate…')).title, '$(symbol-numeric) 2 instructions · Box<long> · g152 · -O2');
+    await x.settled('m.hxx');
+    assert.equal(ce.requests.length, 2, 'not again for the same text');
+    assert.deepEqual(x.state.messages.error, []);
+    assert.equal(x.state.messages.info.length, 1, 'only the analysis that was asked for reports');
+  } finally { ce.restore(); }
+});
+
+test('a header does not compile by itself: reanalyzeOn never; nothing known; unsaved; and it asks nobody', async () => {
+  const dir = makeProject({ 'm.hxx': AUTO_HEADER, 'u.cpp': AUTO_USER, 'alone.hxx': 'inline int a() { return 1; }\n' });
+  let ce = fakeCompilerExplorer(autoReply);
+  try {
+    const never = start(dir, { settings: { 'asmLens.reanalyzeOn': 'never' } });
+    await never.analyze('u.cpp');
+    await never.lenses('m.hxx');
+    await new Promise(r => setTimeout(r, 30));
+    assert.equal(ce.requests.length, 1, 'reanalyzeOn: never compiles only when asked');
+  } finally { ce.restore(); }
+  ce = fakeCompilerExplorer(autoReply);
+  try {
+    const x = start(dir);
+    await x.lenses('alone.hxx');
+    await new Promise(r => setTimeout(r, 30));
+    assert.equal(ce.requests.length, 0, 'no file that includes it was analyzed');
+    await x.analyze('u.cpp');
+    x.state.settings['asmLens.reanalyzeOn'] = 'save';
+    x.edit('m.hxx', 1, 0, 1, 0, ' ');
+    await x.lenses('m.hxx');
+    await new Promise(r => setTimeout(r, 30));
+    assert.equal(ce.requests.length, 1, 'being edited: on save, as asked');
+  } finally { ce.restore(); }
+  ce = fakeCompilerExplorer(autoReply);
+  try {
+    const x = start(dir, { settings: { 'asmLens.confirmRemoteUpload': true } });
+    x.state.dialogAnswers.push('Send');
+    await x.analyze('u.cpp');
+    assert.equal(x.state.dialogs.length, 1);
+    await x.settled('m.hxx');
+    assert.equal(x.state.dialogs.length, 1, 'the answer given for the .cpp holds');
+    assert.equal(ce.requests.length, 2);
+  } finally { ce.restore(); }
+});
+
+test('a header that fails when compiled alone is compiled with what comes before its #include; a message only if that fails too', async () => {
+  const header = '#pragma once\nstatic inline int px(Point p) { return p.x; }\nstatic inline int ok(int x) { return x; }\n';
+  const reply = body => (/#define HAS_POINT/.test(body.source)
+    ? { code: 0, asm: [...asmFor(['px(Point)', 2]), ...asmFor(['ok(int)', 3])] }
+    : { code: 1, stderr: err("<source>:2:24: error: unknown type name 'Point'") });
+  const dir = makeProject({ 'n.hxx': header, 'c.cpp': '#define HAS_POINT\n#include "n.hxx"\nint c() { return 1; }\n' });
+  const ce = fakeCompilerExplorer(body => (body.source.includes('int c()') ? { code: 0, asm: asmFor(['c()', 3]) } : reply(body)));
+  try {
+    const x = start(dir);
+    const msg = await x.analyze('n.hxx');
+    assert.deepEqual(msg.error, []);
+    const sent = ce.requests.at(-1).body.source;
+    assert.ok(sent.startsWith('#define HAS_POINT\n#line 1\n#pragma once\n'), sent);
+    assert.equal(await x.lensAt('n.hxx', 2), '$(symbol-numeric) 2 instructions · g152 · -O2');
+    assert.equal(await x.lensAt('n.hxx', 3), '$(symbol-numeric) 2 instructions · g152 · -O2');
+  } finally { ce.restore(); }
+
+  const noIncluder = makeProject({ 'n.hxx': header });
+  const failing = fakeCompilerExplorer(() => ({ code: 1, stderr: err('<source>:1:1: error: expected unqualified-id') }));
+  try {
+    const x = start(noIncluder);
+    const msg = await x.analyze('n.hxx');
+    assert.equal(msg.error.length, 1, 'nothing else to try');
+  } finally { failing.restore(); }
+});
+
+test('the compile with an includer\'s lines is kept only when it finds more', async () => {
+  const header = '#pragma once\nstatic inline int ok(int x) { return x; }\nstatic inline int bad(int x) { return nope(x); }\n';
+  const dir = makeProject({ 'n.hxx': header, 'c.cpp': '#include <vector>\n#include "n.hxx"\n' });
+  const ce = fakeCompilerExplorer(body => {
+    const lines = body.source.split('\n');
+    const at = lines.findIndex(l => l.includes('nope(x)'));
+    if (at >= 0) return { code: 1, stderr: err(`<source>:3:40: error: 'nope' was not declared in this scope`) };
+    return { code: 0, asm: body.source.includes('#line 1') ? [] : asmFor(['ok(int)', 2]) };
+  });
+  try {
+    const x = start(dir);
+    await x.analyze('n.hxx');
+    assert.ok(ce.requests.some(r => r.body.source.startsWith('#include <vector>\n#line 1\n')), 'it was tried');
+    assert.equal(await x.lensAt('n.hxx', 2), '$(symbol-numeric) 2 instructions · g152 · -O2', 'the first compile found more');
+    assert.match(await x.lensAt('n.hxx', 3), /Not compiled/);
+  } finally { ce.restore(); }
+});
+
+test('a server failure while compiling with marks does not turn the marks off', async () => {
+  const dir = makeProject({ 'h.hxx': 'static inline int a() { return 1; }\n' });
+  let calls = 0;
+  const ce = fakeCompilerExplorer(body => {
+    calls++;
+    if (calls === 1) { const e = new Error('Bad Gateway'); e.status = 502; throw e; }
+    return { code: 0, asm: body.source.includes('__attribute__((used))') ? asmFor(['a()', 1]) : [] };
+  });
+  try {
+    const x = start(dir);
+    await x.analyze('h.hxx').catch(() => {});
+    await x.analyze('h.hxx');
+    assert.ok(/__attribute__\(\(used\)\)/.test(ce.requests.at(-1).body.source), 'marks are still used');
+    assert.equal(await x.lensAt('h.hxx', 1), '$(symbol-numeric) 2 instructions · g152 · -O2');
+  } finally { ce.restore(); }
+});
+
+test('no code: the lens says why', async () => {
+  const dir = makeProject({ 'h.hxx': '#ifdef OFF\nstatic inline int gated(int x) { return x; }\n#endif\nconsteval int ce(int x) { return x; }\nstatic inline int dropped(int x) { return x; }\ntemplate <class T> T t(T x) { return x; }\n' });
+  const ce = fakeCompilerExplorer(() => ({ code: 0, asm: asmFor(['other()', 99]) }));
+  try {
+    const x = start(dir);
+    await x.analyze('h.hxx');
+    assert.equal(await x.lensAt('h.hxx', 2), '$(info) Not compiled · inside #ifdef OFF, which is off · g152');
+    assert.equal(await x.lensAt('h.hxx', 4), '$(info) consteval: it runs only while compiling, so it has no code');
+    assert.equal(await x.lensAt('h.hxx', 5), '$(warning) No code found · click for details');
+    assert.ok(x.state.outputLines.some(l => /no code for dropped at line 5: it was kept and called/.test(l)), x.state.outputLines.join('\n'));
+    assert.equal(await x.lensAt('h.hxx', 6), '$(info) Template: click to choose its types');
+  } finally { ce.restore(); }
+});
+
+test('a declaration from a language server whose range stops before the `;` gets no lens (clangd)', async () => {
+  const dir = makeProject({ 'h.hxx': 'struct S {\n  int decl(int a) const;\n  int body() const { return 1; }\n  virtual int pure() = 0;\n};\n' });
+  const ce = fakeCompilerExplorer(() => ({ code: 0, asm: asmFor(['S::body() const', 3]) }));
+  try {
+    const x = start(dir);
+    const vs = x.vscode;
+    x.state.symbols.set(x.at('h.hxx'), [
+      { name: 'decl', kind: vs.SymbolKind.Method, range: new vs.Range(1, 2, 1, 23), selectionRange: new vs.Range(1, 6, 1, 10), children: [] },
+      { name: 'body', kind: vs.SymbolKind.Method, range: new vs.Range(2, 2, 2, 32), selectionRange: new vs.Range(2, 6, 2, 10), children: [] },
+      { name: 'pure', kind: vs.SymbolKind.Method, range: new vs.Range(3, 2, 3, 24), selectionRange: new vs.Range(3, 14, 3, 18), children: [] }
+    ]);
+    await x.analyze('h.hxx');
+    assert.deepEqual((await x.lenses('h.hxx')).map(l => l.line), [3]);
+  } finally { ce.restore(); }
+});
+
+test('instantiating a class also covers the classes nested in it', async () => {
+  const dir = makeProject({ 'h.hxx': 'template <class T> struct A {\n  T a() const { return T{}; }\n  struct In { T i() const { return T{}; } };\n};\n' });
+  const ce = fakeCompilerExplorer(() => ({ code: 0, asm: [] }));
+  try {
+    const x = start(dir, { settings: { 'asmLens.autoInstantiateTemplates': false } });
+    await x.instantiate('h.hxx', 2, 'int');
+    await x.instantiate('h.hxx', 3, 'int');
+    assert.deepEqual(x.ext._internals.instantiationsFor(x.open('h.hxx')).map(i => i.expr), ['A<int>']);
+    x.state.workspaceState.set('asmLens.instantiations', { [require('../../src/asm').normPath(x.at('h.hxx'))]: [{ kind: 'class', expr: 'A<long>::In', keyword: 'struct' }] });
+    await x.instantiate('h.hxx', 2, 'long');
+    assert.deepEqual(x.ext._internals.instantiationsFor(x.open('h.hxx')).map(i => i.expr), ['A<long>']);
+  } finally { ce.restore(); }
+});
+
+test('an automatic instantiation that does not compile is dropped silently, and not retried by automatic analyses', async () => {
+  const dir = makeProject({ 'h.hxx': 'template <class T> struct A { typename T::x a() const { return {}; } };\ntemplate <class T> struct B { T b() const { return T{}; } };\n' });
+  const ce = fakeCompilerExplorer(body => {
+    const lines = body.source.split('\n');
+    const bad = lines.findIndex(l => l.trim() === 'template struct A<int>;');
+    if (bad >= 0) return { code: 1, stderr: err(`<source>:1:40: error: 'int' is not a class`, `<source>:${bad + 1}:17: required from here`) };
+    return { code: 0, asm: asmFor(['B<int>::b() const', 2]) };
+  });
+  try {
+    const x = start(dir);
+    const msg = await x.analyze('h.hxx');
+    assert.deepEqual([msg.warning, msg.error], [[], []], 'nobody asked for it');
+    assert.equal(ce.requests.length, 2);
+    assert.match(await x.lensAt('h.hxx', 1), /^\$\(warning\) A<int> does not compile: 'int' is not a class · click to choose types$/);
+    assert.equal(await x.lensAt('h.hxx', 2), '$(symbol-numeric) 2 instructions · B<int> · g152 · -O2');
+    x.edit('h.hxx', 1, 0, 1, 0, ' ');
+    for (let i = 0; i < 400 && ce.requests.length < 3; i++) await new Promise(r => setTimeout(r, 10));
+    await x.settled('h.hxx');
+    assert.equal(ce.requests.length, 3, 'one compile for the edit');
+    assert.ok(!ce.requests[2].body.source.includes('template struct A<int>;'));
+    await x.analyze('h.hxx');
+    assert.ok(ce.requests.at(-2).body.source.includes('template struct A<int>;'), 'asked for: tried again');
+  } finally { ce.restore(); }
+});
+
+test('errors on an automatic line and a chosen one: the automatic line goes first, the chosen one stays if it compiles without it', async () => {
+  const dir = makeProject({ 'h.hxx': 'template <class T> struct A { T a() const { return T{}; } T bad() const { return T{}.x; } };\ntemplate <class T> struct B { T b() const { return T{}; } };\n' });
+  const ce = fakeCompilerExplorer(body => {
+    const lines = body.source.split('\n');
+    const manual = lines.findIndex(l => l.includes('&A<long>::a'));
+    const auto = lines.findIndex(l => l.trim() === 'template struct B<int>;');
+    // MSVC names the line that first used a class, whichever line is at fault.
+    if (auto >= 0) return { code: 2, stdout: err(`<source>(1): error C2228: left of '.x' must have class/struct/union`, `<source>(${manual + 1}): note: see reference to class template instantiation 'A<long>' being compiled`, `<source>(${auto + 1}): note: see reference to class template instantiation 'B<int>' being compiled`) };
+    return { code: 0, asm: asmFor(['A<long>::a() const', 1]) };
+  });
+  try {
+    const x = start(dir);
+    x.state.workspaceState.set('asmLens.instantiations', { [require('../../src/asm').normPath(x.at('h.hxx'))]: [{ kind: 'address', expr: 'A<long>::a' }] });
+    const msg = await x.analyze('h.hxx');
+    assert.deepEqual(msg.warning, []);
+    assert.deepEqual(x.ext._internals.instantiationsFor(x.open('h.hxx')).map(i => i.expr), ['A<long>::a'], 'the chosen one is kept');
+    assert.match(ce.requests.at(-1).body.source, /&A<long>::a;/);
+  } finally { ce.restore(); }
+});
+
+// ---------------------------------------------------------------------------
+// 0.8.5: one function that cannot be emitted costs only that function; compile_commands.json for headers
+
+test('a function that fails only when it is emitted loses its mark alone, and the lens gives the compiler\'s reason', async () => {
+  const src = 'static inline int good(int x) { return x + 1; }\nstatic inline int bad(int x)\n{\n  return forbidden(x);\n}\nstatic inline int also_good(int x) { return x + 2; }\n';
+  const dir = makeProject({ 'h.hxx': src });
+  const ce = fakeCompilerExplorer(body => {
+    const marked = body.source.split('\n')[1].includes('__attribute__((used))');
+    if (marked) return { code: 1, stderr: err("<source>:4:10: error: call to 'forbidden' declared with attribute error: cannot be called") };
+    const out = [];
+    if (body.source.includes('__attribute__((used)) static inline int good')) out.push(...asmFor(['good(int)', 1]), ...asmFor(['also_good(int)', 6]));
+    return { code: 0, asm: out };
+  });
+  try {
+    const x = start(dir);
+    await x.analyze('h.hxx');
+    assert.equal(await x.lensAt('h.hxx', 1), '$(symbol-numeric) 2 instructions · g152 · -O2');
+    assert.equal(await x.lensAt('h.hxx', 6), '$(symbol-numeric) 2 instructions · g152 · -O2');
+    assert.match(await x.lensAt('h.hxx', 2), /^\$\(warning\) Not compiled · call to 'forbidden' declared with attribute error: cannot be called · g152$/);
+  } finally { ce.restore(); }
+});
+
+test('a SIMD helper without the flag for it is compiled for that feature, and the lens says so', async () => {
+  const src = 'static inline int good(int x) { return x + 1; }\nstatic inline __m256i simd(__m256i a)\n{\n  return _mm256_abs_epi32(a);\n}\n';
+  const dir = makeProject({ 'h.hxx': src });
+  const ce = fakeCompilerExplorer(body => {
+    const line = body.source.split('\n')[1];
+    if (/__attribute__\(\(used\)\)/.test(line)) return { code: 1, stderr: err("/x/avx2intrin.h:119:1: error: inlining failed in call to 'always_inline' '_mm256_abs_epi32': target specific option mismatch", '<source>:4:10: note: called from here') };
+    if (/target\("avx2"\)/.test(line)) return { code: 0, asm: [...asmFor(['good(int)', 1]), ...asmFor(['simd(long long __vector(4))', 2])] };
+    return { code: 0, asm: [] };
+  });
+  try {
+    const x = start(dir);
+    await x.analyze('h.hxx');
+    assert.equal(await x.lensAt('h.hxx', 2), '$(symbol-numeric) 2 instructions · for -mavx2 (not in your flags) · g152 · -O2');
+    assert.equal(await x.lensAt('h.hxx', 1), '$(symbol-numeric) 2 instructions · g152 · -O2');
+  } finally { ce.restore(); }
+});
+
+test('-Werror in the flags does not stop an analysis: a warning is only a warning here', async () => {
+  const dir = makeProject({ 'h.hxx': '#pragma once\nstatic inline int a() { return 1; }\n' }, { flags: '-O2 -Wall -Werror=format -Werror', compilers: [{ id: 'g152', name: 'g152' }] });
+  const ce = fakeCompilerExplorer(body => (/-Werror/.test(body.options.userArguments) ? { code: 1, stderr: err("<source>:1:9: error: '#pragma once' in main file [-Werror]") } : { code: 0, asm: asmFor(['a()', 2]) }));
+  try {
+    const x = start(dir);
+    const msg = await x.analyze('h.hxx');
+    assert.deepEqual(msg.error, []);
+    assert.equal(await x.lensAt('h.hxx', 2), '$(symbol-numeric) 2 instructions · g152 · -O2 -Wall');
+    assert.ok(x.state.outputLines.some(l => /left out -Werror=format -Werror/.test(l)));
+  } finally { ce.restore(); }
+});
+
+test('a server failure does not count as a compile error that needs other compilations', async () => {
+  const dir = makeProject({ 'n.hxx': '#ifdef A\nstatic inline int a() { return 1; }\n#endif\n', 'c.cpp': '#define A\n#include "n.hxx"\n' });
+  const real = global.fetch;
+  let calls = 0;
+  global.fetch = async () => { calls++; return { ok: false, status: 502, text: async () => 'Bad Gateway', json: async () => ({}) }; };
+  try {
+    const x = start(dir);
+    const msg = await x.analyze('n.hxx');
+    assert.equal(calls, 1);
+    assert.match(msg.error[0], /HTTP 502/);
+  } finally { global.fetch = real; }
+});
+
+test('functions still without code are called from added lines, and what that inlined counts', async () => {
+  const dir = makeProject({ 'h.hxx': 'extern inline int gnu(int x) { return x + 1; }\nstatic inline int other(int x) { return x + 2; }\n' });
+  const ce = fakeCompilerExplorer(body => {
+    const out = [...asmFor(['other(int)', 2])];
+    if (body.source.includes('__asm_lens_call_0(int x) { return gnu(x); }')) out.push(...asmFor(['__asm_lens_call_0(int)', 1]));
+    return { code: 0, asm: out };
+  });
+  try {
+    const x = start(dir);
+    await x.analyze('h.hxx');
+    assert.equal(await x.lensAt('h.hxx', 1), '$(symbol-numeric) 2 instructions · g152 · -O2');
+    assert.ok(!/used in/.test(await x.lensAt('h.hxx', 1)), 'nobody wrote that call');
+    assert.equal(await x.lensAt('h.hxx', 2), '$(symbol-numeric) 2 instructions · g152 · -O2');
+  } finally { ce.restore(); }
+});
+
+test('remote with compile_commands.json: the entry\'s defines and folders are used; flags in .asm-lens.json win', async () => {
+  const dir = makeProject({
+    'inc/h.hxx': '#ifdef FROM_DB\nstatic inline int on(int x) { return x; }\n#endif\n',
+    'inc/more/m.h': '#pragma once\n',
+    'src/a.cpp': '#include "../inc/h.hxx"\n#include "m.h"\n',
+    'compile_commands.json': '[]'
+  }, { flags: '-O2 -std=c++20', compileCommands: 'compile_commands.json', compilers: [{ id: 'g152', name: 'g152' }] });
+  require('fs').writeFileSync(path.join(dir, 'compile_commands.json'), JSON.stringify([{ directory: dir, file: 'src/a.cpp', command: 'g++ -DFROM_DB "-DNAME=a b" -Iinc/more -std=c++11 -O0 -Wall -mavx2 -c src/a.cpp -o a.o' }]));
+  const ce = fakeCompilerExplorer(body => ({ code: 0, asm: /-DFROM_DB/.test(body.options.userArguments) ? asmFor(['on(int)', 2]) : [] }));
+  try {
+    const x = start(dir);
+    await x.analyze('inc/h.hxx');
+    const args = ce.requests[0].body.options.userArguments;
+    assert.match(args, /-DFROM_DB "-DNAME=a b" -std=c\+\+11 -mavx2 -O2 -std=c\+\+20/);
+    assert.ok(!/-O0|-Wall/.test(args), args);
+    assert.ok(ce.requests[0].body.files === undefined || !ce.requests[0].body.files.some(f => f.filename.endsWith('a.cpp')), 'the .cpp itself is not uploaded');
+    assert.equal(await x.lensAt('inc/h.hxx', 2), '$(symbol-numeric) 2 instructions · g152 · -DFROM_DB "-DNAME=a b" -std=c++11 -mavx2 -O2 -std=c++20');
+  } finally { ce.restore(); }
+});
+
+test('automatic analyses of a header go straight to what worked, and do not search again on every edit', async () => {
+  const dir = makeProject({ 'n.hxx': '#ifdef ON\nstatic inline int a() { return 1; }\n#endif\n#ifdef NEVER\nstatic inline int z() { return 2; }\n#endif\n', 'c.cpp': '#define ON\n#include "n.hxx"\nint c() { return 1; }\n' });
+  const ce = fakeCompilerExplorer(body => (body.source.includes('int c()') ? { code: 0, asm: asmFor(['c()', 3]) } : { code: 0, asm: /^#define ON/.test(body.source) ? asmFor(['a()', 2]) : [] }));
+  try {
+    const x = start(dir);
+    await x.analyze('c.cpp');
+    await x.settled('n.hxx');
+    assert.equal(await x.lensAt('n.hxx', 2), '$(symbol-numeric) 2 instructions · g152 · -O2');
+    assert.match(await x.lensAt('n.hxx', 5), /^\$\(info\) Not compiled · inside #ifdef NEVER, which is off in c\.cpp · g152$/);
+    const before = ce.requests.length;
+    x.edit('n.hxx', 5, 0, 5, 0, ' ');
+    for (let i = 0; i < 400 && ce.requests.length === before; i++) await new Promise(r => setTimeout(r, 10));
+    await x.settled('n.hxx');
+    assert.equal(ce.requests.length, before + 1, 'one compile for the edit');
+    assert.match(ce.requests.at(-1).body.source, /^#define ON\n#line 1\n/);
+  } finally { ce.restore(); }
+});
+
+test('a call added for a function counts as its code wherever the compiler says the instructions are; a real call does not', async () => {
+  const dir = makeProject({ 'h.hxx': 'extern inline int gnu(int x) { return x + 1; }\nextern inline int other(int x) { return x + 2; }\n' });
+  const ce = fakeCompilerExplorer(body => {
+    if (!body.source.includes('__asm_lens_call_')) return { code: 0, asm: [] };
+    assert.match(body.source, /__attribute__\(\(used, always_inline\)\) int gnu|extern __attribute__\(\(used, always_inline\)\) inline int gnu|__attribute__\(\(used, always_inline\)\) extern inline int gnu/);
+    const lines = body.source.split('\n');
+    const line = name => lines.findIndex(l => l.includes(`return ${name}(`)) + 1;
+    return { code: 0, asm: [
+      // Credited to the line of the call, as GCC on macOS does for a short body.
+      { text: '__asm_lens_call_0(int):' }, { text: '        lea eax, [rdi+1]', source: { file: null, line: line('gnu') } }, { text: '        ret', source: { file: null, line: line('gnu') } },
+      // Not inlined.
+      { text: '__asm_lens_call_1(int):' }, { text: '        jmp other(int)', source: { file: null, line: line('other') } }
+    ] };
+  });
+  try {
+    const x = start(dir);
+    await x.analyze('h.hxx');
+    assert.match(await x.lensAt('h.hxx', 1), /^\$\(symbol-numeric\) 2 instructions/);
+    assert.equal(await x.lensAt('h.hxx', 2), '$(warning) No code found · click for details');
+  } finally { ce.restore(); }
+});
+
+// ---------------------------------------------------------------------------
+// 0.8.6: every build of a file; a chosen type is not lost
+
+test('a file listed twice in compile_commands.json: both builds are compiled, and what each has off the other shows', async () => {
+  const header = '#pragma once\n#ifdef B64\nstatic inline long a(long x) { return x; }\n#else\nstatic inline int b(int x) { return x; }\n#endif\n#ifdef NEVER\nstatic inline int c() { return 1; }\n#endif\n';
+  for (const dbs of [1, 2]) {
+    const entry = flag => ({ directory: '.', file: 'u.cpp', command: `g++ ${flag} -O2 -c u.cpp` });
+    const files = { 'h.hxx': header, 'u.cpp': '#include "h.hxx"\nint u() { return 1; }\n' };
+    if (dbs === 1) files['compile_commands.json'] = JSON.stringify([entry('-DB32'), entry('-DB64')]);
+    else { files['a/compile_commands.json'] = JSON.stringify([{ ...entry('-DB32'), directory: '..' }]); files['b/compile_commands.json'] = JSON.stringify([{ ...entry('-DB64'), directory: '..' }]); }
+    const dir = makeProject(files, { compileCommands: dbs === 1 ? 'compile_commands.json' : ['a/compile_commands.json', 'b/compile_commands.json'], compilers: [{ id: 'g152', name: 'g152' }] });
+    const ce = fakeCompilerExplorer(body => ({ code: 0, asm: /-DB64/.test(body.options.userArguments) ? asmFor(['a(long)', 3]) : asmFor(['b(int)', 5]) }));
+    try {
+      const x = start(dir);
+      await x.analyze('h.hxx');
+      assert.match(await x.lensAt('h.hxx', 3), /^\$\(symbol-numeric\) 2 instructions/, `${dbs} database(s): ${await x.lensAt('h.hxx', 3)}`);
+      assert.match(await x.lensAt('h.hxx', 5), /^\$\(symbol-numeric\) 2 instructions/, await x.lensAt('h.hxx', 5));
+      assert.match(await x.lensAt('h.hxx', 8), /^\$\(info\) Not compiled · inside #ifdef NEVER, which is off in all \d+ compile commands tried · g152$/);
+    } finally { ce.restore(); }
+  }
+});
+
+test('a .cpp listed for two builds is compiled with both too', async () => {
+  const src = '#ifdef B64\nstatic inline long a(long x) { return x; }\n#else\nstatic inline int b(int x) { return x; }\n#endif\n';
+  const entry = flag => ({ directory: '.', file: 'u.cpp', command: `g++ ${flag} -O2 -c u.cpp` });
+  const dir = makeProject({ 'u.cpp': src, 'compile_commands.json': JSON.stringify([entry('-DB32'), entry('-DB64')]) }, { compileCommands: 'compile_commands.json', compilers: [{ id: 'g152', name: 'g152' }] });
+  const ce = fakeCompilerExplorer(body => ({ code: 0, asm: /-DB64/.test(body.options.userArguments) ? asmFor(['a(long)', 2]) : asmFor(['b(int)', 4]) }));
+  try {
+    const x = start(dir);
+    await x.analyze('u.cpp');
+    assert.match(await x.lensAt('u.cpp', 2), /^\$\(symbol-numeric\) 2 instructions/);
+    assert.match(await x.lensAt('u.cpp', 4), /^\$\(symbol-numeric\) 2 instructions/);
+  } finally { ce.restore(); }
+});
+
+test('a chosen type that needs what the .cpp includes after the header is compiled with that, not removed', async () => {
+  const dir = makeProject({
+    'h.hxx': '#pragma once\ntemplate <class T> struct Box { T get() const { return T{}; } };\n',
+    'types.h': '#pragma once\nstruct Point { int x; };\n',
+    'u.cpp': '#include "h.hxx"\n#include "types.h"\nusing namespace app;\nint u() { return 1; }\n'
+  });
+  const ce = fakeCompilerExplorer(body => {
+    if (body.source.includes('int u()')) return { code: 0, asm: asmFor(['u()', 4]) };
+    const lines = body.source.split('\n');
+    const request = lines.findIndex(l => l.includes('template struct Box<Point>;'));
+    if (request >= 0 && !body.source.includes('#include "types.h"')) return { code: 1, stderr: err(`<source>:${request + 1}:17: error: 'Point' was not declared in this scope`) };
+    return { code: 0, asm: request >= 0 ? asmFor(['Box<Point>::get() const', 2]) : [] };
+  });
+  try {
+    const x = start(dir, { settings: { 'asmLens.autoInstantiateTemplates': false, 'asmLens.reanalyzeOn': 'never' } });
+    await x.analyze('u.cpp');
+    const msg = await x.instantiate('h.hxx', 2, 'Point');
+    assert.deepEqual(msg.warning, []);
+    assert.deepEqual(x.ext._internals.instantiationsFor(x.open('h.hxx')).map(i => i.expr), ['Box<Point>']);
+    assert.equal(await x.lensAt('h.hxx', 2), '$(symbol-numeric) 2 instructions · Box<Point> · g152 · -O2');
+    assert.match(ce.requests.at(-1).body.source, /#include "types\.h"\nusing namespace app;\ntemplate struct Box<Point>;/);
+  } finally { ce.restore(); }
+});
+
+test('a chosen type from the standard library brings its header along', async () => {
+  const dir = makeProject({ 'h.hxx': 'template <class C> auto count(const C& c) { return c.size(); }\n' });
+  const ce = fakeCompilerExplorer(body => {
+    if (!body.source.includes('count<std::vector<int>>')) return { code: 0, asm: [] };
+    assert.match(body.source, /#include <vector>\nauto __asm_lens_inst_0 = &count<std::vector<int>>;/);
+    return { code: 0, asm: asmFor(['unsigned long count<std::vector<int>>(std::vector<int> const&)', 1]) };
+  });
+  try {
+    const x = start(dir, { settings: { 'asmLens.autoInstantiateTemplates': false } });
+    const msg = await x.instantiate('h.hxx', 1, 'std::vector<int>');
+    assert.deepEqual(msg.warning, []);
+    assert.equal(await x.lensAt('h.hxx', 1), '$(symbol-numeric) 2 instructions · count<std::vector<int>> · g152 · -O2');
+  } finally { ce.restore(); }
+});
+
+test('a chosen type that does not compile: the lens gives the reason', async () => {
+  const dir = makeProject({ 'h.hxx': 'template <class T> struct Box { T get() const { return T{}; } };\n' });
+  const ce = fakeCompilerExplorer(body => {
+    const lines = body.source.split('\n');
+    const bad = lines.findIndex(l => l.includes('Nope'));
+    return bad >= 0 ? { code: 1, stderr: err(`<source>:${bad + 1}:17: error: 'Nope' was not declared in this scope`) } : { code: 0, asm: [] };
+  });
+  try {
+    const x = start(dir, { settings: { 'asmLens.autoInstantiateTemplates': false } });
+    await x.instantiate('h.hxx', 1, 'Nope');
+    assert.deepEqual(x.ext._internals.instantiationsFor(x.open('h.hxx')), []);
+    assert.ok(x.state.messages.warning.some(m => /could not instantiate template struct Box<Nope>/.test(m)), x.state.messages.warning.join('\n'));
+    assert.match(await x.settledLens('h.hxx', 1), /^\$\(warning\) Box<Nope>(?:::get)? does not compile: 'Nope' was not declared in this scope · click to choose types$/);
+  } finally { ce.restore(); }
+});
+
+test('choosing types while a compile runs: that compile stops, and one with the types follows', async () => {
+  const dir = makeProject({ 'h.hxx': 'template <class T> T f(T x) { return x; }\n' });
+  const real = global.fetch;
+  const bodies = [];
+  global.fetch = (url, init) => new Promise((resolve, reject) => {
+    const body = JSON.parse(init.body);
+    bodies.push(body);
+    init.signal.addEventListener('abort', () => { const e = new Error('aborted'); e.name = 'AbortError'; reject(e); });
+    const reply = { code: 0, asm: body.source.includes('f<long>') ? asmFor(['long f<long>(long)', 1]) : [] };
+    setTimeout(() => resolve({ ok: true, status: 200, json: async () => reply, text: async () => JSON.stringify(reply) }), 40);
+  });
+  try {
+    const x = start(dir, { settings: { 'asmLens.autoInstantiateTemplates': false } });
+    const running = x.state.commands.get('asmLens.analyzeFile')(x.vscode.Uri.file(x.at('h.hxx')));
+    await new Promise(r => setTimeout(r, 10));
+    await x.instantiate('h.hxx', 1, 'long');
+    await running;
+    for (let i = 0; i < 300 && !/instructions/.test(await x.lensAt('h.hxx', 1)); i++) await new Promise(r => setTimeout(r, 10));
+    assert.equal(await x.lensAt('h.hxx', 1), '$(symbol-numeric) 2 instructions · f<long> · g152 · -O2');
+  } finally { global.fetch = real; }
+});
+
+test('MSVC names the first line that uses a class for any member\'s error: "see the first reference to" decides who is at fault', async () => {
+  const dir = makeProject({ 'm.h': 'template <class T> struct M {\n  T get() const { return T{}; }\n  T bad() const { return (T)42; }\n};\nstruct S { int a; };\n' }, { compilers: [{ id: 'vcpp_v19_latest_x64', name: 'msvc' }] });
+  const ce = fakeCompilerExplorer(body => {
+    const lines = body.source.split('\n');
+    const whole = lines.indexOf('template struct M<S>;');
+    if (whole >= 0) return { code: 2, stdout: err("<source>(3): error C2440: 'type cast': cannot convert from 'int' to 'T'", `<source>(${whole + 1}): note: see reference to class template instantiation 'M<S>' being compiled`) };
+    const get = lines.findIndex(l => l.includes('&M<S>::get')), bad = lines.findIndex(l => l.includes('&M<S>::bad'));
+    if (bad >= 0) return { code: 2, stdout: err("<source>(3): error C2440: 'type cast': cannot convert from 'int' to 'T'", `<source>(${get + 1}): note: see reference to class template instantiation 'M<S>' being compiled`, "<source>(3): note: while compiling class template member function 'T M<T>::bad(void) const'", `<source>(${bad + 1}): note: see the first reference to 'M<S>::bad'`) };
+    return { code: 0, asm: get >= 0 ? asmFor(['M<S>::get(void)const', 2]) : [] };
+  });
+  try {
+    const x = start(dir, { settings: { 'asmLens.reanalyzeOn': 'never', 'asmLens.autoInstantiateTemplates': false } });
+    await x.instantiate('m.h', 2, 'S');
+    assert.match(await x.lensAt('m.h', 2), /^\$\(symbol-numeric\) 2 instructions/);
+    assert.match(await x.lensAt('m.h', 3), /M<S>::bad does not compile: 'type cast'/);
+  } finally { ce.restore(); }
+});
+
+test('an error in the class itself: all its members go at once, not one per compile', async () => {
+  const members = Array.from({ length: 20 }, (_, i) => `  T m${i}() const { return T{}; }`).join('\n');
+  const dir = makeProject({ 'm.h': `template <class T> struct M {\n  typename T::nothing n;\n${members}\n};\n` });
+  const ce = fakeCompilerExplorer(body => {
+    const lines = body.source.split('\n');
+    const use = lines.findIndex(l => l === 'template struct M<int>;' || l.includes('&M<int>::'));
+    if (use < 0) return { code: 0, asm: [] };
+    return { code: 1, stderr: err("<source>:2:23: error: 'int' cannot be used prior to '::'", `<source>:${use + 1}:17: note: in instantiation of template class 'M<int>' requested here`) };
+  });
+  try {
+    const x = start(dir, { settings: { 'asmLens.reanalyzeOn': 'never', 'asmLens.autoInstantiateTemplates': false } });
+    const msg = await x.instantiate('m.h', 3, 'int');
+    assert.ok(ce.requests.length <= 4, `${ce.requests.length} compiles`);
+    assert.match(msg.warning[0], /could not instantiate template struct M<int>/);
+    assert.deepEqual(x.ext._internals.instantiationsFor(x.open('m.h')), []);
+  } finally { ce.restore(); }
+});
+
+// ---------------------------------------------------------------------------
+// 0.8.8: an added line nobody names is still found, and never blamed on the file
+
+// Like Clang: the error is in another template, and the notes end inside the class, before the added line.
+const NO_CHAIN_FILE = 'template <class U> struct Cell { U weak() const { return (U)1; } };\nstruct S { int a; };\ntemplate <class T> struct Box {\n  T get() const { return T{}; }\n  T broken() const { return Cell<S>{}.weak(); }\n};\nstatic inline int plain(int x) { return x; }\n';
+function noChainReply(body) {
+  const lines = body.source.split('\n');
+  const whole = lines.indexOf('template struct Box<S>;');
+  const member = lines.findIndex(l => l.includes('&Box<S>::broken'));
+  if (whole >= 0) return { code: 1, stderr: err("<source>:1:40: error: no matching conversion", "<source>:5:37: note: in instantiation of member function 'Cell<S>::weak' requested here") };
+  if (member >= 0) return { code: 1, stderr: err("<source>:1:40: error: no matching conversion", "<source>:5:37: note: in instantiation of member function 'Cell<S>::weak' requested here", `<source>:${member + 1}:8: note: in instantiation of member function 'Box<S>::broken' requested here`) };
+  return { code: 0, asm: [...asmFor(['plain(int)', 7]), ...(lines.some(l => l.includes('&Box<S>::get')) ? asmFor(['Box<S>::get() const', 4]) : [])] };
+}
+
+test('an added class the notes do not name: found from where they end, and the file keeps its functions', async () => {
+  const dir = makeProject({ 'h.hxx': NO_CHAIN_FILE });
+  const ce = fakeCompilerExplorer(noChainReply);
+  try {
+    const x = start(dir, { settings: { 'asmLens.reanalyzeOn': 'never', 'asmLens.autoInstantiateTemplates': false } });
+    const msg = await x.instantiate('h.hxx', 4, 'S');
+    assert.deepEqual([msg.error, msg.warning], [[], []], 'the part that compiles is there');
+    assert.equal(await x.lensAt('h.hxx', 7), '$(symbol-numeric) 2 instructions · g152 · -O2', 'the file is not at fault');
+    assert.match(await x.lensAt('h.hxx', 4), /^\$\(symbol-numeric\) 2 instructions · Box<S>/);
+    assert.match(await x.lensAt('h.hxx', 5), /^\$\(warning\) Box<S>::broken does not compile: no matching conversion/);
+    assert.ok(!(x.analysis('h.hxx').skipped || []).length, 'nothing of the file counts as not compiling');
+    assert.deepEqual(x.ext._internals.instantiationsFor(x.open('h.hxx')).map(i => i.expr), ['Box<S>']);
+  } finally { ce.restore(); }
+});
+
+test('an added line with no note in this file at all: found by compiling halves of the added lines', async () => {
+  const src = 'template <class T> struct A { T a() const { return T{}; } };\ntemplate <class T> struct B { T b() const { return T{}; } };\ntemplate <class T> struct C { T c() const { return T{}; } };\n';
+  const dir = makeProject({ 'h.hxx': src });
+  const ce = fakeCompilerExplorer(body => {
+    // The error is in another header, whichever line causes it.
+    if (body.source.includes('template struct B<int>;') || body.source.includes('&B<int>::b')) return { code: 1, stderr: err('other.h:9:9: error: this fails for B') };
+    return { code: 0, asm: [...(body.source.includes('template struct A<int>;') ? asmFor(['A<int>::a() const', 1]) : []), ...(body.source.includes('template struct C<int>;') ? asmFor(['C<int>::c() const', 3]) : [])] };
+  });
+  try {
+    const x = start(dir, { settings: { 'asmLens.reanalyzeOn': 'never' } });
+    const msg = await x.analyze('h.hxx');
+    assert.deepEqual([msg.error, msg.warning], [[], []], 'nobody asked for it: silently');
+    assert.match(await x.lensAt('h.hxx', 1), /^\$\(symbol-numeric\) 2 instructions · A<int>/);
+    assert.match(await x.lensAt('h.hxx', 3), /^\$\(symbol-numeric\) 2 instructions · C<int>/, 'what compiles stays');
+    assert.match(await x.lensAt('h.hxx', 2), /B<int>(?:::b)? does not compile: this fails for B/);
+  } finally { ce.restore(); }
+});
+
+test('a requested class nothing of which compiles, and no note names it: it goes with a warning, the analysis goes on', async () => {
+  const src = 'template <class T> struct B { T b() const { return T{}; } };\nstatic inline int plain(int x) { return x; }\n';
+  const dir = makeProject({ 'h.hxx': src });
+  const ce = fakeCompilerExplorer(body => (body.source.includes('B<S>') ? { code: 1, stderr: err('other.h:9:9: error: this fails for S') } : { code: 0, asm: asmFor(['plain(int)', 2]) }));
+  try {
+    const x = start(dir, { settings: { 'asmLens.reanalyzeOn': 'never', 'asmLens.autoInstantiateTemplates': false } });
+    const msg = await x.instantiate('h.hxx', 1, 'S');
+    assert.deepEqual(msg.error, []);
+    assert.match(msg.warning[0], /could not instantiate template struct B<S>: this fails for S/);
+    assert.deepEqual(x.ext._internals.instantiationsFor(x.open('h.hxx')), []);
+    assert.equal(await x.lensAt('h.hxx', 2), '$(symbol-numeric) 2 instructions · g152 · -O2');
+  } finally { ce.restore(); }
+});
+
+test('the file\'s own error is still the file\'s: with added lines around, the function at fault says Not compiled', async () => {
+  const src = 'static inline int bad(int x) { return nope(x); }\nstatic inline int good(int x) { return x; }\ntemplate <class T> struct B { T b() const { return T{}; } };\n';
+  const dir = makeProject({ 'h.hxx': src });
+  const ce = fakeCompilerExplorer(body => (body.source.includes('nope(x)') ? { code: 1, stderr: err("<source>:1:39: error: 'nope' was not declared in this scope") } : { code: 0, asm: [...asmFor(['good(int)', 2]), ...(body.source.includes('template struct B<int>;') ? asmFor(['B<int>::b() const', 3]) : [])] }));
+  try {
+    const x = start(dir, { settings: { 'asmLens.reanalyzeOn': 'never' } });
+    await x.analyze('h.hxx');
+    assert.match(await x.lensAt('h.hxx', 1), /^\$\(warning\) Not compiled · 'nope' was not declared/);
+    assert.match(await x.lensAt('h.hxx', 2), /^\$\(symbol-numeric\) 2 instructions/);
+    assert.match(await x.lensAt('h.hxx', 3), /^\$\(symbol-numeric\) 2 instructions · B<int>/, 'the added line is not blamed either');
   } finally { ce.restore(); }
 });

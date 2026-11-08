@@ -2,6 +2,7 @@ const test = require('node:test');
 const assert = require('node:assert/strict');
 const fs = require('fs');
 const path = require('path');
+const os = require('os');
 const cc = require('../../src/compileCommands');
 const { makeProject } = require('../helpers/env');
 
@@ -82,4 +83,40 @@ test('includes: relative includes, includes through include paths, other files w
   assert.equal(cc.includes('// #include "api.h"\nint x;\n', from, path.resolve('/p/src/zzz.h')), false);
   assert.equal(cc.folderDistance('/a/b', '/a/b'), 0);
   assert.equal(cc.folderDistance('/a/b', '/a/c/d'), 3);
+});
+
+test('includersOf: through other headers, with the entry\'s include folders; all that include it', async () => {
+  cc.reload();
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'asm-lens-cc-'));
+  const write = (rel, text) => { const p = path.join(dir, rel); fs.mkdirSync(path.dirname(p), { recursive: true }); fs.writeFileSync(p, text); return p; };
+  const target = write('inc/deep/target.hxx', 'static inline int t() { return 1; }\n');
+  write('inc/mid.h', '#include <deep/target.hxx>\n');
+  write('inc/other.h', 'int nothing;\n');
+  write('src/a.cpp', '#include "mid.h"\n');
+  write('src/b.cpp', '#include "../inc/deep/target.hxx"\n');
+  write('src/c.cpp', '#include "other.h"\n');
+  const command = (file, extra = '') => ({ directory: dir, file, command: `g++ -Iinc ${extra} -c ${file}` });
+  write('compile_commands.json', JSON.stringify([command('src/c.cpp'), command('src/a.cpp', '-DA'), command('src/b.cpp', '-DB')]));
+  const db = await cc.loadDatabases([path.join(dir, 'compile_commands.json')]);
+  const found = await cc.includersOf(db, target);
+  assert.deepEqual(found.map(e => path.basename(e.file)).sort(), ['a.cpp', 'b.cpp']);
+  const match = await cc.entryFor(db, target);
+  assert.match(match.reason, /the entry of [ab]\.cpp, which includes it/);
+});
+
+test('entriesOf and includersOf: a file listed for two builds, one of each build before a second one of any', async () => {
+  cc.reload();
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'asm-lens-cc-'));
+  const write = (rel, text) => { const p = path.join(dir, rel); fs.mkdirSync(path.dirname(p), { recursive: true }); fs.writeFileSync(p, text); return p; };
+  const target = write('h.hxx', 'int x;\n');
+  for (let i = 0; i < 6; i++) write(`s${i}.cpp`, '#include "h.hxx"\n');
+  const entry = (file, flag) => ({ directory: dir, file, command: `g++ ${flag} -c ${file}` });
+  write('a.json', JSON.stringify([0, 1, 2, 3, 4, 5].map(i => entry(`s${i}.cpp`, '-m32'))));
+  write('b.json', JSON.stringify([0, 1, 2, 3, 4, 5].map(i => entry(`s${i}.cpp`, '-m64'))));
+  const db = await cc.loadDatabases([path.join(dir, 'a.json'), path.join(dir, 'b.json')]);
+  assert.equal(db.byFile.get(require('../../src/asm').normPath(path.join(dir, 's0.cpp'))).command.includes('-m32'), true, 'the first database wins for one entry');
+  assert.deepEqual(cc.entriesOf(db, path.join(dir, 's0.cpp')).map(e => /-m\d+/.exec(e.command)[0]), ['-m32', '-m64']);
+  const found = await cc.includersOf(db, target);
+  assert.deepEqual(found.slice(0, 2).map(e => /-m\d+/.exec(e.command)[0]).sort(), ['-m32', '-m64'], 'both builds, though the first one has many files');
+  assert.equal(found.length, 4, 'two of each build are enough');
 });

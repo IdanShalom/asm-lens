@@ -76,3 +76,57 @@ test('local: a compiler that defaults to C++98 gets -std=gnu++17 when C++11 code
   assert.ok(x.state.outputLines.some(l => /defaults to an older C\+\+ standard: added -std=gnu\+\+17/.test(l)), x.state.outputLines.join('\n'));
   assert.match(await x.lensAt('a.cpp', 1), /-std=gnu\+\+17$/);
 });
+
+// Headers that do not compile on their own, and class templates, with real compilers.
+const BROKEN = { goodOne: 2, goodTwo: 3, needsOther: 4, usesMacro: 5, goodMember: 8, goodStatic: 9, badMember: 10 };
+const STACK = { push: 8, pop: 9, empty: 10, size: 16, deref: 22, get: 28 };
+
+async function brokenHeader(config) {
+  const x = start(makeProject({ 'broken.hxx': fixture('classes', 'broken.hxx') }, config), { settings: { 'asmLens.reanalyzeOn': 'never' } });
+  assert.deepEqual((await x.analyze('broken.hxx')).error, [], x.state.outputLines.join('\n'));
+  for (const name of ['goodOne', 'goodTwo', 'goodMember', 'goodStatic']) assert.match(await x.lensAt('broken.hxx', BROKEN[name]) || '', ONE, `${name}\n${x.state.outputLines.join('\n')}`);
+  for (const name of ['needsOther', 'usesMacro', 'badMember']) assert.match(await x.lensAt('broken.hxx', BROKEN[name]) || '', /Not compiled/, name);
+}
+
+async function classTemplates(config) {
+  const files = { 'stack.h': fixture('classes', 'stack.h'), 'use_stack.cpp': fixture('classes', 'use_stack.cpp') };
+  const x = start(makeProject(files, config), { settings: { 'asmLens.reanalyzeOn': 'never' } });
+  // Through a .cpp that uses it: real code, inlined code or an honest "no separate code", never "not instantiated".
+  // With GCC and Linux Clang everything can end up attributed to library headers: then no instruction
+  // maps to stack.h, so nothing ties the analysis to it and it simply offers to be analyzed.
+  assert.deepEqual((await x.analyze('use_stack.cpp')).error, [], x.state.outputLines.join('\n'));
+  for (const name of ['push', 'pop', 'empty', 'size']) {
+    const lens = await x.lensAt('stack.h', STACK[name]) || '';
+    assert.match(lens, /^\$\(symbol-numeric\) |No separate code in use_stack\.cpp \(inlined or not used\)|^\$\(play\) Analyze with Asm Lens$/, `${name}: ${lens}`);
+    assert.ok(!/not instantiated/.test(lens), lens);
+  }
+  // Choosing the types gives every member its own code, however the .cpp compiled.
+  assert.deepEqual((await x.instantiate('stack.h', STACK.push, 'int')).warning, []);
+  for (const name of ['push', 'pop', 'empty', 'size']) assert.match(await x.lensAt('stack.h', STACK[name]) || '', ONE, `${name}\n${x.describe('stack.h')}`);
+  // A partial specialization compiles itself, not the primary template.
+  assert.deepEqual((await x.instantiate('stack.h', STACK.deref, 'int')).warning, []);
+  assert.match(await x.lensAt('stack.h', STACK.deref) || '', ONE, x.describe('stack.h'));
+  // A class that does not compile as a whole for the type: the clicked member still does, and the one at fault says why.
+  await x.instantiate('stack.h', STACK.get, 'int');
+  assert.match(await x.lensAt('stack.h', STACK.get) || '', ONE, x.state.outputLines.slice(-12).join('\n'));
+  assert.match(await x.lensAt('stack.h', STACK.get + 1) || '', /^\$\(warning\) Mixed<int>::length does not compile: /);
+  assert.ok(x.ext._internals.instantiationsFor(x.open('stack.h')).some(i => i.kind === 'class' && i.expr === 'Mixed<int>'));
+}
+
+for (const cc of localCompilers()) {
+  const config = { mode: 'local', compiler: cc, flags: '-O2 -std=c++17' };
+  test(`local ${cc}: one function that does not compile costs only that function`, () => brokenHeader(config));
+  test(`local ${cc}: class templates, through a .cpp and instantiated`, () => classTemplates(config));
+}
+
+for (const id of ['g152', 'clang2010', 'vcpp_v19_latest_x64']) {
+  const config = { flags: '-O2 -std=c++17', compilers: [{ id, name: id }] };
+  test(`remote ${id} (Compiler Explorer): one function that does not compile costs only that function`, async () => {
+    const ce = installFetch();
+    try { await brokenHeader(config); } finally { ce.restore(); }
+  });
+  test(`remote ${id} (Compiler Explorer): class templates, through a .cpp and instantiated`, async () => {
+    const ce = installFetch();
+    try { await classTemplates(config); } finally { ce.restore(); }
+  });
+}

@@ -2,6 +2,7 @@ const test = require('node:test');
 const assert = require('node:assert/strict');
 const path = require('path');
 const F = require('../../src/flags');
+const flagsLib = require('../../src/flags');
 
 test('stripSyntaxFlags: -masm and -mllvm -x86-asm-syntax are taken out; AT&T is remembered', () => {
   assert.deepEqual(F.stripSyntaxFlags('-O2 -masm=intel'), { flags: '-O2', syntax: 'intel' });
@@ -137,4 +138,34 @@ test('needsNewerStd: C++11 code compiled as C++98 by Apple clang 14 or old GCC',
   assert.equal(F.needsNewerStd("<stdin>:22:3: warning: 'auto' type specifier is a C++11 extension [-Wc++11-extensions]\n<stdin>:22:13: error: expected expression"), true);
   assert.equal(F.needsNewerStd("a.cpp:3:12: error: 'v' was not declared\nnote: extended initializer lists only available with '-std=c++11' or '-std=gnu++11'"), true);
   assert.equal(F.needsNewerStd("a.cpp:1:5: error: use of undeclared identifier 'x'"), false);
+});
+
+test('withoutWarningsAsErrors: warnings stay warnings', () => {
+  const { flags, removed } = flagsLib.withoutWarningsAsErrors('-O2 -Wall -Werror -Werror=format -Wno-error=x -pedantic-errors /WX -std=c++17');
+  assert.equal(flags, '-O2 -Wall -Wno-error=x -std=c++17');
+  assert.deepEqual(removed, ['-Werror', '-Werror=format', '-pedantic-errors', '/WX']);
+  assert.deepEqual(flagsLib.withoutWarningsAsErrors('-O2'), { flags: '-O2', removed: [] });
+});
+
+test('compileFlagsOf: link-time optimization, instrumentation and reports are left out', () => {
+  const args = flagsLib.compileFlagsOf({ directory: '/p', file: 'a.cpp', arguments: ['g++', '-O2', '-flto=auto', '-fno-fat-lto-objects', '--coverage', '-fprofile-arcs', '-ftest-coverage', '-save-temps=obj', '-ftime-trace', '-fstack-usage', '-gsplit-dwarf', '-DX', '-c', 'a.cpp', '-o', 'a.o'] }, false);
+  assert.deepEqual(args, ['-O2', '-DX']);
+});
+
+test('splitForcedIncludes: -include in its forms and precompiled headers', () => {
+  assert.deepEqual(flagsLib.splitForcedIncludes(['-O2', '-include', 'a.h', '-includeb.h', '--include=c.h', '-Winvalid-pch', '-Xclang', '-include-pch', '-Xclang', 'x.pch', '-Xclang', '-include', '-Xclang', 'd.h', '-DX']), { rest: ['-O2', '-DX'], files: ['a.h', 'b.h', 'c.h', 'd.h'] });
+  assert.deepEqual(flagsLib.splitForcedIncludes(['-O2', '-Xclang', '-fcolor']), { rest: ['-O2', '-Xclang', '-fcolor'], files: [] });
+});
+
+test('portableFlags: defines, standard and target options; folders apart', () => {
+  const { flags, dirs } = flagsLib.portableFlags({ directory: '/p', file: 'a.cpp', arguments: ['g++', '-D', 'A', '-DB=1', '-UC', '-DNAME=a b', '-Iinc', '-isystem', '/sys', '-std=c++17', '-mavx2', '-march=haswell', '-O3', '-Wall', '-fPIC', '-fno-rtti', '-masm=intel', '-c', 'a.cpp'] }, false);
+  assert.equal(flags, '-DA -DB=1 -UC "-DNAME=a b" -std=c++17 -mavx2 -march=haswell -fno-rtti');
+  assert.deepEqual(dirs, [require('path').resolve('/p/inc'), require('path').resolve('/sys')]);
+});
+
+test('macroFlags and targetFlags: what changes what the preprocessor sees', () => {
+  const args = ['-O2', '-m32', '-DX=1', '-D', 'Y', '-UZ', '-Iinc', '-std=c++17', '-Wall', '-masm=intel', '--target=i386-linux', '-mavx2'];
+  assert.deepEqual(flagsLib.macroFlags(args), ['-m32', '-DX=1', '-DY', '-UZ', '-std=c++17', '--target=i386-linux', '-mavx2']);
+  assert.deepEqual(flagsLib.targetFlags(args), ['-m32', '--target=i386-linux']);
+  assert.deepEqual(flagsLib.targetFlags(['-target', 'x86_64-linux', '-O2']), ['-target x86_64-linux']);
 });

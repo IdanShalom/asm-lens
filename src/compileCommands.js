@@ -5,6 +5,7 @@
 const fs = require('fs/promises');
 const path = require('path');
 const { normPath } = require('./asm');
+const { compileFlagsOf, includeDirsOf, entryCompiler, macroFlags } = require('./flags');
 
 const cache = new Map();   // database path -> { mtimeMs, size, entries, byFile, error }
 
@@ -72,12 +73,89 @@ function includes(text, from, target) {
   return false;
 }
 
-const includerCache = new Map();   // `${database stamps}\n${file}` -> entry | null
+const includerCache = new Map();   // `${database stamps}\n${file}` -> entries
+
+// All entries of a file. It can be listed more than once: a 32-bit and a 64-bit build,
+// in one database or in several.
+function entriesOf(db, file) {
+  const key = normPath(file);
+  return (db?.entries || []).filter(e => normPath(e.file) === key);
+}
+
+// What makes a build different for the preprocessor: its compiler, defines and target.
+function buildOf(entry) {
+  return [entryCompiler(entry), ...macroFlags(compileFlagsOf(entry))].join(' ');
+}
+
+// The entries whose source file includes `file`, directly or through other headers
+// (followed the way the entry's own include folders find them), nearest folders first,
+// with one of each build before a second one of any: thousands of files of a 32-bit build
+// listed first must not hide the 64-bit one.
+async function includersOf(db, file, { readText = defaultRead, maxScan = 400, maxFiles = 3000, max = 8 } = {}) {
+  if (!db || !db.entries.length) return [];
+  const stamp = `${db.stamp || ''}\n${normPath(file)}`;
+  if (includerCache.has(stamp)) return includerCache.get(stamp);
+  const dir = path.dirname(file);
+  const target = normPath(file);
+  const nearest = db.entries.map(e => ({ e, d: folderDistance(dir, path.dirname(e.file)) })).sort((a, b) => a.d - b.d).map(x => x.e);
+  const texts = new Map();
+  const read = async p => {
+    const key = normPath(p);
+    if (!texts.has(key)) texts.set(key, texts.size < maxFiles ? await readText(p) : undefined);
+    return texts.get(key);
+  };
+  const found = [];
+  const perBuild = new Map();
+  let scanned = 0;
+  for (const entry of nearest) {
+    if (found.length >= max || scanned >= maxScan) break;
+    if (normPath(entry.file) === target) continue;
+    const build = buildOf(entry);
+    if ((perBuild.get(build) || 0) >= 2) continue;
+    scanned++;
+    if (!await reaches(entry.file, file, includeDirsOf(compileFlagsOf(entry), entry.directory), read)) continue;
+    perBuild.set(build, (perBuild.get(build) || 0) + 1);
+    found.push(entry);
+  }
+  const seen = new Set();
+  const firsts = found.filter(e => { const b = buildOf(e); if (seen.has(b)) return false; seen.add(b); return true; });
+  const result = [...firsts, ...found.filter(e => !firsts.includes(e))];
+  includerCache.set(stamp, result);
+  return result;
+}
+
+// Whether `from` includes `file`, directly or through other headers found in `dirs`.
+async function reaches(from, file, dirs = [], read = defaultRead) {
+  const target = normPath(file);
+  const tail = `/${path.basename(file).toLowerCase()}`;
+  const seen = new Set([normPath(from)]);
+  const queue = [from];
+  while (queue.length) {
+    const current = queue.shift();
+    const text = await read(current);
+    if (text === undefined) continue;
+    for (const m of text.matchAll(INCLUDE_RE)) {
+      const name = m[1].trim();
+      if (path.isAbsolute(name)) { if (normPath(name) === target) return true; continue; }
+      const spelled = `/${name.replace(/\\/g, '/').replace(/^\.\//, '').toLowerCase()}`;
+      if (normPath(path.resolve(path.dirname(current), name)) === target || (target.replace(/\\/g, '/').toLowerCase().endsWith(spelled) && spelled.endsWith(tail))) return true;
+      for (const base of [path.dirname(current), ...dirs]) {
+        const next = path.resolve(base, name);
+        if (seen.has(normPath(next))) break;
+        if (await read(next) === undefined) continue;
+        seen.add(normPath(next));
+        queue.push(next);
+        break;
+      }
+    }
+  }
+  return false;
+}
 
 // The entry to compile `file` with, and why:
 //   1. its own entry;
 //   2. the entry of a file known to include it (`includedBy`, e.g. analyzed .cpp files);
-//   3. the entry of a source file that includes it (searched nearest folders first);
+//   3. the entry of a source file that includes it, also through other headers (searched nearest folders first);
 //   4. an entry in the same folder, else the nearest folder.
 // Returns { entry, reason } or undefined.
 async function entryFor(db, file, { includedBy = [], readText = defaultRead, maxScan = 400 } = {}) {
@@ -93,16 +171,7 @@ async function entryFor(db, file, { includedBy = [], readText = defaultRead, max
   const byDistance = db.entries
     .map(e => ({ e, d: folderDistance(dir, path.dirname(e.file)) }))
     .sort((a, b) => a.d - b.d);
-  const stamp = `${db.stamp || ''}\n${key}`;
-  if (!includerCache.has(stamp)) {
-    let found = null;
-    for (const { e } of byDistance.slice(0, maxScan)) {
-      const text = await readText(e.file);
-      if (text !== undefined && includes(text, e.file, file)) { found = e; break; }
-    }
-    includerCache.set(stamp, found);
-  }
-  const includer = includerCache.get(stamp);
+  const includer = (await includersOf(db, file, { readText, maxScan }))[0];
   if (includer) return { entry: includer, reason: `the entry of ${path.basename(includer.file)}, which includes it` };
   const nearest = byDistance[0];
   return { entry: nearest.e, reason: nearest.d === 0 ? `the entry of ${path.basename(nearest.e.file)} in the same folder` : `the entry of ${path.basename(nearest.e.file)} in the nearest folder` };
@@ -114,4 +183,4 @@ async function defaultRead(file) {
 
 function clearIncluderCache() { includerCache.clear(); }
 
-module.exports = { loadDatabase, loadDatabases, reload: () => { reload(); clearIncluderCache(); }, entryFor, includes, folderDistance };
+module.exports = { loadDatabase, loadDatabases, reload: () => { reload(); clearIncluderCache(); }, entryFor, entriesOf, buildOf, includersOf, reaches, includes, folderDistance };
