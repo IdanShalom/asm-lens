@@ -533,3 +533,23 @@ test('findAllFunctionResults: a symbol that starts on another line than the one 
   assert.equal(findAllFunctionResults({ name: 'f', range: range(5, 6) }, [fn], 'k', 'k').length, 1, 'same name, same place');
   assert.equal(findAllFunctionResults({ name: 'f', range: range(20, 22) }, [fn], 'k', 'k').length, 0, 'an overload elsewhere is not it');
 });
+
+test('cleanInstruction: a trailing # comment goes, an ARM immediate (#1, #-16) stays', () => {
+  const { cleanInstruction, cleanAssemblyRowsForDisplay } = require('../../src/asm');
+  const same = {
+    'stp\tx29, x30, [sp, #-16]!': 'stp\tx29, x30, [sp, #-16]!',
+    'add\tw0, w0, #1': 'add\tw0, w0, #1',
+    'ldp\tx29, x30, [sp], #16': 'ldp\tx29, x30, [sp], #16',
+    'ldr\tx0, [x1, #:lo12:value]': 'ldr\tx0, [x1, #:lo12:value]',
+    'movs\tr0, #5': 'movs\tr0, #5',
+    'mov\teax, DWORD PTR [rdi]  # *p_2(D), *p_2(D)': 'mov\teax, DWORD PTR [rdi]',
+    'addl\t$1, %eax\t# x': 'addl\t$1, %eax',
+    'li\ta0, 1  # imm': 'li\ta0, 1',
+    'stp\tx29, x30, [sp, #-16]!           ; 16-byte Folded Spill': 'stp\tx29, x30, [sp, #-16]!',
+    'mov\teax, DWORD PTR x$[rsp]   ; comment': 'mov\teax, DWORD PTR x$[rsp]',
+    '  ret  ': 'ret'
+  };
+  for (const [text, want] of Object.entries(same)) assert.equal(cleanInstruction(text), want, text);
+  const shown = cleanAssemblyRowsForDisplay({ rows: [{ text: 'f:' }, { text: '\tadd\tw0, w0, #1' }, { text: '\tb\t.LBB0_2   # jump' }, { text: '.LBB0_2:' }, { text: '\tret' }] });
+  assert.deepEqual(shown.map(r => r.text), ['add\tw0, w0, #1', 'b\t.LBB0_2', '.LBB0_2:', 'ret']);
+});

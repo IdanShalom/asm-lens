@@ -23,6 +23,7 @@ const { maskCode, blankEnclosingDeclaration, keepHeaderFunctions } = scan;
 const LANGS = languages.LANGUAGE_IDS;
 const VIRTUAL_ROOT = 'asm_lens';
 const HEADER_RE = /\.(?:h|hh|hpp|hxx|h\+\+|inl|ipp|tcc|tpp|txx|cuh|ph)$/i;
+const SOURCE_RE = /\.(?:c|cc|cp|cpp|cxx|c\+\+|m|mm|cu|s)$/i;
 // Template instantiations requested per file: { [file key]: [{ kind, expr, keyword }] }.
 const INSTANTIATIONS_KEY = 'asmLens.instantiations';
 const TEMPLATE_ARGS_KEY = 'asmLens.lastTemplateArgs';
@@ -176,6 +177,12 @@ async function resolveSettings(document) {
     ? { id: chosen.id, name: chosen.name || chosen.id, mode: 'remote' } : undefined;
   const active = (chosen && !chosen.browsed && compilers.find(x => x.id === chosen.id)) || browsed || compilers[0];
   const settingsPaths = (s.get('includePaths', []) || []).filter(x => typeof x === 'string' && x.trim());
+  // The build chosen with Select Compiler, else the one the active compiler names.
+  const picked = pickedBuild(project);
+  const named = active.entriesWith || active.entriesWithout
+    ? { build: { with: active.entriesWith || [], without: active.entriesWithout || [] }, label: [...(active.entriesWith || []), ...(active.entriesWithout || []).map(f => `without ${f}`)].join(' ') }
+    : undefined;
+  const build = picked || named;
   return {
     configFile: project?.file,
     configError: project?.error,
@@ -195,9 +202,103 @@ async function resolveSettings(document) {
     mode: active.mode || c?.mode || s.get('mode', 'remote'),
     localCompiler: resolveCompilerPath(active.compiler || c?.compiler || s.get('localCompiler', '') || 'g++', project),
     // Local mode: compile_commands.json databases (absolute paths), and the flags added to an entry's.
-    compileCommands: c?.compileCommands ?? settingsCompileCommands(document, s),
-    activeExtraFlags: active.extraFlags || ''
+    // A compiler can have its own databases, or none ("compileCommands": false).
+    compileCommands: active.compileCommands ?? c?.compileCommands ?? settingsCompileCommands(document, s),
+    activeExtraFlags: active.extraFlags || '',
+    // Only the entries of this build (a 32-bit one, say), when the database lists several.
+    build: build?.build,
+    buildLabel: build?.label,
+    // A compiler of the active entry in "compilers" runs instead of the database entry's own.
+    entryCompiler: active.compiler ? resolveCompilerPath(active.compiler, project) : undefined
   };
+}
+
+// Commands edited in the assembly view, per file. One applies while the compiler it was edited for is
+// active (in the same mode): the command of one compiler means nothing to another.
+const EDITED_KEY = 'asmLens.editedCommands';
+function commandOverride(document, resolved) {
+  const all = extContext?.workspaceState.get(EDITED_KEY, {}) || {};
+  const edited = all[fileKey(document)];
+  return edited && edited.mode === resolved.mode && edited.compilerId === resolved.active.id ? edited : undefined;
+}
+
+// From the assembly view: compile the file shown with this command, or go back to the settings' (reset).
+async function editCommand(message) {
+  const analysis = panelState?.analysis;
+  const uri = analysis && analyzedFiles.get(analysis.rootKey)?.uri;
+  if (!uri || !analysis.command) return;
+  const document = await vscode.workspace.openTextDocument(uri);
+  const key = fileKey(document);
+  const all = { ...(extContext.workspaceState.get(EDITED_KEY, {}) || {}) };
+  if (message.type === 'resetCommand') {
+    if (!all[key]) return;
+    delete all[key];
+    outputChannel.appendLine(`${path.basename(document.fileName)}: the edited command was reset; the settings apply again.`);
+  } else {
+    const text = String(message.text ?? '').replace(/\s+/g, ' ').trim();
+    // A local command needs at least the compiler; flags may be empty.
+    if ((analysis.command.kind === 'command' && !text) || text.length > 65536) return;
+    const resolved = await resolveSettings(document);
+    all[key] = { text, kind: analysis.command.kind, cwd: analysis.command.cwd, mode: resolved.mode, compilerId: resolved.active.id };
+    outputChannel.appendLine(`${path.basename(document.fileName)}: compiling with the command edited in the assembly view: ${text}`);
+  }
+  await extContext.workspaceState.update(EDITED_KEY, all);
+  bestCompilation.delete(key);
+  dropExtras(key);
+  const before = lastAnalysis.get(key);
+  const shownBefore = lastRender;
+  await analyzeDocument(document);
+  // A compile that is still running (a rerun was asked for) answers when it ends; a new render answers too.
+  if (analysisBusy.has(key) || lastRender !== shownBefore) return;
+  postToPanel({ type: 'commandDone', failed: lastAnalysis.get(key) === before });
+}
+
+// Select Compiler's build items: "All builds" and each build of the file's entries (a header: of the
+// files including it). Nothing when the file has one build or no database is used.
+async function buildChoices(document, settings) {
+  if (!settings.compileCommands?.length || document.uri.scheme !== 'file') return [];
+  const dbs = await databasesOf({ ...settings, build: undefined });
+  let groups = compileCommands.buildsAmong(compileCommands.entriesOf(dbs.all, document.uri.fsPath));
+  if (!groups.length && !compileCommands.entriesOf(dbs.all, document.uri.fsPath).length) {
+    const includers = [...includersOf(document).flatMap(f => compileCommands.entriesOf(dbs.all, f)), ...await compileCommands.includersOf(dbs.all, document.uri.fsPath)];
+    groups = compileCommands.buildsAmong([...new Set(includers)]);
+  }
+  if (!groups.length && !settings.build) return [];
+  const same = b => JSON.stringify(b) === JSON.stringify(settings.build);
+  const name = path.basename(document.fileName);
+  return [
+    { label: '$(layers) All builds', description: settings.build ? '' : 'active', detail: `Each entry of ${name}: the result with most code first, the others fill in what it lacks`, buildChoice: true, build: undefined },
+    ...groups.map(g => ({
+      label: g.label,
+      description: `${g.entries.length} ${g.entries.length === 1 ? 'entry' : 'entries'} here${same(g.build) ? ' · active' : ''}`,
+      detail: `Only the entries of this build, in ${[...new Set(g.entries.map(e => path.basename(path.dirname(e.database)) + '/' + path.basename(e.database)))].join(', ')}`,
+      buildChoice: true, build: g.build
+    })),
+    // A build picked for another file, which this one does not have.
+    ...(settings.build && !groups.some(g => same(g.build)) ? [{ label: settings.buildLabel || 'chosen build', description: 'active', detail: `${name} is not in this build: its own entry is used`, buildChoice: true, build: settings.build }] : [])
+  ];
+}
+
+async function chooseBuild(document, settings, picked) {
+  const hadAnalysis = analysisFor(document);
+  await extContext.workspaceState.update(BUILD_KEY, picked.build ? { configFile: settings.configFile, build: picked.build, label: picked.label } : undefined);
+  lastAnalysis.clear();
+  bestCompilation.clear();
+  clearTimeout(reanalysisTimers.get(fileKey(document)));
+  reanalysisTimers.delete(fileKey(document));
+  codeLensEmitter?.fire();
+  await refreshStatusBar();
+  vscode.window.showInformationMessage(picked.build ? `Asm Lens compiles with the build ${picked.label} of compile_commands.json.` : 'Asm Lens compiles with every build of compile_commands.json.');
+  if (hadAnalysis) await analyzeDocument(document);
+}
+
+// A build picked with Select Compiler applies to the project it was picked in.
+const BUILD_KEY = 'asmLens.build';
+function pickedBuild(project) {
+  const stored = extContext?.workspaceState.get(BUILD_KEY);
+  if (!stored || !stored.build) return undefined;
+  const same = stored.configFile ? project?.file && normPath(stored.configFile) === normPath(project.file) : !project?.file;
+  return same ? { build: stored.build, label: stored.label } : undefined;
 }
 
 // asmLens.compileCommands: a path or paths, relative to the workspace folder.
@@ -263,8 +364,10 @@ async function refreshStatusBar() {
     if (analysisBusy.size) return;            // an analysis started meanwhile: keep its spinner
     const local = r.mode === 'local';
     const database = local && r.compileCommands && r.compileCommands.length;
-    statusItem.text = `$(chip) ${database ? 'compile_commands (local)' : local ? `${path.basename(r.localCompiler || '')} (local)` : r.active.name || r.active.id}`;
-    statusItem.tooltip = `Asm Lens compiler: ${database ? `from ${r.compileCommands.join(', ')}` : local ? `${r.localCompiler} on this machine` : `${r.active.id} on ${r.baseUrl}`}\n${r.configFile ? `Config: ${r.configFile}` : 'No .asm-lens.json (using VS Code settings)'}\nClick to change`;
+    const edited = commandOverride(document, r);
+    const databaseText = [r.entryCompiler ? path.basename(r.entryCompiler) : '', 'compile_commands', r.buildLabel || ''].filter(Boolean).join(' ');
+    statusItem.text = `$(chip) ${database ? `${databaseText} (local)` : local ? `${path.basename(r.localCompiler || '')} (local)` : r.active.name || r.active.id}${edited ? ' · edited' : ''}`;
+    statusItem.tooltip = `Asm Lens compiler: ${database ? `from ${r.compileCommands.join(', ')}${r.buildLabel ? `, build ${r.buildLabel}` : ''}${r.entryCompiler ? `, run with ${r.entryCompiler}` : ''}` : local ? `${r.localCompiler} on this machine` : `${r.active.id} on ${r.baseUrl}`}\n${r.configFile ? `Config: ${r.configFile}` : 'No .asm-lens.json (using VS Code settings)'}${edited ? `\n${path.basename(document.fileName)} compiles with the command edited in the assembly view (Reset there)` : ''}\nClick to change`;
     statusItem.show();
   } catch (_) { statusItem.hide(); }
 }
@@ -489,17 +592,25 @@ function activate(context) {
     const other = settings.lang && settings.lang.family !== 'c' ? settings.lang : undefined;
     const docLang = other ? other.id : (document.languageId === 'c' ? 'c' : 'c++');
     const BROWSE = { label: '$(search) Browse all Compiler Explorer compilers…', browse: true };
+    const separator = label => (vscode.QuickPickItemKind ? [{ label, kind: vscode.QuickPickItemKind.Separator }] : []);
+    // The builds compile_commands.json has for this file (a 32-bit and a 64-bit one, say).
+    const builds = other ? [] : await buildChoices(document, settings);
     let picked;
-    if (settings.configFile && settings.compilers.length) {
-      const items = settings.compilers.map((c, i) => ({
+    if (builds.length || (settings.configFile && settings.compilers.length)) {
+      const items = settings.configFile ? settings.compilers.map((c, i) => ({
         label: c.name || c.id,
         description: `${c.id}${i === 0 ? ' · first in config' : ''}${c.id === settings.active.id ? ' · active' : ''}${(c.mode || settings.mode) === 'local' ? ' · local' : ''}`,
         detail: c.flags,
         compiler: c
-      }));
-      picked = await vscode.window.showQuickPick([...items, BROWSE], { placeHolder: 'Choose a compiler from .asm-lens.json' });
+      })) : [];
+      picked = await vscode.window.showQuickPick([
+        ...(builds.length ? [...separator('compile_commands.json builds'), ...builds] : []),
+        ...(items.length ? [...separator('Compilers in .asm-lens.json'), ...items] : []),
+        ...separator(''), BROWSE
+      ], { placeHolder: builds.length ? 'Choose the build to compile with, or a compiler' : 'Choose a compiler from .asm-lens.json' });
       if (!picked) return;
     } else picked = BROWSE;
+    if (picked.buildChoice) return chooseBuild(document, settings, picked);
     try {
       let chosen;
       if (picked.browse) {
@@ -522,6 +633,8 @@ function activate(context) {
       }
       // Before the settings change: it discards the results.
       const hadAnalysis = analysisFor(document);
+      // A compiler brings its own choice of build ("entriesWith"), or all of them.
+      if (!other) await extContext.workspaceState.update(BUILD_KEY, undefined);
       if (other) {
         await extContext.workspaceState.update(`asmLens.activeCompiler.${other.id}`, chosen);
       } else if (settings.configFile) {
@@ -1679,7 +1792,9 @@ async function otherCompilations(document, { max = 8 } = {}) {
   const own = document.uri.fsPath;
   const pathKey = docPathKey(document);
   const resolved = await resolveSettings(document);
-  const db = resolved.compileCommands?.length ? await compileCommands.loadDatabases(resolved.compileCommands) : undefined;
+  const dbs = await databasesOf(resolved);
+  // With a build chosen, only its entries: the others are what the choice is meant to leave out.
+  const db = dbs?.db;
   const candidates = [];
   const analyzed = [...analyzedFiles.entries()]
     .filter(([root, e]) => root !== fileKey(document) && e.deps.has(pathKey) && e.uri.scheme === 'file')
@@ -1711,8 +1826,10 @@ async function otherCompilations(document, { max = 8 } = {}) {
     const found = await includerSearches.get(pathKey);
     if (found) candidates.push({ file: found });
   }
-  const flagsOf = e => (e ? flagsLib.compileFlagsOf(e).join(' ') : '');
-  const usual = db ? (await compileCommands.entryFor(db, own, { includedBy: includersOf(document) }))?.entry : undefined;
+  // An edited command replaces every entry's flags: entries then differ only in how they include the file.
+  const edited = commandOverride(document, resolved);
+  const flagsOf = e => (e && !edited ? flagsLib.compileFlagsOf(e).join(' ') : '');
+  const usual = dbs ? (await entryOf(document, resolved, dbs))?.entry : undefined;
   const seen = new Set([`\n\n${flagsOf(usual)}`]);
   const hasTemplates = sourceInfo(document).templated.length > 0;
   const fresh = [], repeats = [];
@@ -1735,10 +1852,9 @@ async function otherCompilations(document, { max = 8 } = {}) {
 // flags in .asm-lens.json come later, so they win.
 async function databaseFlags(document, resolved, context) {
   if (!resolved.compileCommands?.length) return { flags: '', dirs: [] };
-  const db = await compileCommands.loadDatabases(resolved.compileCommands);
-  for (const e of db.errors) outputChannel.appendLine(`compile_commands: ${e}`);
+  const dbs = await databasesOf(resolved, { log: true });
   const given = context?.entry;
-  const match = given ? { entry: given, reason: `the entry of ${path.basename(given.file)}` } : await compileCommands.entryFor(db, document.uri.fsPath, { includedBy: includersOf(document) });
+  const match = given ? { entry: given, reason: `the entry of ${path.basename(given.file)}` } : await entryOf(document, resolved, dbs);
   if (!match) return { flags: '', dirs: [] };
   const portable = flagsLib.portableFlags(match.entry);
   outputChannel.appendLine(`  compile_commands: ${match.reason}: ${portable.flags || '(no flags to use here)'}`);
@@ -1766,7 +1882,10 @@ async function runAnalysis(document, { context, calls } = {}) {
     const { baseUrl, language } = resolved;
     // The syntax flag is Compiler Explorer's job (filters.intel), per compiler: -masm=intel would break MSVC and non-x86 compilers.
     const database = await databaseFlags(document, resolved, context);
-    const lenient = flagsLib.withoutWarningsAsErrors([database.flags, resolved.flags, ...resolved.defines.map(d => `-D${d}`), resolved.extraFlags].filter(Boolean).join(' '));
+    // Flags edited in the assembly view replace all of these (the database's include folders still find the headers).
+    const edited = commandOverride(document, resolved);
+    if (edited) outputChannel.appendLine('  flags from: the assembly view, where they were edited (Reset there goes back to the settings)');
+    const lenient = flagsLib.withoutWarningsAsErrors(edited ? edited.text : [database.flags, resolved.flags, ...resolved.defines.map(d => `-D${d}`), resolved.extraFlags].filter(Boolean).join(' '));
     if (lenient.removed.length) outputChannel.appendLine(`  left out ${lenient.removed.join(' ')}: a warning should not stop the analysis`);
     const stripped = flagsLib.stripSyntaxFlags(lenient.flags);
     const compilerId = resolved.active.id;
@@ -1818,12 +1937,19 @@ async function runAnalysis(document, { context, calls } = {}) {
     const rootPathKey = docPathKey(document);
     const paths = new Map([[rootPathKey, document.uri.fsPath]]);
     for (const entry of includeBundle.pathMap) paths.set(normPath(entry.real), entry.real);
+    const shownFlags = effectiveFlags.replace(/\s*-I(?:asm_lens\S*|\.)(?=\s|$)/g, '').trim();
     const result = await recordAnalysis(document, {
       rows: asmRows,
       resolveRef: makeRefResolver(rootPathKey, includeBundle.pathMap),
       compilerId,
       compilerLabel: resolved.active.name || compilerId,
-      flags: effectiveFlags.replace(/\s*-I(?:asm_lens\S*|\.)(?=\s|$)/g, '').trim(),
+      flags: shownFlags,
+      command: {
+        kind: 'flags', label: resolved.active.name || compilerId, where: hostOf(baseUrl), edited: Boolean(edited),
+        // The flags as sent, before the folders of the uploaded headers.
+        text: [flagsLib.removeFlags(flags, compiled.removedFlags || []).flags, syntax === 'att' ? '-masm=att' : ''].filter(Boolean).join(' '),
+        added: `${syntax === 'att' ? 'AT&T' : 'Intel'} syntax and the ${includeBundle.pathMap.length} local header(s) found are added by Asm Lens`
+      },
       includeCount: includeBundle.files.length,
       configFile: resolved.configFile,
       deps: new Set([rootPathKey, ...includeBundle.pathMap.map(e => normPath(e.real))]),
@@ -2084,6 +2210,8 @@ async function recordAnalysis(document, o) {
     compilerId: o.compilerId,
     compilerLabel: o.compilerLabel,
     flags: o.flags,
+    // The command shown, and edited, above the assembly.
+    command: o.command,
     includeCount: o.includeCount || 0,
     rootKey: fileKey(document),
     configFile: o.configFile,
@@ -2206,19 +2334,64 @@ function errorsOnly(err) {
 // compile_commands.json when one fits (the file's own, that of a file including
 // it, or one in the nearest folder), else the settings.
 async function localCompilePlan(document, resolved, baseDir, entry) {
+  const plan = await configuredPlan(document, resolved, baseDir, entry);
+  const edited = commandOverride(document, resolved);
+  return edited ? editedPlan(edited, plan, document) : plan;
+}
+
+// The command typed in the assembly view, in place of the one the settings give: its first word is
+// the compiler (unless it is a flag), the rest the flags. What only a build needs (-c, -o x, -MD,
+// -Werror, source files, ...) is left out as from a compile_commands.json entry: the editor text is the source.
+const TAKES_VALUE = new Set(['-include', '-imacros', '-Xclang', '-Xpreprocessor', '-Xassembler', '-Xlinker', '-mllvm', '--param', '-o', '-MF', '-MT', '-MQ']);
+function editedPlan(edited, plan, document) {
+  const words = splitArgs(edited.text);
+  const compiler = words.length && !words[0].startsWith('-') ? words.shift() : plan.compiler;
+  const cwd = edited.cwd || plan.cwd;
+  const sources = words.filter((w, i) => !w.startsWith('-') && SOURCE_RE.test(w) && !TAKES_VALUE.has(words[i - 1]));
+  const kept = flagsLib.compileFlagsOf({ arguments: [compiler, ...words.filter(w => !sources.includes(w))], directory: cwd, file: document.uri.fsPath });
+  const dropped = words.filter(w => !kept.includes(w));
+  if (dropped.length) outputChannel.appendLine(`  left out of the edited command: ${dropped.join(' ')} (Asm Lens compiles to assembly itself)`);
+  const { args, syntax } = flagsLib.stripSyntaxArgs(kept);
+  return {
+    compiler, cwd, args, syntax, fromDatabase: plan.fromDatabase, edited: true,
+    display: ['edited command', ...flagsLib.targetFlags(args)].join(' '),
+    description: 'the command edited in the assembly view (Reset there goes back to the settings)'
+  };
+}
+
+// The compile_commands.json databases of `resolved`: { all, db }, where `db` has only the entries of
+// the chosen build (all of them when none is chosen). Undefined without databases.
+async function databasesOf(resolved, { log = false } = {}) {
+  if (!resolved.compileCommands?.length) return undefined;
+  const all = await compileCommands.loadDatabases(resolved.compileCommands);
+  if (log) for (const e of all.errors) outputChannel.appendLine(`compile_commands: ${e}`);
+  return { all, db: compileCommands.filterDatabase(all, resolved.build) };
+}
+
+// The entry to compile `document` with. With a build chosen, a file that build lists nowhere (not even
+// through a file including it) takes its own entry in another build rather than a stranger's.
+async function entryOf(document, resolved, dbs) {
+  const opts = { includedBy: includersOf(document) };
+  const match = dbs.db.entries.length ? await compileCommands.entryFor(dbs.db, document.uri.fsPath, opts) : undefined;
+  if (!resolved.build || (match && match.kind !== 'nearest')) return match;
+  const other = await compileCommands.entryFor(dbs.all, document.uri.fsPath, opts);
+  if (other && other.kind !== 'nearest') return { ...other, reason: `${other.reason}, as ${resolved.buildLabel || 'the chosen build'} lists no file for it` };
+  return match || other;
+}
+
+async function configuredPlan(document, resolved, baseDir, entry) {
   const fileDir = path.dirname(document.uri.fsPath);
   if (resolved.compileCommands && resolved.compileCommands.length) {
-    const db = await compileCommands.loadDatabases(resolved.compileCommands);
-    for (const e of db.errors) outputChannel.appendLine(`compile_commands: ${e}`);
-    const match = entry ? { entry, reason: `the entry of ${path.basename(entry.file)}` } : await compileCommands.entryFor(db, document.uri.fsPath, { includedBy: includersOf(document) });
+    const dbs = await databasesOf(resolved, { log: true });
+    const match = entry ? { entry, reason: `the entry of ${path.basename(entry.file)}` } : await entryOf(document, resolved, dbs);
     if (match) {
       const { args, syntax } = flagsLib.stripSyntaxArgs([...await withoutOwnForcedInclude(document, match.entry), ...splitArgs(resolved.activeExtraFlags)]);
       return {
-        compiler: flagsLib.entryCompiler(match.entry),
+        compiler: resolved.entryCompiler || flagsLib.entryCompiler(match.entry),
         cwd: match.entry.directory,
         args, syntax, fromDatabase: true,
         display: ['compile_commands.json', ...flagsLib.targetFlags(args)].join(' '),
-        description: `compile_commands.json: ${match.reason} (${match.entry.file}, from ${match.entry.database})`
+        description: `compile_commands.json: ${match.reason} (${match.entry.file}, from ${match.entry.database})${resolved.buildLabel ? `, build ${resolved.buildLabel}` : ''}${resolved.entryCompiler ? `, run with ${resolved.entryCompiler}` : ''}`
       };
     }
     outputChannel.appendLine(`compile_commands: no entry for ${document.fileName}; using the settings.`);
@@ -2470,6 +2643,17 @@ async function analyzeLocal(document, resolved, settings, { context, calls } = {
     compilerId: compiler,
     compilerLabel: `${path.basename(compiler)} (local)`,
     flags: [plan.display, addedStd].filter(Boolean).join(' '),
+    // What the settings or the database give can be edited; the rest is how Asm Lens gets assembly out of it.
+    command: {
+      kind: 'command', cwd, edited: Boolean(plan.edited),
+      text: [compiler, ...baseArgs, ...(plan.syntax === 'att' ? ['-masm=att'] : [])].map(quoteArg).join(' '),
+      // Folders inside the one it runs in are shown relative to it (it is shown too).
+      added: args.slice(baseArgs.length).filter(a => !a.startsWith(`-I${stubDir}`)).map(a => {
+        const m = /^(-I)?(.+)$/.exec(a);
+        const inside = path.isAbsolute(m[2]) && (normPath(m[2]) === normPath(cwd) || normPath(m[2]).startsWith(normPath(cwd + path.sep)));
+        return inside ? `${m[1] || ''}${path.relative(cwd, m[2]) || '.'}` : a;
+      }).map(quoteArg).join(' ')
+    },
     configFile: resolved.configFile,
     skipped: skipped.filter(k => prepared.firstLine < 0 || k.startLine < prepared.firstLine),
     unkept,
@@ -2508,8 +2692,11 @@ async function analyzeOtherLanguage(document, resolved, settings) {
   const { lang } = resolved;
   const timeoutMs = settings.get('requestTimeoutMs', 60000);
   const rootPathKey = docPathKey(document);
-  const required = lang.requiredFlags && !String(resolved.flags).includes(lang.requiredFlags) ? lang.requiredFlags : '';
-  let flags = [resolved.flags, resolved.extraFlags, required].filter(Boolean).join(' ');
+  // Flags edited in the assembly view replace the settings' (a flag the language needs is still added).
+  const edited = commandOverride(document, resolved);
+  const own = edited ? edited.text : [resolved.flags, resolved.extraFlags].filter(Boolean).join(' ');
+  const required = lang.requiredFlags && !String(own).includes(lang.requiredFlags) ? lang.requiredFlags : '';
+  let flags = [own, required].filter(Boolean).join(' ');
   const started = Date.now();
   let rows, resolveRef, compilerId, compilerLabel;
   if (resolved.mode === 'local') {
@@ -2541,7 +2728,11 @@ async function analyzeOtherLanguage(document, resolved, settings) {
     rows = languages.remoteRows(lang.key, Array.isArray(data.asm) ? data.asm : []);
     resolveRef = makeRefResolver(rootPathKey, []);
   }
-  const result = await recordAnalysis(document, { rows, resolveRef, compilerId, compilerLabel, flags, configFile: resolved.configFile, requireName: lang.requireName });
+  const command = {
+    kind: 'flags', label: compilerLabel, where: resolved.mode === 'local' ? '' : hostOf(resolved.baseUrl), edited: Boolean(edited),
+    text: flags, added: resolved.mode === 'local' ? 'The file and the output options are added by Asm Lens' : ''
+  };
+  const result = await recordAnalysis(document, { rows, resolveRef, compilerId, compilerLabel, flags, command, configFile: resolved.configFile, requireName: lang.requireName });
   const mine = result.functions.filter(f => f.sourceRange).length;
   outputChannel.appendLine(`Compiled ${document.fileName} (${lang.label}) with ${compilerId} ${flags} in ${Date.now() - started} ms; found ${result.functions.length} emitted function(s), ${mine} matched to this file.`);
   const hint = !mine && EMPTY_HINTS[lang.key] ? ` ${EMPTY_HINTS[lang.key]}` : '';
@@ -2889,10 +3080,14 @@ function showAssembly(result, analysis, { reveal = true } = {}) {
   const mappedLines = new Set(groups.map(g => `${fileKeys.indexOf(g.key)}:${g.line}`));
   panelState = { analysis, result, fileKeys, groups, mappedLines, stale: false };
   outputPanel.title = `Assembly: ${result.sourceName || result.name}`;
+  const command = analysis.command;
   lastRender = {
     type: 'render',
     title: `${result.sourceName || result.name} — ${result.count} instructions`,
-    meta: `${analysis.compilerLabel} · ${analysis.compilerId} · ${analysis.flags}`,
+    meta: command
+      ? `${analysis.compilerLabel}${analysis.compiledAs ? ` · compiled as ${analysis.compiledAs} sees it` : ''}`
+      : `${analysis.compilerLabel} · ${analysis.compilerId} · ${analysis.flags}`,
+    command: command && { kind: command.kind, label: command.label || '', where: command.where || '', text: command.text, added: command.added || '', cwd: command.cwd || '', edited: Boolean(command.edited) },
     noMap: !displayRows.some(r => r.ref),
     colorize: config().get('colorizeLines', true),
     dim: config().get('dimOtherLines', false),
@@ -2913,7 +3108,7 @@ function panelHtml() {
 <meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; script-src 'nonce-${nonce}';">
 <style>
 body{font-family:var(--vscode-font-family);color:var(--vscode-foreground);padding:16px}
-.asm{font-family:var(--vscode-editor-font-family);font-size:var(--vscode-editor-font-size);white-space:pre;background:var(--vscode-editor-background);padding:12px;border:1px solid var(--vscode-panel-border)}
+.asm{font-family:var(--vscode-editor-font-family);font-size:var(--vscode-editor-font-size);white-space:pre;background:var(--vscode-editor-background);padding:12px;border:1px solid var(--vscode-panel-border);overflow-x:auto;display:grid;grid-template-columns:minmax(max-content,1fr)}
 .asm-line{display:block;min-height:1em;transition:opacity 80ms}
 .asm-line[data-l]{cursor:pointer}
 ${paletteCss}
@@ -2921,10 +3116,52 @@ ${paletteCss}
 .asm-line.hl{background:var(--vscode-editor-wordHighlightStrongBackground,var(--vscode-editor-findMatchHighlightBackground));box-shadow:inset 3px 0 0 var(--vscode-focusBorder)}
 .asm-line.hl-self{background:var(--vscode-editor-findMatchBackground);outline:1px solid var(--vscode-focusBorder)}
 .meta{color:var(--vscode-descriptionForeground);margin-bottom:14px}
-</style></head><body><h2 id="title"></h2><div class="meta" id="meta"></div><p class="meta" id="nomap" hidden>No source mapping is available for this function, so hover highlighting is disabled.</p><div class="asm" id="asm"></div>
+#cmdbox{margin:0 0 14px}
+.cmd-row{display:flex;gap:8px;align-items:flex-start}
+.cmd-label{flex:none;padding:4px 0;font-weight:600}
+#cmd{flex:1;min-width:0;width:100%;box-sizing:border-box;resize:none;overflow:hidden;margin:0;padding:4px 6px;line-height:1.4;font-family:var(--vscode-editor-font-family);font-size:var(--vscode-editor-font-size);color:var(--vscode-input-foreground);background:var(--vscode-input-background);border:1px solid var(--vscode-input-border,var(--vscode-panel-border))}
+#cmd:focus{outline:1px solid var(--vscode-focusBorder);outline-offset:-1px}
+.cmd-actions{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-top:6px}
+.cmd-actions .meta{margin:0}
+button{font-family:inherit;font-size:inherit;padding:3px 12px;border-radius:2px;cursor:pointer;color:var(--vscode-button-foreground);background:var(--vscode-button-background);border:1px solid var(--vscode-button-border,transparent)}
+button:hover:not(:disabled){background:var(--vscode-button-hoverBackground)}
+button:focus-visible{outline:1px solid var(--vscode-focusBorder);outline-offset:2px}
+button:disabled{opacity:.5;cursor:default}
+button.secondary{color:var(--vscode-button-secondaryForeground);background:var(--vscode-button-secondaryBackground)}
+button.secondary:hover:not(:disabled){background:var(--vscode-button-secondaryHoverBackground)}
+.cmd-added{margin:6px 0 0;font-family:var(--vscode-editor-font-family);font-size:.92em;overflow-wrap:anywhere}
+.edited{color:var(--vscode-editorWarning-foreground)}
+</style></head><body><h2 id="title"></h2><div class="meta" id="meta"></div>
+<div id="cmdbox" hidden><div class="cmd-row"><span class="cmd-label" id="cmdLabel"></span><textarea id="cmd" rows="1" spellcheck="false" autocomplete="off" autocapitalize="off"></textarea></div>
+<div class="cmd-actions"><button id="cmdRun" disabled title="Compile this file with the command above (Enter)">Compile</button><button id="cmdReset" class="secondary" hidden title="Compile with the command from the settings again">Reset</button><span class="meta" id="cmdNote" aria-live="polite"></span></div>
+<p class="meta cmd-added" id="cmdAdded"></p></div>
+<p class="meta" id="nomap" hidden>No source mapping is available for this function, so hover highlighting is disabled.</p><div class="asm" id="asm"></div>
 <script nonce="${nonce}">
 const vscode=acquireVsCodeApi();
 const box=document.getElementById('asm');
+const cmdBox=document.getElementById('cmdbox'),cmd=document.getElementById('cmd'),cmdRun=document.getElementById('cmdRun'),cmdReset=document.getElementById('cmdReset'),cmdNote=document.getElementById('cmdNote');
+let shown=null,pending=false;
+const fit=()=>{cmd.style.height='auto';cmd.style.height=cmd.scrollHeight+2+'px';};
+const changed=()=>shown!==null&&cmd.value.replace(/\\s+/g,' ').trim()!==shown.text.replace(/\\s+/g,' ').trim();
+function showCommand(c){
+  cmdBox.hidden=!c;if(!c){shown=null;return;}
+  // Typing that was not sent yet stays; a compile that was asked for shows its command.
+  if(pending||!changed())cmd.value=c.text;
+  pending=false;shown=c;
+  document.getElementById('cmdLabel').textContent=c.kind==='flags'?c.label+(c.where?' on '+c.where:''):'';
+  cmd.setAttribute('aria-label',c.kind==='flags'?'Compiler flags':'Compiler command');
+  document.getElementById('cmdAdded').textContent=[c.added?(c.kind==='command'?'Asm Lens adds: '+c.added:c.added):'',c.cwd?'Runs in '+c.cwd:''].filter(Boolean).join(' · ');
+  cmdReset.hidden=!c.edited;cmdReset.disabled=false;
+  cmdNote.textContent=c.edited?'Edited here: the settings do not apply to this file until Reset.':'';
+  cmdNote.className='meta'+(c.edited?' edited':'');
+  cmdRun.disabled=!changed();fit();
+}
+function compileNow(){if(!shown||!changed()||pending)return;pending=true;cmdRun.disabled=true;cmdNote.className='meta';cmdNote.textContent='Compiling…';vscode.postMessage({type:'compileWith',text:cmd.value});}
+cmd.addEventListener('input',()=>{cmdRun.disabled=!changed()||pending;fit();});
+cmd.addEventListener('keydown',e=>{if(e.key==='Enter'&&!e.shiftKey&&!e.isComposing){e.preventDefault();compileNow();}else if(e.key==='Escape'&&shown){cmd.value=shown.text;cmdRun.disabled=true;fit();}});
+cmdRun.addEventListener('click',compileNow);
+cmdReset.addEventListener('click',()=>{if(pending)return;pending=true;cmdReset.disabled=true;cmdNote.className='meta';cmdNote.textContent='Compiling…';vscode.postMessage({type:'resetCommand'});});
+window.addEventListener('resize',fit);
 let groups=new Map(),current='',self=null,leaveTimer;
 const keyOf=el=>el.dataset.f+':'+el.dataset.l;
 function clearMarks(){if(current)for(const e of groups.get(current)||[])e.classList.remove('hl');if(self)self.classList.remove('hl-self');current='';self=null;box.classList.remove('focus');}
@@ -2939,13 +3176,15 @@ function render(m){
   document.getElementById('title').textContent=m.title;
   document.getElementById('meta').textContent=m.meta;
   document.getElementById('nomap').hidden=!m.noMap;
+  showCommand(m.command);
   const frag=document.createDocumentFragment();
   for(const r of m.rows){
     const el=document.createElement('span');
     el.className='asm-line'+(m.colorize&&r.k!==undefined?' c'+r.k:'');
     el.textContent=r.t;
     if(r.f!==undefined){el.dataset.f=r.f;el.dataset.l=r.l;if(r.c!==undefined&&r.c!==null)el.dataset.c=r.c;const k=r.f+':'+r.l;if(!groups.has(k))groups.set(k,[]);groups.get(k).push(el);}
-    frag.appendChild(el);frag.appendChild(document.createTextNode('\\n'));
+    // One block per instruction: copying still gives one per line, and no empty line comes between them.
+    frag.appendChild(el);
   }
   box.replaceChildren(frag);
 }
@@ -2953,7 +3192,7 @@ const payload=(type,el)=>({type,file:Number(el.dataset.f),line:Number(el.dataset
 box.addEventListener('mouseover',e=>{const el=e.target.closest&&e.target.closest('.asm-line[data-l]');if(!el)return;clearTimeout(leaveTimer);const k=keyOf(el);const same=k===current;mark(k,el,false);if(!same)vscode.postMessage(payload('highlight',el));});
 box.addEventListener('click',e=>{const el=e.target.closest&&e.target.closest('.asm-line[data-l]');if(el)vscode.postMessage(payload('open',el));});
 box.addEventListener('mouseleave',()=>{leaveTimer=setTimeout(()=>{clearMarks();vscode.postMessage({type:'clearHighlight'});},120);});
-window.addEventListener('message',e=>{const m=e.data||{};if(m.type==='render')render(m);else if(m.type==='highlightAsm'){const k=m.file+':'+m.line;if(k!==current||self)mark(k,null,true);}else if(m.type==='clearAsm')clearMarks();});
+window.addEventListener('message',e=>{const m=e.data||{};if(m.type==='render')render(m);else if(m.type==='commandDone'){if(pending){pending=false;cmdReset.disabled=false;cmdRun.disabled=!changed();cmdNote.className='meta edited';cmdNote.textContent=m.failed?'That did not compile: the compiler\\'s message is in the Asm Lens output.':'Compiled. This function has no code with that command: its CodeLens in the editor says why.';}}else if(m.type==='highlightAsm'){const k=m.file+':'+m.line;if(k!==current||self)mark(k,null,true);}else if(m.type==='clearAsm')clearMarks();});
 vscode.postMessage({type:'ready'});
 </script></body></html>`;
 }
@@ -2997,6 +3236,7 @@ function handleWebviewMessage(message) {
     return;
   }
   if (!message || !panelState) return;
+  if (message.type === 'compileWith' || message.type === 'resetCommand') return editCommand(message);
   if (message.type === 'clearHighlight') return clearSourceHighlight();
   if (message.type !== 'highlight' && message.type !== 'open') return;
   const key = panelState.fileKeys[message.file];

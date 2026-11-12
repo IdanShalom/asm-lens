@@ -120,3 +120,52 @@ test('entriesOf and includersOf: a file listed for two builds, one of each build
   assert.deepEqual(found.slice(0, 2).map(e => /-m\d+/.exec(e.command)[0]).sort(), ['-m32', '-m64'], 'both builds, though the first one has many files');
   assert.equal(found.length, 4, 'two of each build are enough');
 });
+
+test('buildsAmong: what tells each build of a file apart; inBuild and filterDatabase keep only one', async () => {
+  cc.reload();
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'asm-lens-cc-'));
+  const write = (rel, text) => { const p = path.join(dir, rel); fs.mkdirSync(path.dirname(p), { recursive: true }); fs.writeFileSync(p, text); return p; };
+  const main = write('main.cpp', '');
+  write('other.cpp', '');
+  // A 32-bit build, and a 64-bit one written without -m64; both define what every build has.
+  write('cc.json', JSON.stringify([
+    { directory: dir, file: 'main.cpp', command: 'g++ -m32 -DCOMMON -DWIDE=0 -c main.cpp' },
+    { directory: dir, file: 'main.cpp', command: 'g++ -DCOMMON -DWIDE=0 -c main.cpp' },
+    { directory: dir, file: 'other.cpp', command: 'g++ -m32 -DCOMMON -DOTHER -c other.cpp' },
+    { directory: dir, file: 'other.cpp', command: 'g++ -DCOMMON -DOTHER -c other.cpp' }
+  ]));
+  const db = await cc.loadDatabases([path.join(dir, 'cc.json')]);
+  const builds = cc.buildsAmong(cc.entriesOf(db, main));
+  assert.deepEqual(builds.map(b => b.label), ['-m32', 'without -m32']);
+  assert.deepEqual(builds.map(b => b.build), [{ with: ['-m32'], without: [] }, { with: [], without: ['-m32'] }]);
+  // The same build in another file, whose own defines differ.
+  const [b32, b64] = builds.map(b => cc.filterDatabase(db, b.build));
+  assert.deepEqual(b32.entries.map(e => path.basename(e.file)), ['main.cpp', 'other.cpp']);
+  assert.ok(b32.entries.every(e => e.command.includes('-m32')));
+  assert.ok(b64.entries.every(e => !e.command.includes('-m32')) && b64.entries.length === 2);
+  assert.ok(b64.byFile.get(require('../../src/asm').normPath(main)).command.startsWith('g++ -DCOMMON'), 'the file\'s entry in that build');
+  assert.equal(cc.filterDatabase(db, undefined), db, 'no build: the database as it is');
+  assert.equal(cc.filterDatabase(await cc.loadDatabases([path.join(dir, 'cc.json')]), builds[0].build), b32, 'the same view while the database does not change');
+  assert.notEqual(b32.stamp, db.stamp, 'its own cache key for includers');
+  // One build, or none: nothing to choose.
+  assert.deepEqual(cc.buildsAmong(cc.entriesOf(db, main).slice(0, 1)), []);
+  assert.deepEqual(cc.buildsAmong([]), []);
+  // Builds that differ by database (two build folders with the same flags) or compiler.
+  write('b32/compile_commands.json', JSON.stringify([{ directory: dir, file: 'main.cpp', command: 'g++ -DX -c main.cpp' }]));
+  write('b64/compile_commands.json', JSON.stringify([{ directory: dir, file: 'main.cpp', command: 'clang++ -DX -c main.cpp' }]));
+  const two = await cc.loadDatabases([path.join(dir, 'b32', 'compile_commands.json'), path.join(dir, 'b64', 'compile_commands.json')]);
+  const split = cc.buildsAmong(cc.entriesOf(two, main));
+  assert.deepEqual(split.map(b => b.label), ['b32/compile_commands.json g++', 'b64/compile_commands.json clang++']);
+  assert.ok(cc.inBuild(cc.entriesOf(two, main)[1], split[1].build) && !cc.inBuild(cc.entriesOf(two, main)[0], split[1].build));
+  // -D written apart counts like -DNAME.
+  assert.ok(cc.inBuild({ directory: dir, file: 'main.cpp', arguments: ['g++', '-D', 'FAST', '-c', 'main.cpp'] }, { with: ['-DFAST'], without: [] }));
+});
+
+test('entryFor says what kind of entry it found: own, includer or nearest', async () => {
+  cc.reload();
+  const dir = project();
+  const db = await cc.loadDatabases([path.join(dir, 'build', 'compile_commands.json')]);
+  assert.equal((await cc.entryFor(db, path.join(dir, 'src', 'main.cpp'))).kind, 'own');
+  assert.equal((await cc.entryFor(db, path.join(dir, 'src', 'util', 'api.h'))).kind, 'includer');
+  assert.equal((await cc.entryFor(db, path.join(dir, 'tools', 'x.h'))).kind, 'nearest');
+});

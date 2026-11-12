@@ -17,7 +17,8 @@ Go, Python, Zig, Swift, D and Fortran are supported too.
 - **Instruction counts as CodeLens** above every function: `12 instructions · GCC 15.2 · -O2`.
   Template functions show every instantiation (`3 instantiations · 4 / 6 / 9 instructions`).
 - **Assembly view** next to the editor. Click a count to open it; it follows the cursor
-  from function to function.
+  from function to function. Above the code is the command that compiled it, like on Compiler Explorer:
+  edit it (`-m64` → `-m32`, another compiler, `-O3`) and press Enter to compile with that.
 - **Two-way highlighting**, like Compiler Explorer: each source line and its instructions
   share a color. Hover or click a source line to highlight its instructions; hover an
   instruction to highlight its source line (and the exact token, when the compiler reports a
@@ -78,6 +79,20 @@ By default the file is compiled on godbolt.org with GCC 15.2 and `-O2`, in Intel
 Choose another compiler with the compiler name in the status bar (bottom right) or
 **Asm Lens: Select Compiler**. To change flags, include folders and so on for a
 project, run **Asm Lens: Open or Create Project Config** (see [`.asm-lens.json`](#project-configuration-asm-lensjson)).
+
+### The command above the assembly
+
+The assembly view starts with the command that compiled the code: locally the compiler and its flags (those of
+the settings, or of the file's `compile_commands.json` entry), on Compiler Explorer the compiler's name and the flags.
+Below it, in grey, is what Asm Lens adds to get assembly (`-S -g -o - -x c++ -`, the syntax flag) and the folder
+it runs in. Edit the command and press **Enter** (or **Compile**); **Escape** puts it back.
+
+- The edited command is kept for that file and that compiler, also after a restart, until you click **Reset**. The
+  view, the status bar (`· edited`) and the CodeLens (`edited command`) say so while it applies.
+- It replaces the whole command, so a file listed for several builds is compiled with that one only.
+- A command copied from a build log works: `-c`, `-o file`, `-MD`/`-MF`, `-Werror` and source files are left
+  out (the output says which), as for a `compile_commands.json` entry.
+- Locally the first word is the compiler; leave it out to keep the current one and change only flags.
 
 ## Remote and local mode
 
@@ -150,7 +165,7 @@ the header by itself, once for each saved version (not with `"reanalyzeOn": "nev
 lack code (compile errors, an `#if` that is off, templates without types) is also compiled the way the files
 including it see it: with the preprocessor lines before its `#include`, and with their entries in
 `compile_commands.json`, directly or through other headers. A file listed more than once (a 32-bit and a 64-bit build,
-in one database or several) is compiled with each entry, a `.cpp` as well. The best result is the main one, and the
+in one database or several) is compiled with each entry, a `.cpp` as well, unless you chose one build ([Choosing a build](#compile_commandsjson)). The best result is the main one, and the
 others fill in what it lacks, so a function behind `-m32` or `-DFEATURE_A` and one behind `-m64` or `-DFEATURE_B` can
 both show code. The CodeLens names the target (`compile_commands.json -m32`).
 
@@ -182,6 +197,37 @@ flags in `.asm-lens.json` come after them.
   The output shows the final command and which entry was used.
 - Local mode needs a GCC- or Clang-compatible compiler; an MSVC (`cl.exe`, `clang-cl`) database is
   reported, and remote mode with an MSVC compiler from Compiler Explorer is the way to see its code.
+
+**Choosing a build.** A file listed more than once (a 32-bit and a 64-bit build, in one database or several) is
+compiled with every entry by default, and the results are combined. To see one build only, click the compiler in
+the status bar (**Asm Lens: Select Compiler**): it lists the builds of the file, named by what tells them apart
+(`-m32`, `without -m32`, `build32/compile_commands.json`), and **All builds**. A header lists the builds of the
+files that include it. The choice applies to every file of the project, and the status bar shows it
+(`compile_commands -m32 (local)`). A file the chosen build does not list uses its own entry of another build.
+
+**Builds and compilers in `.asm-lens.json`.** Each entry of `compilers` can choose its own way, so Select Compiler
+switches between them:
+
+```jsonc
+{
+  "mode": "local",
+  "compileCommands": "build/compile_commands.json",
+  "compilers": [
+    { "id": "all", "name": "Every build" },
+    { "id": "x86", "name": "32-bit", "entriesWith": "-m32" },
+    { "id": "x64", "name": "64-bit", "entriesWithout": "-m32" },          // a 64-bit build written without -m64
+    { "id": "arm", "name": "ARM build", "compileCommands": "build-arm/compile_commands.json" },
+    { "id": "clang", "name": "Clang, build flags", "compiler": "clang++", "extraFlags": "-O3" },
+    { "id": "plain", "name": "No database", "compileCommands": false, "compiler": "g++", "flags": "-O2" }
+  ]
+}
+```
+
+- `entriesWith` / `entriesWithout`: only the entries with all of these flags, or none of them.
+- `compileCommands` on a compiler replaces the top-level one; `false` means none (its own `compiler`, `flags`,
+  `defines` and the `includePaths` apply).
+- `compiler` on a compiler runs instead of each entry's compiler, with the entry's flags (a flag it rejects is
+  left out). `extraFlags` come after the entry's flags; `flags` is not used with a database.
 
 ## Headers and templates
 
@@ -323,9 +369,12 @@ Each object in `compilers` may have:
 | `flags` | string | Flags for this compiler; replaces the top-level `flags`. |
 | `language` | `c`, `c++`, `rust`, `go`, `python`, `zig`, `swift`, `d`, `fortran` | Use this compiler only for that language. Without it the compiler is for C and C++. |
 | `mode` | `"remote"` \| `"local"` | Overrides the top-level `mode` for this compiler. |
-| `compiler` | string | Local mode: the command or path (`clang++-18`, `rustc`, `python3.12`). |
+| `compiler` | string | Local mode: the command or path (`clang++-18`, `rustc`, `python3.12`). With `compile_commands.json` it runs instead of each entry's compiler, with the entry's flags. |
 | `defines` | string[] | Extra `-D` defines for this compiler (C/C++). |
 | `extraFlags` | string \| string[] | Flags added after the others. |
+| `compileCommands` | string \| string[] \| `false` | This compiler's own `compile_commands.json` file(s), in place of the top-level one; `false`: none. See [Choosing a build](#compile_commandsjson). |
+| `entriesWith` | string \| string[] | With `compile_commands.json`: only the entries that have all of these flags (`"-m32"`), when a file is listed for several builds. |
+| `entriesWithout` | string \| string[] | Only the entries that have none of these flags (`"-m32"` for a 64-bit build written without `-m64`). |
 
 ## VS Code settings
 
@@ -361,7 +410,7 @@ Each object in `compilers` may have:
 | Command | What it does |
 |---------|--------------|
 | Asm Lens: Analyze Current File | Compile the file and show counts (also in the editor's context menu). |
-| Asm Lens: Select Compiler | Choose a compiler from `.asm-lens.json`, or browse Compiler Explorer's list for the file's language. |
+| Asm Lens: Select Compiler | Choose a compiler from `.asm-lens.json`, a build of `compile_commands.json` when the file is listed for several, or browse Compiler Explorer's list for the file's language. |
 | Asm Lens: Instantiate Template at Cursor… | Same as the **Instantiate…** CodeLens. |
 | Asm Lens: Remove Template Instantiations… | Remove instantiation requests of the current file. |
 | Asm Lens: Open or Create Project Config (.asm-lens.json) | Open the project file, creating it from a template. |
