@@ -86,7 +86,44 @@
               },
               "compiler": {
                 "type": "string",
-                "description": "Local mode: command or path of the compiler (e.g. clang++-18, rustc, python3.12)."
+                "description": "Local mode: command or path of the compiler (e.g. clang++-18, rustc, python3.12). With compile_commands.json it runs instead of each entry's compiler, with the entry's flags."
+              },
+              "compileCommands": {
+                "oneOf": [
+                  {
+                    "type": "string"
+                  },
+                  {
+                    "type": "array",
+                    "items": {
+                      "type": "string"
+                    }
+                  },
+                  {
+                    "const": false
+                  }
+                ],
+                "description": "This compiler's own compile_commands.json database(s), relative to this file, in place of the top-level \"compileCommands\"; false: none (this compiler's flags, defines and includePaths apply)."
+              },
+              "entriesWith": {
+                "type": [
+                  "string",
+                  "array"
+                ],
+                "items": {
+                  "type": "string"
+                },
+                "description": "When compile_commands.json lists a file more than once (a 32-bit and a 64-bit build, say): use only the entries with all of these flags, e.g. \"-m32\"."
+              },
+              "entriesWithout": {
+                "type": [
+                  "string",
+                  "array"
+                ],
+                "items": {
+                  "type": "string"
+                },
+                "description": "Like entriesWith: use only the entries with none of these flags, e.g. \"-m32\" for a 64-bit build written without -m64."
               },
               "defines": {
                 "type": "array",

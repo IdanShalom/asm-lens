@@ -162,25 +162,91 @@ async function entryFor(db, file, { includedBy = [], readText = defaultRead, max
   if (!db || !db.entries.length) return undefined;
   const key = normPath(file);
   const own = db.byFile.get(key);
-  if (own) return { entry: own, reason: 'its own entry' };
+  if (own) return { entry: own, reason: 'its own entry', kind: 'own' };
   for (const p of includedBy) {
     const e = db.byFile.get(normPath(p));
-    if (e) return { entry: e, reason: `the entry of ${path.basename(p)}, which includes it` };
+    if (e) return { entry: e, reason: `the entry of ${path.basename(p)}, which includes it`, kind: 'includer' };
   }
   const dir = path.dirname(file);
   const byDistance = db.entries
     .map(e => ({ e, d: folderDistance(dir, path.dirname(e.file)) }))
     .sort((a, b) => a.d - b.d);
   const includer = (await includersOf(db, file, { readText, maxScan }))[0];
-  if (includer) return { entry: includer, reason: `the entry of ${path.basename(includer.file)}, which includes it` };
+  if (includer) return { entry: includer, reason: `the entry of ${path.basename(includer.file)}, which includes it`, kind: 'includer' };
   const nearest = byDistance[0];
-  return { entry: nearest.e, reason: nearest.d === 0 ? `the entry of ${path.basename(nearest.e.file)} in the same folder` : `the entry of ${path.basename(nearest.e.file)} in the nearest folder` };
+  return { entry: nearest.e, reason: nearest.d === 0 ? `the entry of ${path.basename(nearest.e.file)} in the same folder` : `the entry of ${path.basename(nearest.e.file)} in the nearest folder`, kind: 'nearest' };
+}
+
+// A build to compile with, chosen by the user: { with: [flags], without: [flags], database, compiler }.
+// An entry belongs to it when it has every flag of `with`, none of `without`, and the database and
+// compiler, when those are given.
+function inBuild(entry, build) {
+  if (!build) return true;
+  if (build.database && normPath(entry.database || '') !== normPath(build.database)) return false;
+  if (build.compiler && normPath(entryCompiler(entry)) !== normPath(build.compiler)) return false;
+  const args = compileFlagsOf(entry);
+  const has = new Set([...args, ...macroFlags(args)]);
+  return (build.with || []).every(f => has.has(f)) && !(build.without || []).some(f => has.has(f));
+}
+
+// The database with only the entries of `build` (the same object without one). Kept while the
+// database files do not change: a big database is not filtered again for every compile.
+const filtered = new Map();   // `${stamp}\n${build}` -> view
+function filterDatabase(db, build) {
+  if (!db || !build) return db;
+  const stamp = `${db.stamp || ''}\n${JSON.stringify(build)}`;
+  if (db.stamp && filtered.has(stamp)) return filtered.get(stamp);
+  const entries = db.entries.filter(e => inBuild(e, build));
+  const byFile = new Map();
+  for (const e of entries) { const k = normPath(e.file); if (!byFile.has(k)) byFile.set(k, e); }
+  const view = { ...db, entries, byFile, stamp, build };
+  if (filtered.size > 20) filtered.clear();
+  if (db.stamp) filtered.set(stamp, view);
+  return view;
+}
+
+// The builds among `entries` (a file listed for a 32-bit and a 64-bit build, say), each with
+// what tells it from the others: [{ build, label, entries }]. One build or none: [].
+function buildsAmong(entries) {
+  const groups = new Map();
+  for (const e of entries) {
+    const key = `${normPath(e.database || '')}\n${buildOf(e)}`;
+    if (!groups.has(key)) groups.set(key, { entries: [], database: e.database, compiler: entryCompiler(e), flags: new Set(macroFlags(compileFlagsOf(e))) });
+    groups.get(key).entries.push(e);
+  }
+  const list = [...groups.values()];
+  if (list.length < 2) return [];
+  const differ = f => new Set(list.map(f)).size > 1;
+  const byDatabase = differ(g => normPath(g.database || ''));
+  const byCompiler = differ(g => normPath(g.compiler));
+  return list.map(g => {
+    const others = list.filter(o => o !== g);
+    const own = [...g.flags].filter(f => others.some(o => !o.flags.has(f)));
+    const missing = [...new Set(others.flatMap(o => [...o.flags]))].filter(f => !g.flags.has(f));
+    const build = {
+      with: own,
+      // Only what is needed to tell it apart: a 64-bit build written without -m64 is "without -m32".
+      without: own.length ? [] : missing,
+      ...(byDatabase ? { database: g.database } : {}),
+      ...(byCompiler ? { compiler: g.compiler } : {})
+    };
+    const label = [
+      byDatabase ? path.basename(path.dirname(g.database || '')) + '/' + path.basename(g.database || '') : '',
+      byCompiler ? path.basename(g.compiler) : '',
+      own.join(' '),
+      !own.length && missing.length && !byDatabase && !byCompiler ? `without ${missing.join(' ')}` : ''
+    ].filter(Boolean).join(' ');
+    return { build, label: label || buildOf(g.entries[0]), entries: g.entries };
+  });
 }
 
 async function defaultRead(file) {
   try { return await fs.readFile(file, 'utf8'); } catch (_) { return undefined; }
 }
 
-function clearIncluderCache() { includerCache.clear(); }
+function clearIncluderCache() { includerCache.clear(); filtered.clear(); }
 
-module.exports = { loadDatabase, loadDatabases, reload: () => { reload(); clearIncluderCache(); }, entryFor, entriesOf, buildOf, includersOf, reaches, includes, folderDistance };
+module.exports = {
+  loadDatabase, loadDatabases, reload: () => { reload(); clearIncluderCache(); }, entryFor, entriesOf, buildOf, includersOf, reaches, includes, folderDistance,
+  inBuild, filterDatabase, buildsAmong
+};

@@ -1,5 +1,32 @@
 # Changelog
 
+## 0.9.0
+
+### New
+- **The command above the assembly**, like on Compiler Explorer. The assembly view shows the command that compiled
+  the code: locally the compiler and its flags (from the settings or the file's `compile_commands.json` entry), on
+  Compiler Explorer the compiler and its flags, with what Asm Lens adds shown apart. Edit it (`-m64` to `-m32`,
+  another compiler, `-O3`) and press Enter to compile the file that way. The edit is kept per file and compiler until
+  **Reset**; the status bar and the CodeLens show it. A command copied from a build log works: `-c`, `-o`, `-MD`,
+  `-Werror` and source files are left out.
+- **Choose a build of `compile_commands.json`.** When a file is listed for several builds (32-bit and 64-bit),
+  **Select Compiler** lists them, named by what tells them apart (`-m32`, `without -m32`), next to **All builds**,
+  which is how it worked so far. The choice applies to the whole project; the status bar shows it.
+- **Builds and compilers in `.asm-lens.json`.** An entry of `compilers` can have its own `compileCommands` (or
+  `false` for none), take only the entries with or without some flags (`entriesWith`, `entriesWithout`), and run its
+  own `compiler` with the database's flags. Select Compiler switches between them.
+
+### Changed
+- A `compiler` set on an entry of `compilers` is now used with `compile_commands.json` too (it was ignored: the
+  database entry's compiler ran). The top-level `compiler` is unchanged: the entry's compiler runs.
+
+### Fixed
+- ARM instructions lost their numbers in the assembly view and hover previews: `add w0, w0, #1` showed as
+  `add w0, w0,`. Only a trailing comment (`# ...`, `; ...`) is left out now.
+- The assembly view showed an empty line between instructions; it is single-spaced now, and copying it still gives one
+  instruction per line.
+- A long line (a call to a long C++ name) ran past the edge of the assembly view; the view scrolls sideways instead.
+
 ## 0.8.8
 
 ### New

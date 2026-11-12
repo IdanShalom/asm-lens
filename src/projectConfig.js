@@ -116,6 +116,15 @@ function normalizeConfig(raw, baseDir) {
     const extra = normalizeFlags(item.extraFlags, `compilers[${i}].extraFlags`, warnings);
     if (extra) entry.extraFlags = extra;
     if (typeof item.compiler === 'string' && item.compiler.trim()) entry.compiler = item.compiler.trim();
+    // This compiler's own compile_commands.json (or none: false), and which of its entries to use.
+    if (item.compileCommands !== undefined) {
+      const dbs = normalizeDatabases(item.compileCommands, baseDir, `compilers[${i}].compileCommands`, warnings, true);
+      if (dbs) entry.compileCommands = dbs;
+    }
+    for (const k of ['entriesWith', 'entriesWithout']) {
+      const list = normalizeFlagList(item[k], `compilers[${i}].${k}`, warnings);
+      if (list && list.length) entry[k] = list;
+    }
     out.compilers.push(entry);
   });
 
@@ -140,11 +149,30 @@ function normalizeConfig(raw, baseDir) {
   if (mode) out.mode = mode;
   if (typeof raw.compiler === 'string' && raw.compiler.trim()) out.compiler = raw.compiler.trim();
   if (raw.compileCommands !== undefined) {
-    const list = typeof raw.compileCommands === 'string' ? [raw.compileCommands] : raw.compileCommands;
-    if (!Array.isArray(list) || list.some(x => typeof x !== 'string' || !x.trim())) warnings.push('"compileCommands" must be a path or an array of paths to compile_commands.json files.');
-    else out.compileCommands = list.map(x => x.trim()).map(x => path.isAbsolute(x) ? path.resolve(x) : path.resolve(baseDir, x));
+    const dbs = normalizeDatabases(raw.compileCommands, baseDir, 'compileCommands', warnings, false);
+    if (dbs) out.compileCommands = dbs;
   }
   return out;
+}
+
+// A path or paths to compile_commands.json files, absolute. A compiler may also say false: no database.
+function normalizeDatabases(value, baseDir, label, warnings, allowFalse) {
+  if (allowFalse && value === false) return [];
+  const list = typeof value === 'string' ? [value] : value;
+  if (!Array.isArray(list) || list.some(x => typeof x !== 'string' || !x.trim())) {
+    warnings.push(`"${label}" must be a path or an array of paths to compile_commands.json files${allowFalse ? ', or false' : ''}.`);
+    return undefined;
+  }
+  return list.map(x => x.trim()).map(x => path.isAbsolute(x) ? path.resolve(x) : path.resolve(baseDir, x));
+}
+
+// Flags as one string ("-m32 -DFAST") or an array of them.
+function normalizeFlagList(value, label, warnings) {
+  if (value === undefined) return undefined;
+  if (typeof value === 'string') return value.split(/\s+/).filter(Boolean);
+  if (Array.isArray(value) && value.every(x => typeof x === 'string')) return value.map(x => x.trim()).filter(Boolean);
+  warnings.push(`"${label}" must be a string of flags or an array of flags.`);
+  return undefined;
 }
 
 // Directory that relative paths in the file are resolved against: the folder

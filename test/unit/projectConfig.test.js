@@ -123,3 +123,37 @@ test('the JSON schema lists every top-level key normalizeConfig accepts', () => 
   const item = schema.properties.compilers.items.oneOf[1].properties;
   for (const k of ['id', 'name', 'flags', 'language', 'mode', 'compiler', 'defines', 'extraFlags']) assert.ok(item[k], `compilers[].${k}`);
 });
+
+test('normalizeConfig: a compiler can have its own compile_commands.json, none, and a choice of its entries', () => {
+  const base = path.resolve('/proj');
+  const cfg = pc.normalizeConfig({
+    compileCommands: 'build/compile_commands.json',
+    compilers: [
+      { id: 'x86', compileCommands: 'build32/compile_commands.json', entriesWith: '-m32 -DFAST' },
+      { id: 'x64', compileCommands: ['a.json', path.resolve('/abs/b.json')], entriesWithout: ['-m32'] },
+      { id: 'plain', compileCommands: false, compiler: 'clang++' },
+      { id: 'bad', compileCommands: 3, entriesWith: 7, entriesWithout: [1] }
+    ]
+  }, base);
+  assert.deepEqual(cfg.compileCommands, [path.join(base, 'build', 'compile_commands.json')]);
+  const [x86, x64, plain, bad] = cfg.compilers;
+  assert.deepEqual(x86.compileCommands, [path.join(base, 'build32', 'compile_commands.json')]);
+  assert.deepEqual(x86.entriesWith, ['-m32', '-DFAST']);
+  assert.deepEqual(x64.compileCommands, [path.join(base, 'a.json'), path.resolve('/abs/b.json')]);
+  assert.deepEqual(x64.entriesWithout, ['-m32']);
+  assert.deepEqual(plain.compileCommands, [], 'false: no database for this compiler');
+  assert.equal(plain.compiler, 'clang++');
+  for (const k of ['compileCommands', 'entriesWith', 'entriesWithout']) assert.equal(bad[k], undefined, k);
+  assert.equal(cfg.warnings.length, 3, cfg.warnings.join('\n'));
+  assert.match(cfg.warnings[0], /compilers\[3\]\.compileCommands" must be a path or an array of paths .*, or false/);
+  // The top level still takes no false: it has nothing to turn off.
+  const top = pc.normalizeConfig({ compileCommands: false }, base);
+  assert.equal(top.compileCommands, undefined);
+  assert.match(top.warnings[0], /"compileCommands" must be a path or an array of paths to compile_commands\.json files\.$/);
+});
+
+test('the JSON schema lists the keys a compiler can have for compile_commands.json', () => {
+  const schema = JSON.parse(fs.readFileSync(path.join(__dirname, '..', '..', 'schemas', 'asm-lens.schema.json'), 'utf8'));
+  const item = schema.properties.compilers.items.oneOf[1].properties;
+  for (const k of ['compileCommands', 'entriesWith', 'entriesWithout']) assert.ok(item[k], `compilers[].${k}`);
+});

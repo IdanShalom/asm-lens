@@ -323,7 +323,10 @@ function finalizeFunction(fn) {
   for (const r of fn.instructionRows) if (r.ref) fileKeys.add(r.ref.key);
   return { ...fn, fileKeys, assembly: fn.lines.join('\n') };
 }
-function cleanInstruction(text) { return text.trim().replace(/\s+#.*$/, '').trim(); }
+// Without a trailing comment: `# ...` (GCC, Clang for x86, RISC-V, MIPS) or `; ...` (Apple arm64, MSVC, AVR).
+// On ARM `#` starts a number (`add w0, w0, #1`, `ldp x29, x30, [sp], #16`), which stays.
+const TRAILING_COMMENT = /\s+[#;](?=\s|$).*$/;
+function cleanInstruction(text) { return text.trim().replace(TRAILING_COMMENT, '').trim(); }
 
 // key -> line -> [{ fnName, text }]: every emitted instruction by source line.
 function buildLineIndex(functions) {
@@ -664,7 +667,7 @@ function cleanAssemblyRowsForDisplay(result) {
   for (const row of rows) {
     const text = (typeof row === 'string' ? row : row.text || '').trim();
     if (!isInstructionLine(text)) continue;
-    const withoutComment = text.replace(/\s+#.*$/, '');
+    const withoutComment = text.replace(TRAILING_COMMENT, '');
     const refs = withoutComment.matchAll(/(?:^|[\s,])\|?((?:\.L|\$L)[\w.$@]*)/g);
     for (const match of refs) referencedLocalLabels.add(match[1]);
   }
