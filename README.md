@@ -10,7 +10,7 @@ the compiler installed on your machine (nothing leaves it). C and C++ get the
 full treatment, including local headers, header-only code and templates. Rust,
 Go, Python, Zig, Swift, D and Fortran are supported too.
 
-![Asm Lens: instruction counts above every function, source lines linked to their assembly by color, and the compiler flags changed right above the assembly](https://raw.githubusercontent.com/IdanShalom/asm-lens/main/images/demo.gif)
+![Asm Lens: instruction counts above every function, source lines linked to their assembly by color, and the compiler flags changed right above the assembly](https://raw.githubusercontent.com/IdanShalom/asm-lens/main/images/demo.webp)
 
 ## Features
 
