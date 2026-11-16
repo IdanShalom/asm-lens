@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.9.1
+
+- The demo at the top of the page plays smoothly: an animated WebP at 24 frames per second instead of a 9 fps GIF.
+  The extension itself is unchanged.
+
 ## 0.9.0
 
 ### New
